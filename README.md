@@ -38,6 +38,7 @@
 ## ✨ 功能特性
 
 ### 🤖 AI 对话
+
 - ✅ **多模型支持** - 支持 GLM-4.5、GPT、Claude 等主流大语言模型
 - ✅ **流式响应** - 基于 SSE 的实时流式对话体验
 - ✅ **会话管理** - 创建、重命名、删除、固定对话
@@ -45,17 +46,20 @@
 - ✅ **上下文保持** - 自动维护对话上下文
 
 ### 📚 知识库 (RAG)
+
 - ✅ **文档管理** - 上传、索引、管理知识库文档
 - ✅ **向量检索** - 基于语义的智能检索
 - ✅ **分块管理** - 文档自动分块和嵌入
 - ✅ **状态追踪** - 实时查看文档处理状态
 
 ### 💡 提示词工程
+
 - 🚧 提示词模板管理
 - 🚧 提示词版本控制
 - 🚧 提示词测试和优化
 
 ### ⚙️ 系统设置
+
 - ✅ **模型配置** - 灵活切换不同的 AI 模型
 - ✅ **数据库管理** - MySQL + Redis 双数据库支持
 - ✅ **实时状态** - 服务器连接状态实时监控
@@ -66,77 +70,28 @@
 
 ### 后端 (Python)
 
-| 技术 | 版本 | 用途 |
-|------|------|------|
-| Python | 3.11+ | 核心语言 |
-| FastAPI | 0.111.0 | Web 框架 |
-| SQLAlchemy | 2.0.31 | ORM |
-| MySQL | 8.0+ | 主数据库 |
-| Redis | 7.0+ | 缓存和会话 |
-| OpenAI SDK | 4.52.7 | LLM API 调用 |
-| SSE-Starlette | 2.1.0 | 流式响应 |
-| Pydantic | 2.8.2 | 数据验证 |
+| 技术          | 版本    | 用途         |
+| ------------- | ------- | ------------ |
+| Python        | 3.11+   | 核心语言     |
+| FastAPI       | 0.111.0 | Web 框架     |
+| SQLAlchemy    | 2.0.31  | ORM          |
+| MySQL         | 8.0+    | 主数据库     |
+| Redis         | 7.0+    | 缓存和会话   |
+| OpenAI SDK    | 4.52.7  | LLM API 调用 |
+| SSE-Starlette | 2.1.0   | 流式响应     |
+| Pydantic      | 2.8.2   | 数据验证     |
 
 ### 前端 (TypeScript)
 
-| 技术 | 版本 | 用途 |
-|------|------|------|
-| React | 19.0 | UI 框架 |
-| TypeScript | 5.5 | 类型系统 |
-| Electron | 31.2 | 桌面应用 |
-| Redux Toolkit | 2.2.6 | 状态管理 |
-| Vite | 5.3.3 | 构建工具 |
-| TailwindCSS | 3.4.4 | 样式框架 |
-| Lucide React | 0.408.0 | 图标库 |
-
----
-
-## 📁 项目结构
-
-```
-AI-Workspace-py/
-├── back-end/                 # Python 后端
-│   ├── routers/              # API 路由
-│   │   ├── chat_router.py    # 对话相关 API
-│   │   └── knowledge_router.py # 知识库相关 API
-│   ├── services/             # 业务逻辑
-│   │   ├── chat_service.py   # 对话服务
-│   │   └── knowledge_service.py # 知识库服务
-│   ├── models.py             # 数据库模型
-│   ├── database.py           # 数据库连接
-│   ├── config.py             # 配置管理
-│   ├── redis_service.py      # Redis 服务
-│   ├── main.py               # 应用入口
-│   ├── requirements.txt      # Python 依赖
-│   └── .env                  # 环境变量
-│
-└── front-end/                # TypeScript 前端
-    ├── src/
-    │   ├── app/              # 应用配置
-    │   │   └── providers/    # Redux Store
-    │   ├── pages/            # 页面组件
-    │   │   ├── chat/         # 对话页面
-    │   │   ├── knowledge/    # 知识库页面
-    │   │   ├── prompts/      # 提示词页面
-    │   │   └── settings/     # 设置页面
-    │   ├── widgets/          # 组件部件
-    │   │   ├── header/       # 顶部栏
-    │   │   └── sidebar/      # 侧边栏
-    │   ├── entities/         # 实体和状态
-    │   │   └── chat/         # 对话状态管理
-    │   └── shared/           # 共享资源
-    │       ├── api/          # API 客户端
-    │       ├── types/        # 类型定义
-    │       └── lib/          # 工具函数
-    ├── electron/             # Electron 主进程
-    ├── public/               # 静态资源
-    ├── package.json          # Node 依赖
-    ├── tsconfig.json         # TypeScript 配置
-    ├── vite.config.ts        # Vite 配置
-    └── .gitignore            # Git 忽略文件
-```
-
----
+| 技术          | 版本    | 用途     |
+| ------------- | ------- | -------- |
+| React         | 19.0    | UI 框架  |
+| TypeScript    | 5.5     | 类型系统 |
+| Electron      | 31.2    | 桌面应用 |
+| Redux Toolkit | 2.2.6   | 状态管理 |
+| Vite          | 5.3.3   | 构建工具 |
+| TailwindCSS   | 3.4.4   | 样式框架 |
+| Lucide React  | 0.408.0 | 图标库   |
 
 ## 🚀 快速开始
 
@@ -281,6 +236,7 @@ REDIS_URL=redis://localhost:6379/0
 ### 后端 API 端点
 
 服务器启动后访问自动生成的 API 文档:
+
 - **Swagger UI**: http://localhost:3000/docs
 - **ReDoc**: http://localhost:3000/redoc
 
@@ -356,8 +312,8 @@ async def your_endpoint():
 ```typescript
 // front-end/src/shared/types/api.types.ts
 export interface YourType {
-  id: string
-  name: string
+  id: string;
+  name: string;
 }
 ```
 
@@ -422,6 +378,7 @@ npm run build
 ### Q: 数据库连接失败?
 
 **A**: 检查 MySQL 是否运行,确认 `.env` 中的连接字符串正确:
+
 ```bash
 mysql -u root -p
 # 验证数据库是否存在
@@ -430,7 +387,8 @@ SHOW DATABASES;
 
 ### Q: LLM API 调用失败?
 
-**A**: 
+**A**:
+
 1. 检查 API Key 是否正确
 2. 确认网络连接正常
 3. 查看 API 配额是否用尽
@@ -438,14 +396,16 @@ SHOW DATABASES;
 
 ### Q: 前端无法连接后端?
 
-**A**: 
+**A**:
+
 1. 确认后端服务运行在 `http://localhost:3000`
 2. 检查防火墙设置
 3. 查看浏览器控制台错误信息
 
 ### Q: Electron 应用启动失败?
 
-**A**: 
+**A**:
+
 1. 删除 `node_modules` 重新安装
 2. 清除 Electron 缓存: `npm run clean`
 3. 检查 Node.js 版本是否符合要求
