@@ -1,0 +1,78 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+venv/
+ENV/
+env/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# 数据库
+*.db
+*.sqlite
+*.sqlite3
+
+# 日志
+*.log
+logs/
+
+# 操作系统
+Thumbs.db
+desktop.ini
+
+# 临时文件
+*.tmp
+*.temp
+*.cache
+.cache/
+
+# 编译输出
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.o
+*.out
+
+# 测试
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
