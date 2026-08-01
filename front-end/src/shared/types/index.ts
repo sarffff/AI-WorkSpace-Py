@@ -1,13 +1,23 @@
 export type {
-    Message,
-    Chat,
-    ChatSession,
-    KnowledgeDocument,
-    CompletionRequest,
-    CompletionResponse,
-    NavTab,
-    UIMessage,
-    ChatRequest,
-    CreateChatRequest,
-    StreamChunk,
+  // Auth types
+  User,
+  LoginRequest,
+  RegisterRequest,
+  AuthResponse,
+  TokenResponse,
+  // Chat types
+  Message,
+  Chat,
+  ChatSession,
+  // Knowledge types
+  KnowledgeDocument,
+  // Request/Response types
+  CompletionRequest,
+  CompletionResponse,
+  ChatRequest,
+  CreateChatRequest,
+  StreamChunk,
+  // UI types
+  NavTab,
+  UIMessage,
 } from "./api.types";

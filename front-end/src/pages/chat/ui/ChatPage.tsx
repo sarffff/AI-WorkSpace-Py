@@ -33,7 +33,7 @@ export const ChatPage: React.FC = () => {
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const bufferRef = useRef({ id: "", content: "" });
+  const bufferRef = useRef({ id: "", content: "", sessionId: "" });
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const isNewSessionRef = useRef(false);
@@ -77,16 +77,16 @@ export const ChatPage: React.FC = () => {
   }, [currentChatId, dispatch, messagesBySession]);
 
   const flushBuffer = useCallback(() => {
-    const { id, content } = bufferRef.current;
-    if (!id || !content) return;
+    const { id, content, sessionId } = bufferRef.current;
+    if (!id || !content || !sessionId) return;
     dispatch(
       updateMessageContent({
         id,
-        sessionId: currentChatId || "",
+        sessionId,
         content,
       }),
     );
-  }, [dispatch, currentChatId]);
+  }, [dispatch]);
 
   const startFlushTimer = useCallback(() => {
     if (timerRef.current) return;
@@ -137,7 +137,7 @@ export const ChatPage: React.FC = () => {
       if (!sessionId) {
         try {
           const chat = await apiClient.createChat({
-            title: "New Chat",
+            title: "新对话",
           });
           sessionId = chat.id;
           isNewSessionRef.current = true;
@@ -222,7 +222,7 @@ export const ChatPage: React.FC = () => {
           if (chunk.done) {
             stopFlushTimer();
             flushBuffer();
-            bufferRef.current = { id: "", content: "" };
+            bufferRef.current = { id: "", content: "", sessionId: "" };
             dispatch(setIsGenerating(false));
             assistantMsgId = "";
             break;
@@ -245,6 +245,7 @@ export const ChatPage: React.FC = () => {
               bufferRef.current = {
                 id: assistantMsgId,
                 content: chunk.content,
+                sessionId,
               };
               dispatch(
                 addMessage({
