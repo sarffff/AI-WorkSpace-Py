@@ -2,23 +2,32 @@
 认证相关路由
 包括: 注册、登录、登出、获取当前用户信息等
 """
+import re
 from datetime import timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, EmailStr, Field
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy.orm import Session
 
 from auth import (
     create_access_token,
+    create_refresh_token,
     get_current_user,
     get_password_hash,
     verify_password,
-    ACCESS_TOKEN_EXPIRE_MINUTES
+    blacklist_token,
+    security,
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+    REFRESH_TOKEN_EXPIRE_DAYS,
 )
 from config import settings
 from database import get_db
 from models import User
+
+# 限流器
+from rate_limit import limiter
 
 router = APIRouter(prefix="/auth", tags=["认证"])
 
@@ -29,8 +38,20 @@ class RegisterRequest(BaseModel):
     """注册请求"""
     email: EmailStr
     username: str = Field(..., min_length=3, max_length=50, pattern="^[a-zA-Z0-9_-]+$")
-    password: str = Field(..., min_length=6, max_length=100)
+    password: str = Field(..., min_length=8, max_length=100)
     name: Optional[str] = Field(None, max_length=100)
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_strength(cls, v: str) -> str:
+        """密码必须包含大小写字母和数字,长度 >= 8"""
+        if not re.search(r"[a-z]", v):
+            raise ValueError("密码必须包含至少一个小写字母")
+        if not re.search(r"[A-Z]", v):
+            raise ValueError("密码必须包含至少一个大写字母")
+        if not re.search(r"\d", v):
+            raise ValueError("密码必须包含至少一个数字")
+        return v
 
 
 class LoginRequest(BaseModel):
@@ -39,9 +60,15 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class RefreshRequest(BaseModel):
+    """刷新 token 请求"""
+    refresh_token: str
+
+
 class TokenResponse(BaseModel):
     """Token 响应"""
     access_token: str
+    refresh_token: Optional[str] = None
     token_type: str = "bearer"
     expires_in: int = ACCESS_TOKEN_EXPIRE_MINUTES * 60  # 秒
 
@@ -65,6 +92,7 @@ class UserResponse(BaseModel):
 class AuthResponse(BaseModel):
     """认证响应 (包含 token 和用户信息)"""
     access_token: str
+    refresh_token: str
     token_type: str = "bearer"
     expires_in: int
     user: UserResponse
@@ -73,59 +101,59 @@ class AuthResponse(BaseModel):
 # ========== API 端点 ==========
 
 @router.post("/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit("5/minute")
 async def register(
-    request: RegisterRequest,
-    db: Session = Depends(get_db)
+    request: Request,
+    body: RegisterRequest,
+    db: Session = Depends(get_db),
 ):
     """
     用户注册
-    
+
     - **email**: 邮箱地址 (唯一)
     - **username**: 用户名 (唯一, 3-50字符, 只能包含字母数字下划线和横线)
-    - **password**: 密码 (至少6字符)
+    - **password**: 密码 (至少8字符, 须包含大小写字母和数字)
     - **name**: 显示名称 (可选)
     """
     # 检查邮箱是否已存在
-    existing_user = db.query(User).filter(User.email == request.email).first()
+    existing_user = db.query(User).filter(User.email == body.email).first()
     if existing_user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="邮箱已被注册"
         )
-    
+
     # 检查用户名是否已存在
-    existing_username = db.query(User).filter(User.username == request.username).first()
+    existing_username = db.query(User).filter(User.username == body.username).first()
     if existing_username:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="用户名已被占用"
         )
-    
+
     # 创建新用户
-    hashed_password = get_password_hash(request.password)
+    hashed_password = get_password_hash(body.password)
     new_user = User(
-        email=request.email,
-        username=request.username,
-        name=request.name or request.username,
+        email=body.email,
+        username=body.username,
+        name=body.name or body.username,
         hashed_password=hashed_password,
         provider="local",
         is_active=True,
         is_verified=False
     )
-    
+
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
-    
-    # 生成 access token
-    access_token = create_access_token(
-        data={"sub": new_user.id},
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    )
-    
-    # 返回认证信息
+
+    # 生成 access token + refresh token
+    access_token = create_access_token(data={"sub": new_user.id})
+    refresh_token = create_refresh_token(data={"sub": new_user.id})
+
     return AuthResponse(
         access_token=access_token,
+        refresh_token=refresh_token,
         token_type="bearer",
         expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         user=UserResponse(
@@ -143,50 +171,50 @@ async def register(
 
 
 @router.post("/login", response_model=AuthResponse)
+@limiter.limit("10/minute")
 async def login(
-    request: LoginRequest,
-    db: Session = Depends(get_db)
+    request: Request,
+    body: LoginRequest,
+    db: Session = Depends(get_db),
 ):
     """
     用户登录
-    
+
     - **email**: 邮箱地址
     - **password**: 密码
-    
-    返回 access token 和用户信息
+
+    返回 access token、refresh token 和用户信息
     """
     # 查找用户
-    user = db.query(User).filter(User.email == request.email).first()
-    
+    user = db.query(User).filter(User.email == body.email).first()
+
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="邮箱或密码错误"
         )
-    
+
     # 验证密码
-    if not user.hashed_password or not verify_password(request.password, user.hashed_password):
+    if not user.hashed_password or not verify_password(body.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="邮箱或密码错误"
         )
-    
+
     # 检查账号状态
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="账号已被禁用"
         )
-    
-    # 生成 access token
-    access_token = create_access_token(
-        data={"sub": user.id},
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    )
-    
-    # 返回认证信息
+
+    # 生成 access token + refresh token
+    access_token = create_access_token(data={"sub": user.id})
+    refresh_token = create_refresh_token(data={"sub": user.id})
+
     return AuthResponse(
         access_token=access_token,
+        refresh_token=refresh_token,
         token_type="bearer",
         expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         user=UserResponse(
@@ -227,14 +255,17 @@ async def get_current_user_info(
 
 @router.post("/logout")
 async def logout(
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
     """
     用户登出
-    
-    JWT 是无状态的,登出主要由客户端删除 token 实现
-    这个端点主要用于服务端记录日志或其他业务逻辑
+
+    将当前 access token 加入黑名单,使其立即失效。
+    客户端也应同时删除本地存储的 token。
     """
+    token = credentials.credentials
+    blacklist_token(token)
     return {
         "success": True,
         "message": "登出成功"
@@ -243,19 +274,46 @@ async def logout(
 
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh_token(
-    current_user: User = Depends(get_current_user)
+    request: Request,
+    body: RefreshRequest,
+    db: Session = Depends(get_db),
 ):
     """
     刷新 access token
-    
-    使用当前有效的 token 换取新的 token
+
+    使用 refresh token 换取新的 access token。
     """
-    # 生成新的 access token
-    access_token = create_access_token(
-        data={"sub": current_user.id},
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    )
-    
+    from auth import decode_refresh_token, is_token_blacklisted
+
+    if is_token_blacklisted(body.refresh_token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="refresh token 已失效"
+        )
+
+    try:
+        payload = decode_refresh_token(body.refresh_token)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="无效的 refresh token"
+        )
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="无效的 refresh token"
+        )
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="用户不存在或已被禁用"
+        )
+
+    access_token = create_access_token(data={"sub": user.id})
     return TokenResponse(
         access_token=access_token,
         token_type="bearer",

@@ -39,10 +39,8 @@ export const Sidebar: React.FC = () => {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
 
-  // 根据当前路径确定active tab
   const activeTab = location.pathname.split("/")[1] || "chat";
 
-  // 初始加载时从服务器获取会话列表
   useEffect(() => {
     apiClient
       .getChats()
@@ -125,8 +123,8 @@ export const Sidebar: React.FC = () => {
   const handleLogout = async () => {
     try {
       await apiClient.logout();
-    } catch (error) {
-      console.error("Logout error:", error);
+    } catch {
+      // 即使服务端登出失败也继续清除前端状态
     } finally {
       dispatch(clearAuth());
       navigate("/login");
@@ -140,44 +138,47 @@ export const Sidebar: React.FC = () => {
   });
 
   return (
-    <aside className="w-64 bg-slate-900/80 border-r border-slate-800/80 flex flex-col h-full select-none">
-      <div className="p-4 flex items-center gap-3 border-b border-slate-800/60">
-        <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-indigo-600 via-blue-500 to-cyan-400 flex items-center justify-center shadow-lg shadow-indigo-500/20">
-          <Bot className="w-5 h-5 text-white" />
+    <aside className="w-64 bg-[#f3f0e6] dark:bg-[#1a1917] border-r border-[#e6e2d8] dark:border-[#282724] flex flex-col h-full select-none transition-colors duration-200">
+      {/* Brand & User Header */}
+      <div className="p-4 flex items-center gap-3 border-b border-[#e6e2d8]/80 dark:border-[#282724]/80">
+        <div className="w-9 h-9 rounded-xl bg-[#da7756] text-white flex items-center justify-center shadow-md shadow-[#da7756]/20">
+          <Bot className="w-5 h-5" />
         </div>
-        <div>
-          <h1 className="font-semibold text-sm text-slate-100 tracking-wide">
-            AI 工作区
+        <div className="min-w-0 flex-1">
+          <h1 className="font-semibold text-sm text-[#1f1e1d] dark:text-[#edece8] tracking-tight truncate">
+            AI Workspace
           </h1>
-          <span className="text-[11px] text-slate-400 flex items-center gap-1">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+          <span className="text-[11px] text-[#6e6b63] dark:text-[#a19f96] flex items-center gap-1.5 truncate">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
             {user?.name || user?.username || "User"}
           </span>
         </div>
       </div>
 
+      {/* New Chat Button */}
       <div className="p-3">
         <button
           onClick={handleNewChat}
-          className="w-full py-2 px-3 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium flex items-center justify-center gap-2 transition-all shadow-md shadow-indigo-600/20"
+          className="w-full py-2.5 px-3.5 rounded-xl bg-[#da7756] hover:bg-[#c86544] text-white text-xs font-medium flex items-center justify-center gap-2 transition-all shadow-md shadow-[#da7756]/20 active:scale-[0.99]"
         >
           <Plus className="w-4 h-4" />
-          新建聊天
+          开启新对话
         </button>
       </div>
 
-      <div className="px-3 py-2 space-y-1">
-        <div className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold px-2 mb-1">
+      {/* Navigation */}
+      <div className="px-3 py-1 space-y-1">
+        <div className="text-[10px] uppercase tracking-wider text-[#918d83] dark:text-[#78756d] font-bold px-2 mb-1">
           导航栏
         </div>
         {navItems.map((item) => (
           <button
             key={item.id}
             onClick={() => navigate(item.path)}
-            className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-xs font-medium transition-colors ${
+            className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-medium transition-all ${
               activeTab === item.id
-                ? "bg-slate-800 text-slate-100 border border-slate-700/60"
-                : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/50"
+                ? "bg-[#eae6db] dark:bg-[#262522] text-[#1f1e1d] dark:text-[#edece8] font-semibold border border-[#dcd7cb] dark:border-[#33312d]"
+                : "text-[#6e6b63] dark:text-[#a19f96] hover:text-[#1f1e1d] dark:hover:text-[#edece8] hover:bg-[#eae6db]/60 dark:hover:bg-[#22211e]"
             }`}
           >
             {item.icon}
@@ -186,28 +187,29 @@ export const Sidebar: React.FC = () => {
         ))}
       </div>
 
+      {/* Recent Chats List */}
       <div className="flex-1 overflow-y-auto px-3 py-2 mt-2">
-        <div className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold px-2 mb-2">
-          最近聊天列表
+        <div className="text-[10px] uppercase tracking-wider text-[#918d83] dark:text-[#78756d] font-bold px-2 mb-2">
+          近期对话
         </div>
         <div className="space-y-1">
           {sorted.map((chat) => (
             <div
               key={chat.id}
-              className={`group relative flex items-center gap-1 px-3 py-2 rounded-lg text-xs transition-colors cursor-pointer ${
+              className={`group relative flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs transition-all cursor-pointer ${
                 currentChatId === chat.id
-                  ? "bg-slate-800 text-slate-100 border border-slate-700/60"
-                  : "text-slate-300 hover:bg-slate-800/50 hover:text-slate-100"
+                  ? "bg-[#eae6db] dark:bg-[#262522] text-[#1f1e1d] dark:text-[#edece8] font-medium border border-[#dcd7cb] dark:border-[#33312d]"
+                  : "text-[#52504a] dark:text-[#b0aeA5] hover:bg-[#eae6db]/50 dark:hover:bg-[#22211e] hover:text-[#1f1e1d] dark:hover:text-[#edece8]"
               }`}
               onClick={() => handleSelectChat(chat.id)}
             >
               {chat.pinned && (
-                <Pin className="w-3 h-3 text-amber-400 shrink-0 fill-amber-400" />
+                <Pin className="w-3 h-3 text-[#da7756] shrink-0 fill-[#da7756]" />
               )}
 
               {editingId === chat.id ? (
                 <input
-                  className="flex-1 bg-slate-700 text-xs text-slate-100 px-1 py-0.5 rounded border border-indigo-500 outline-none min-w-0"
+                  className="flex-1 bg-white dark:bg-[#2b2a27] text-xs text-[#1f1e1d] dark:text-[#edece8] px-1.5 py-0.5 rounded-md border border-[#da7756] outline-none min-w-0"
                   value={editValue}
                   onChange={(e) => setEditValue(e.target.value)}
                   onKeyDown={(e) => {
@@ -219,7 +221,7 @@ export const Sidebar: React.FC = () => {
                   onClick={(e) => e.stopPropagation()}
                 />
               ) : (
-                <span className="flex-1 truncate font-medium">
+                <span className="flex-1 truncate">
                   {chat.title}
                 </span>
               )}
@@ -231,7 +233,7 @@ export const Sidebar: React.FC = () => {
                       e.stopPropagation();
                       handleTogglePin(chat.id);
                     }}
-                    className="p-1 rounded hover:bg-slate-700 text-slate-400 hover:text-amber-400 transition-colors"
+                    className="p-1 rounded hover:bg-[#dcd7cb] dark:hover:bg-[#33312d] text-[#6e6b63] dark:text-[#a19f96] hover:text-[#da7756] transition-colors"
                     title={chat.pinned ? "取消固定" : "固定"}
                   >
                     {chat.pinned ? (
@@ -245,7 +247,7 @@ export const Sidebar: React.FC = () => {
                       e.stopPropagation();
                       handleStartRename(chat.id, chat.title);
                     }}
-                    className="p-1 rounded hover:bg-slate-700 text-slate-400 hover:text-slate-100 transition-colors"
+                    className="p-1 rounded hover:bg-[#dcd7cb] dark:hover:bg-[#33312d] text-[#6e6b63] dark:text-[#a19f96] hover:text-[#1f1e1d] dark:hover:text-[#edece8] transition-colors"
                     title="重命名"
                   >
                     <Pencil className="w-3 h-3" />
@@ -255,7 +257,7 @@ export const Sidebar: React.FC = () => {
                       e.stopPropagation();
                       handleDelete(chat.id);
                     }}
-                    className="p-1 rounded hover:bg-slate-700 text-slate-400 hover:text-red-400 transition-colors"
+                    className="p-1 rounded hover:bg-[#dcd7cb] dark:hover:bg-[#33312d] text-[#6e6b63] dark:text-[#a19f96] hover:text-rose-600 transition-colors"
                     title="删除"
                   >
                     <Trash2 className="w-3 h-3" />
@@ -267,29 +269,30 @@ export const Sidebar: React.FC = () => {
         </div>
       </div>
 
-      <div className="p-3 m-3 rounded-xl bg-slate-950/60 border border-slate-800/80 space-y-2">
-        <div className="flex items-center gap-2 text-xs font-medium text-slate-300">
-          <Cpu className="w-3.5 h-3.5 text-cyan-400" />
-          <span>当前提供程序</span>
+      {/* Bottom Status Card */}
+      <div className="p-3 m-3 rounded-xl bg-[#eae6db]/60 dark:bg-[#201f1c] border border-[#e3dfd5] dark:border-[#2a2926] space-y-2">
+        <div className="flex items-center gap-2 text-xs font-medium text-[#1f1e1d] dark:text-[#edece8]">
+          <Cpu className="w-3.5 h-3.5 text-[#da7756]" />
+          <span>服务提供节点</span>
         </div>
-        <div className="text-[11px] text-slate-400 flex items-center justify-between">
-          <span>模型</span>
-          <span className="text-slate-200 font-mono text-[10px] px-1.5 py-0.5 bg-slate-800 rounded">
+        <div className="text-[11px] text-[#6e6b63] dark:text-[#a19f96] flex items-center justify-between">
+          <span>当前模型</span>
+          <span className="text-[#1f1e1d] dark:text-[#edece8] font-mono text-[10px] px-1.5 py-0.5 bg-[#dcd7cb] dark:bg-[#2b2a27] rounded-md font-semibold">
             {selectedModel}
           </span>
         </div>
-        <div className="text-[11px] text-slate-400 flex items-center justify-between">
-          <span>数据库</span>
-          <span className="text-slate-200 font-mono text-[10px] px-1.5 py-0.5 bg-slate-800 rounded flex items-center gap-1">
-            <Database className="w-2.5 h-2.5 text-emerald-400" /> MySQL + Redis
+        <div className="text-[11px] text-[#6e6b63] dark:text-[#a19f96] flex items-center justify-between">
+          <span>存储</span>
+          <span className="text-[#1f1e1d] dark:text-[#edece8] font-mono text-[10px] px-1.5 py-0.5 bg-[#dcd7cb] dark:bg-[#2b2a27] rounded-md flex items-center gap-1">
+            <Database className="w-2.5 h-2.5 text-emerald-500" /> MySQL + Redis
           </span>
         </div>
         <button
           onClick={handleLogout}
-          className="w-full mt-2 py-1.5 px-3 rounded-lg bg-red-600/10 hover:bg-red-600/20 text-red-400 text-xs font-medium flex items-center justify-center gap-2 transition-colors border border-red-600/20"
+          className="w-full mt-2 py-1.5 px-3 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 text-xs font-medium flex items-center justify-center gap-2 transition-colors border border-rose-500/20"
         >
           <LogOut className="w-3.5 h-3.5" />
-          登出
+          退出登录
         </button>
       </div>
     </aside>

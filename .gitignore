@@ -76,3 +76,9 @@ desktop.ini
 .coverage
 htmlcov/
 .tox/
+
+# 评估报告（每次运行都会生成，不进版本库）
+back-end/eval/reports/
+
+# 真实价目表（示例见 model_prices.example.json）
+back-end/model_prices.json

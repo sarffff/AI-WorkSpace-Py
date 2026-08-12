@@ -1,186 +1,228 @@
+"""知识库文档的解析、入库与检索入口。
+
+索引结构与检索算法在 ``retrieval_index`` / ``retriever``，分块在 ``chunking``；
+这里只负责文档生命周期：解析 -> 落库 -> 分块向量化 -> 检索 -> 删除。
+"""
+from __future__ import annotations
+
 import io
-import re
+import logging
 
 from sqlalchemy.orm import Session
 
+from config import settings
 from models import Document, DocumentChunk
+from services.chunking import split_document
 from services.embedding_service import EmbeddingService
+from services.retrieval_index import invalidate_user_indexes
+from services.retriever import HybridRetriever, RetrievedChunk, format_context
+from services.token_budget import get_token_counter
 
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
+logger = logging.getLogger("knowledge_service")
 
-
-def _split_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """将文本分割为重叠的块"""
-    # 先按段落分割
-    paragraphs = re.split(r"\n\s*\n", text)
-    chunks: list[str] = []
-    current = ""
-
-    for para in paragraphs:
-        para = para.strip()
-        if not para:
-            continue
-        if len(current) + len(para) <= chunk_size:
-            current = (current + "\n\n" + para).strip() if current else para
-        else:
-            if current:
-                chunks.append(current)
-            current = para
-
-    if current:
-        chunks.append(current)
-
-    # 如果还有超长块，按字符截断并重叠
-    final_chunks: list[str] = []
-    for chunk in chunks:
-        if len(chunk) <= chunk_size:
-            final_chunks.append(chunk)
-        else:
-            start = 0
-            while start < len(chunk):
-                end = min(start + chunk_size, len(chunk))
-                final_chunks.append(chunk[start:end])
-                start += chunk_size - overlap
-
-    return final_chunks
+_TEXT_EXTENSIONS = {
+    "txt", "md", "js", "ts", "tsx", "jsx", "json", "xml", "yaml", "yml",
+    "css", "csv", "log", "sh", "java", "go", "rs", "c", "cpp", "py",
+}
 
 
 def _parse_file_content(filename: str, content: bytes) -> str:
-    """根据文件类型解析文本内容"""
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    """根据文件类型解析文本内容。不支持的格式抛 ValueError,由路由转成 400。"""
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
-    if ext in ("txt", "md", "py", "js", "ts", "tsx", "jsx", "json", "xml", "yaml", "yml", "css", "html"):
+    if extension in _TEXT_EXTENSIONS:
         return content.decode("utf-8", errors="replace")
 
-    if ext == "pdf":
+    if extension == "pdf":
         try:
             from PyPDF2 import PdfReader
-            reader = PdfReader(io.BytesIO(content))
-            return "\n\n".join(page.extract_text() or "" for page in reader.pages)
         except ImportError:
             raise ValueError("PDF 解析需要安装 PyPDF2 库")
+        reader = PdfReader(io.BytesIO(content))
+        return "\n\n".join(page.extract_text() or "" for page in reader.pages)
 
-    raise ValueError(f"不支持的文件格式: .{ext}")
+    raise ValueError(f"不支持的文件格式: .{extension}")
 
 
 class KnowledgeService:
-    def __init__(self):
+    def __init__(self, retriever: HybridRetriever | None = None) -> None:
         self.embedding = EmbeddingService()
+        self.retriever = retriever or HybridRetriever(embedding=self.embedding)
 
-    async def get_documents(self, db: Session) -> list[dict]:
-        """获取文档列表"""
-        documents = db.query(Document).order_by(Document.created_at.desc()).all()
+    async def get_documents(self, db: Session, user_id: str) -> list[dict]:
+        documents = (
+            db.query(Document)
+            .filter(Document.user_id == user_id)
+            .order_by(Document.created_at.desc())
+            .all()
+        )
         return [
             {
-                "id": doc.id,
-                "name": doc.name,
-                "size": doc.size,
-                "chunks": doc.chunks,
-                "status": doc.status,
-                "createdAt": doc.created_at.isoformat(),
+                "id": document.id,
+                "name": document.name,
+                "size": document.size,
+                "chunks": document.chunks,
+                "status": document.status,
+                "createdAt": document.created_at.isoformat(),
             }
-            for doc in documents
+            for document in documents
         ]
 
-    async def upload_document(self, db: Session, filename: str, content: bytes, user_id: str | None = None) -> Document:
-        """上传并索引文档"""
-        # 1. 解析文件内容
+    async def create_document(
+        self, db: Session, filename: str, content: bytes, user_id: str
+    ) -> Document:
+        """解析并落库，状态置 processing。分块与向量化交给 index_document。"""
         text = _parse_file_content(filename, content)
-
-        # 2. 创建文档记录
-        doc = Document(
+        document = Document(
             name=filename,
             size=len(content),
             content=text,
             user_id=user_id,
             status="processing",
         )
-        db.add(doc)
+        db.add(document)
         db.commit()
-        db.refresh(doc)
+        db.refresh(document)
+        return document
+
+    async def index_document(self, db: Session, document_id: str) -> None:
+        """分块 + 批量向量化 + 落库。
+
+        供后台任务调用，所以内部吞掉异常并把文档标成 failed —— 后台任务抛出的
+        异常没有接收方，状态机才是用户能看到的反馈。
+        """
+        document = db.query(Document).filter(Document.id == document_id).first()
+        if not document:
+            logger.warning("Document %s disappeared before indexing", document_id)
+            return
 
         try:
-            # 3. 分块
-            chunks = _split_text(text)
+            chunks = split_document(
+                document.content or "",
+                document.name,
+                max_tokens=settings.CHUNK_MAX_TOKENS,
+                overlap_tokens=settings.CHUNK_OVERLAP_TOKENS,
+                counter=get_token_counter(settings.TOKEN_COUNTER),
+            )
             if not chunks:
-                doc.status = "indexed"
-                doc.chunks = 0
+                document.status = "indexed"
+                document.chunks = 0
                 db.commit()
-                return doc
+                return
 
-            # 4. 批量向量化
-            embeddings = await self.embedding.embed_texts(chunks)
-
-            # 5. 保存分块和向量
-            for i, (chunk_text, vec) in enumerate(zip(chunks, embeddings)):
-                chunk = DocumentChunk(
-                    document_id=doc.id,
-                    content=chunk_text,
-                    embedding=EmbeddingService.serialize(vec),
-                    chunk_index=i,
+            embeddings = await self.embedding.embed_texts(
+                [chunk.content for chunk in chunks]
+            )
+            if len(embeddings) != len(chunks):
+                raise RuntimeError(
+                    f"Embedding 数量不匹配：期望 {len(chunks)}，实际 {len(embeddings)}"
                 )
-                db.add(chunk)
 
-            doc.chunks = len(chunks)
-            doc.status = "indexed"
+            for chunk, vector in zip(chunks, embeddings):
+                db.add(
+                    DocumentChunk(
+                        document_id=document.id,
+                        content=chunk.content,
+                        embedding=EmbeddingService.serialize(
+                            vector, model=settings.EMBEDDING_MODEL
+                        ),
+                        chunk_index=chunk.index,
+                    )
+                )
+            document.chunks = len(chunks)
+            document.status = "indexed"
             db.commit()
-
+            invalidate_user_indexes(document.user_id)
         except Exception:
-            doc.status = "failed"
-            db.commit()
-            raise
+            logger.exception("Indexing failed for document %s", document_id)
+            db.rollback()
+            failed = db.query(Document).filter(Document.id == document_id).first()
+            if failed:
+                failed.status = "failed"
+                db.commit()
 
-        return doc
+    async def upload_document(
+        self, db: Session, filename: str, content: bytes, user_id: str
+    ) -> Document:
+        """同步上传：解析、落库、立即索引。上传接口现在走异步路径，这里保留给脚本使用。"""
+        document = await self.create_document(db, filename, content, user_id)
+        await self.index_document(db, document.id)
+        db.refresh(document)
+        return document
 
-    async def search(self, db: Session, query: str, top_k: int = 5) -> list[dict]:
-        """RAG 检索：查询知识库中最相关的文本块"""
-        # 1. 向量化查询
-        query_vec = await self.embedding.embed_query(query)
-        if not query_vec:
+    async def retrieve(
+        self, db: Session, query: str, user_id: str, top_k: int = 5
+    ) -> list[RetrievedChunk]:
+        return await self.retriever.retrieve(db, user_id, query, top_k=top_k)
+
+    async def search(
+        self, db: Session, query: str, user_id: str, top_k: int = 5
+    ) -> list[dict]:
+        """检索接口，返回可直接 JSON 序列化的结果。"""
+        chunks = await self.retrieve(db, query, user_id, top_k)
+        return [chunk.as_dict() for chunk in chunks]
+
+    async def build_rag_context_with_citations(
+        self, db: Session, query: str, user_id: str, top_k: int = 5
+    ) -> tuple[str, list[dict]]:
+        """返回 (喂给模型的参考内容, 结构化引用列表)。"""
+        chunks = await self.retrieve(db, query, user_id, top_k)
+        return format_context(chunks), [chunk.as_dict() for chunk in chunks]
+
+    async def build_rag_context(
+        self, db: Session, query: str, user_id: str, top_k: int = 5
+    ) -> str:
+        context, _citations = await self.build_rag_context_with_citations(
+            db, query, user_id, top_k
+        )
+        return context
+
+    async def read_chunks(
+        self,
+        db: Session,
+        user_id: str,
+        document_id: str,
+        chunk_index: int,
+        window: int = 1,
+    ) -> list[dict]:
+        """读取指定分块及其相邻分块，仅返回归属于 user_id 的文档。"""
+        document = (
+            db.query(Document)
+            .filter(Document.id == document_id, Document.user_id == user_id)
+            .first()
+        )
+        if not document:
             return []
 
-        # 2. 加载所有分块并计算相似度
-        all_chunks = db.query(DocumentChunk).all()
-        scored = []
-        for chunk in all_chunks:
-            if not chunk.embedding:
-                continue
-            vec = EmbeddingService.deserialize(chunk.embedding)
-            sim = EmbeddingService.cosine_similarity(query_vec, vec)
-            scored.append((sim, chunk))
-
-        # 3. 排序取 top_k
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top = scored[:top_k]
-
+        chunks = (
+            db.query(DocumentChunk)
+            .filter(
+                DocumentChunk.document_id == document_id,
+                DocumentChunk.chunk_index >= max(0, chunk_index - window),
+                DocumentChunk.chunk_index <= chunk_index + window,
+            )
+            .order_by(DocumentChunk.chunk_index.asc())
+            .all()
+        )
         return [
             {
-                "id": chunk.id,
-                "document_id": chunk.document_id,
+                "document_name": document.name,
+                "chunk_index": chunk.chunk_index,
                 "content": chunk.content,
-                "score": round(score, 4),
             }
-            for score, chunk in top
+            for chunk in chunks
         ]
 
-    async def delete_document(self, db: Session, doc_id: str) -> bool:
-        """删除文档及其所有分块"""
-        doc = db.query(Document).filter(Document.id == doc_id).first()
-        if not doc:
+    async def delete_document(self, db: Session, doc_id: str, user_id: str) -> bool:
+        """删除文档及其所有分块（cascade），并让该用户的索引失效。"""
+        document = (
+            db.query(Document)
+            .filter(Document.id == doc_id, Document.user_id == user_id)
+            .first()
+        )
+        if not document:
             return False
-        db.delete(doc)  # cascade 会自动删除关联的 chunks
+        db.delete(document)
         db.commit()
+        invalidate_user_indexes(user_id)
         return True
-
-    async def build_rag_context(self, db: Session, query: str, top_k: int = 5) -> str:
-        """构建 RAG 上下文，返回格式化的文本"""
-        results = await self.search(db, query, top_k)
-        if not results:
-            return ""
-
-        parts = ["以下是知识库中与当前问题相关的参考内容：\n"]
-        for i, r in enumerate(results, 1):
-            parts.append(f"【参考 {i}】(相关度: {r['score']})\n{r['content']}\n")
-
-        return "\n".join(parts)

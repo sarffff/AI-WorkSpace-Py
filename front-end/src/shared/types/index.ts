@@ -12,7 +12,6 @@ export type {
   // Knowledge types
   KnowledgeDocument,
   // Request/Response types
-  CompletionRequest,
   CompletionResponse,
   ChatRequest,
   CreateChatRequest,

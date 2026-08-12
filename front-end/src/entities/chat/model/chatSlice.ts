@@ -1,5 +1,10 @@
 import { createSlice, PayloadAction } from "@reduxjs/toolkit";
-import type { UIMessage, ChatSession, NavTab } from "@/shared/types/api.types";
+import type {
+    UIMessage,
+    ChatSession,
+    NavTab,
+    Citation,
+} from "@/shared/types/api.types";
 
 interface ChatState {
     activeTab: NavTab;
@@ -9,6 +14,7 @@ interface ChatState {
     currentChatId: string | null;
     sessions: ChatSession[];
     messagesBySession: Record<string, UIMessage[]>;
+    pendingInput: string | null;
 }
 
 const initialState: ChatState = {
@@ -19,6 +25,7 @@ const initialState: ChatState = {
     currentChatId: null,
     sessions: [],
     messagesBySession: {},
+    pendingInput: null,
 };
 
 let _nextId = 1;
@@ -135,12 +142,54 @@ export const chatSlice = createSlice({
             if (msg) msg.content = action.payload.content;
         },
 
+        removeMessage: (
+            state,
+            action: PayloadAction<{ sessionId: string; messageId: string }>,
+        ) => {
+            const msgs = state.messagesBySession[action.payload.sessionId];
+            if (!msgs) return;
+            state.messagesBySession[action.payload.sessionId] = msgs.filter(
+                (message) => message.id !== action.payload.messageId,
+            );
+        },
+
+        /** 覆盖某条消息的 RAG 引用来源（流式期间会多次到达） */
+        setMessageCitations: (
+            state,
+            action: PayloadAction<{
+                sessionId: string;
+                messageId: string;
+                citations: Citation[];
+            }>,
+        ) => {
+            const msgs = state.messagesBySession[action.payload.sessionId];
+            if (!msgs) return;
+            const msg = msgs.find((m) => m.id === action.payload.messageId);
+            if (msg) msg.citations = action.payload.citations;
+        },
+
         setMessages: (
             state,
             action: PayloadAction<{ sessionId: string; messages: UIMessage[] }>,
         ) => {
             state.messagesBySession[action.payload.sessionId] =
                 action.payload.messages;
+        },
+
+        /** 从某个消息开始（含）往后截断，用于重新生成 / 编辑后重发 */
+        truncateMessagesAfter: (
+            state,
+            action: PayloadAction<{ sessionId: string; messageId: string }>,
+        ) => {
+            const msgs = state.messagesBySession[action.payload.sessionId];
+            if (!msgs) return;
+            const idx = msgs.findIndex((m) => m.id === action.payload.messageId);
+            if (idx < 0) return;
+            state.messagesBySession[action.payload.sessionId] = msgs.slice(0, idx);
+        },
+
+        setPendingInput: (state, action: PayloadAction<string | null>) => {
+            state.pendingInput = action.payload;
         },
     },
 });
@@ -159,7 +208,11 @@ export const {
     addMessage,
     appendToMessage,
     updateMessageContent,
+    removeMessage,
     setMessages,
+    truncateMessagesAfter,
+    setPendingInput,
+    setMessageCitations,
 } = chatSlice.actions;
 
 export default chatSlice.reducer;

@@ -17,7 +17,14 @@ class RedisService:
             return
 
         try:
-            self.client = redis.from_url(settings.REDIS_URL, decode_responses=True)
+            self.client = redis.from_url(
+                settings.REDIS_URL,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                socket_timeout=5,
+                health_check_interval=0,  # 禁用健康检查,兼容旧版 Redis
+                protocol=2,  # 强制 RESP2 协议,兼容 Redis 3.x
+            )
             self.client.ping()
             logger.info("Redis connected.")
         except redis.ConnectionError as e:
@@ -41,3 +48,7 @@ class RedisService:
         if not self.client:
             return 0
         return self.client.delete(key)
+
+
+# 创建全局实例
+redis_service = RedisService()

@@ -1,0 +1,299 @@
+"""检索索引：稠密向量 + BM25 稀疏检索，以及两者的 RRF 融合。
+
+单路稠密检索的盲区很具体：专有名词、错别字、精确的 API 名或编号，向量化之后
+语义相近但字面不同的东西会被拉到一起，而"字面完全命中"反而排不上去。BM25 恰好
+补上这一块。两路分数量纲不同（余弦相似度 vs TF-IDF 加权和），直接加权相加需要
+先做分数归一化且对分布敏感，所以这里用 RRF——只看排名不看分数。
+
+索引仍然是进程内、按用户隔离、按签名失效。多 worker 部署时每个 worker 各建一份，
+这是把向量搬到 pgvector / Qdrant 之前的已知限制。
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+import math
+import re
+import threading
+from collections import Counter
+from typing import Optional
+
+import numpy as np
+
+from config import settings
+from models import DocumentChunk
+from services.embedding_service import EmbeddingService
+
+logger = logging.getLogger("retrieval_index")
+
+try:
+    import faiss  # type: ignore
+
+    _FAISS_AVAILABLE = True
+except ImportError:
+    _FAISS_AVAILABLE = False
+    logger.info("faiss not installed, falling back to numpy cosine similarity.")
+
+
+_LATIN_TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+")
+_CJK_RUN_RE = re.compile(r"[㐀-䶿一-鿿぀-ヿ가-힯]+")
+
+
+def tokenize(text: str) -> list[str]:
+    """BM25 用的分词。
+
+    中文没有空格，按词切需要词典（jieba 之类）。这里用字符 bigram 作为无依赖的
+    替代：召回稍宽，但短查询下很稳，也不会因为分词器把专有名词切错而漏召回。
+    拉丁字母与数字按小写词元处理。
+    """
+    if not text:
+        return []
+    tokens = _LATIN_TOKEN_RE.findall(text.lower())
+    for run in _CJK_RUN_RE.findall(text):
+        if len(run) == 1:
+            tokens.append(run)
+            continue
+        tokens.extend(run[index : index + 2] for index in range(len(run) - 1))
+    return tokens
+
+
+def _signature(chunks: list[DocumentChunk], include_content: bool) -> str:
+    digest = hashlib.sha256()
+    for chunk in chunks:
+        digest.update(chunk.id.encode("utf-8"))
+        digest.update((chunk.content if include_content else chunk.embedding or "").encode("utf-8"))
+    return digest.hexdigest()
+
+
+class VectorIndex:
+    """进程内向量索引：按签名失效，FAISS 可用时走 IndexFlatIP，否则 numpy。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._ids: list[str] = []
+        self._matrix: Optional[np.ndarray] = None  # (n, d) float32, 已 L2 归一化
+        self._faiss_index = None
+        self._signature = ""
+        self._dimension = 0
+
+    def build_if_stale(self, chunks: list[DocumentChunk]) -> None:
+        with self._lock:
+            signature = _signature(chunks, include_content=False)
+            if self._matrix is not None and signature == self._signature:
+                return
+
+            ids: list[str] = []
+            vectors: list[list[float]] = []
+            dimension = 0
+            for chunk in chunks:
+                if not chunk.embedding:
+                    continue
+                try:
+                    embedding_model = EmbeddingService.deserialize_model(chunk.embedding)
+                    vector = EmbeddingService.deserialize(chunk.embedding)
+                except (TypeError, ValueError):
+                    logger.warning("Skipping invalid embedding for chunk %s", chunk.id)
+                    continue
+                if embedding_model and embedding_model != settings.EMBEDDING_MODEL:
+                    logger.warning(
+                        "Skipping chunk %s from embedding model %s (current: %s)",
+                        chunk.id,
+                        embedding_model,
+                        settings.EMBEDDING_MODEL,
+                    )
+                    continue
+                if not vector:
+                    continue
+                if dimension == 0:
+                    dimension = len(vector)
+                if len(vector) != dimension:
+                    logger.warning(
+                        "Skipping chunk %s because embedding dimension %s != %s",
+                        chunk.id,
+                        len(vector),
+                        dimension,
+                    )
+                    continue
+                vectors.append(vector)
+                ids.append(chunk.id)
+
+            self._signature = signature
+            self._ids = ids
+            self._dimension = dimension
+            if not vectors:
+                self._matrix = None
+                self._faiss_index = None
+                self._dimension = 0
+                return
+
+            matrix = np.asarray(vectors, dtype=np.float32)
+            norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            self._matrix = matrix / norms  # 归一化后内积即余弦相似度
+
+            if _FAISS_AVAILABLE:
+                self._faiss_index = faiss.IndexFlatIP(self._matrix.shape[1])
+                self._faiss_index.add(self._matrix)
+            else:
+                self._faiss_index = None
+
+    def search(self, query_vector: list[float], top_k: int = 5) -> list[tuple[float, str]]:
+        """返回 [(余弦相似度, chunk_id), ...]，按分数降序。"""
+        with self._lock:
+            if self._matrix is None or not self._ids:
+                return []
+            if len(query_vector) != self._dimension:
+                logger.error(
+                    "Query embedding dimension %s does not match index dimension %s",
+                    len(query_vector),
+                    self._dimension,
+                )
+                return []
+
+            query = np.asarray([query_vector], dtype=np.float32)
+            norm = np.linalg.norm(query, axis=1, keepdims=True)
+            norm[norm == 0] = 1.0
+            query = query / norm
+
+            limit = min(top_k, len(self._ids))
+            if _FAISS_AVAILABLE and self._faiss_index is not None:
+                scores, indices = self._faiss_index.search(query, limit)
+                return [
+                    (float(score), self._ids[index])
+                    for score, index in zip(scores[0], indices[0])
+                    if index >= 0
+                ]
+
+            similarities = (self._matrix @ query.T).reshape(-1)
+            top_indices = np.argsort(-similarities)[:limit]
+            return [(float(similarities[i]), self._ids[i]) for i in top_indices]
+
+
+class BM25Index:
+    """进程内 BM25 稀疏索引。
+
+    实现的是 BM25Okapi：词频饱和（k1）+ 文档长度归一化（b）+ 逆文档频率。
+    比朴素 TF-IDF 的关键改进是词频饱和——一个词在长文档里重复 50 次，
+    并不意味着相关度是重复 5 次的 10 倍。
+    """
+
+    K1 = 1.5
+    B = 0.75
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._signature = ""
+        self._ids: list[str] = []
+        self._term_freqs: list[Counter[str]] = []
+        self._lengths: list[int] = []
+        self._doc_freq: Counter[str] = Counter()
+        self._average_length = 0.0
+
+    def build_if_stale(self, chunks: list[DocumentChunk]) -> None:
+        with self._lock:
+            signature = _signature(chunks, include_content=True)
+            if self._ids and signature == self._signature:
+                return
+
+            self._signature = signature
+            self._ids = []
+            self._term_freqs = []
+            self._lengths = []
+            self._doc_freq = Counter()
+
+            for chunk in chunks:
+                tokens = tokenize(chunk.content or "")
+                if not tokens:
+                    continue
+                frequencies = Counter(tokens)
+                self._ids.append(chunk.id)
+                self._term_freqs.append(frequencies)
+                self._lengths.append(len(tokens))
+                self._doc_freq.update(frequencies.keys())
+
+            self._average_length = (
+                sum(self._lengths) / len(self._lengths) if self._lengths else 0.0
+            )
+
+    def search(self, query: str, top_k: int = 5) -> list[tuple[float, str]]:
+        """返回 [(BM25 分数, chunk_id), ...]，按分数降序，零分不返回。"""
+        query_terms = tokenize(query)
+        if not query_terms:
+            return []
+
+        with self._lock:
+            if not self._ids:
+                return []
+            total_docs = len(self._ids)
+            average_length = self._average_length or 1.0
+
+            idf: dict[str, float] = {}
+            for term in set(query_terms):
+                doc_freq = self._doc_freq.get(term, 0)
+                if doc_freq == 0:
+                    continue
+                # 加 1 保证 idf 恒为正，避免高频词产生负分把文档推到末尾
+                idf[term] = math.log(
+                    1 + (total_docs - doc_freq + 0.5) / (doc_freq + 0.5)
+                )
+            if not idf:
+                return []
+
+            scored: list[tuple[float, str]] = []
+            for position, chunk_id in enumerate(self._ids):
+                frequencies = self._term_freqs[position]
+                length = self._lengths[position]
+                score = 0.0
+                for term, term_idf in idf.items():
+                    frequency = frequencies.get(term, 0)
+                    if not frequency:
+                        continue
+                    denominator = frequency + self.K1 * (
+                        1 - self.B + self.B * length / average_length
+                    )
+                    score += term_idf * frequency * (self.K1 + 1) / denominator
+                if score > 0:
+                    scored.append((score, chunk_id))
+
+            scored.sort(key=lambda item: (-item[0], item[1]))
+            return scored[:top_k]
+
+
+def reciprocal_rank_fusion(
+    rankings: list[list[str]], k: int = 60
+) -> list[tuple[str, float]]:
+    """RRF 融合多条召回通道。
+
+    每条通道贡献 ``1 / (k + rank)``，只用排名不用分数——这样余弦相似度和 BM25
+    分数不需要归一化就能合并，也不会因为某一路分数尺度大而独占结果。
+    常数 k（经验值 60）压低头部名次的权重差，让多路都命中的文档更容易冒头。
+    """
+    scores: dict[str, float] = {}
+    for ranking in rankings:
+        for rank, chunk_id in enumerate(ranking, start=1):
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank)
+    return sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+
+
+class _UserIndexes:
+    __slots__ = ("vector", "bm25")
+
+    def __init__(self) -> None:
+        self.vector = VectorIndex()
+        self.bm25 = BM25Index()
+
+
+_indexes: dict[str, _UserIndexes] = {}
+_indexes_lock = threading.Lock()
+
+
+def get_user_indexes(user_id: str) -> _UserIndexes:
+    """按用户隔离索引，避免跨用户检索结果混合。"""
+    with _indexes_lock:
+        return _indexes.setdefault(user_id, _UserIndexes())
+
+
+def invalidate_user_indexes(user_id: str) -> None:
+    """文档增删后调用；下次检索时重建。"""
+    with _indexes_lock:
+        _indexes.pop(user_id, None)
