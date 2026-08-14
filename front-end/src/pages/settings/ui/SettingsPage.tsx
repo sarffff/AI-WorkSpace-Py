@@ -3,19 +3,12 @@ import { useDispatch } from "react-redux";
 import { apiClient } from "@/shared/api/client";
 import type { AppSettings, UserPreferences } from "@/shared/types/api.types";
 import { setSelectedModel } from "@/entities/chat/model/chatSlice";
-import { UsagePanel } from "@/widgets/usage-panel/ui/UsagePanel";
-import {
-    Loader2,
-    Save,
-    Check,
-    Server,
-    Cpu,
-    Database,
-    X,
-} from "lucide-react";
+import { useNavigate } from "react-router-dom";
+import { Server, Cpu, X, Loader2, Save, Check, Database, ArrowRight } from "lucide-react";
 
 export const SettingsPage: React.FC = () => {
     const dispatch = useDispatch();
+    const navigate = useNavigate();
     const [settings, setSettings] = useState<AppSettings | null>(null);
     const [prefs, setPrefs] = useState<UserPreferences | null>(null);
     const [loading, setLoading] = useState(true);
@@ -69,9 +62,9 @@ export const SettingsPage: React.FC = () => {
     }
 
     return (
-        <div className="p-8 h-full overflow-y-auto space-y-6 bg-[#fbf9f5] dark:bg-[#141413] transition-colors duration-200">
-            <div>
-                <h3 className="text-lg font-semibold text-[#1f1e1d] dark:text-[#edece8]">
+        <div className="p-8 h-full overflow-y-auto space-y-6 app-atmosphere transition-colors duration-200">
+            <div className="relative z-10 anim-fade-up">
+                <h3 className="font-display text-[22px] font-semibold text-[#1f1e1d] dark:text-[#edece8]">
                     设置
                 </h3>
                 <p className="text-xs text-[#6e6b63] dark:text-[#a19f96] mt-1">
@@ -93,9 +86,11 @@ export const SettingsPage: React.FC = () => {
 
             {/* 模型与生成参数 */}
             {prefs && settings && (
-                <div className="p-6 rounded-2xl bg-white dark:bg-[#1a1917] border border-[#e6e2d8] dark:border-[#282724] space-y-5 shadow-sm">
-                    <div className="flex items-center gap-2 pb-3 border-b border-[#e6e2d8] dark:border-[#282724]">
-                        <Cpu className="w-4 h-4 text-[#da7756]" />
+                <div className="card-surface p-6 rounded-2xl space-y-5 relative z-10 anim-fade-up stagger-1">
+                    <div className="flex items-center gap-2.5 pb-3 border-b border-[#e6e2d8] dark:border-[#282724]">
+                        <span className="w-6 h-6 rounded-lg bg-[#da7756]/12 text-[#da7756] flex items-center justify-center">
+                            <Cpu className="w-3.5 h-3.5" />
+                        </span>
                         <h4 className="text-sm font-semibold text-[#1f1e1d] dark:text-[#edece8]">
                             模型与生成参数
                         </h4>
@@ -154,7 +149,12 @@ export const SettingsPage: React.FC = () => {
                                         temperature: Number(e.target.value),
                                     })
                                 }
-                                className="w-full accent-[#da7756]"
+                                className="w-full slider-accent"
+                                style={
+                                    {
+                                        "--fill": `${(prefs.temperature / 2) * 100}%`,
+                                    } as React.CSSProperties
+                                }
                             />
                         </div>
                         <div>
@@ -170,7 +170,12 @@ export const SettingsPage: React.FC = () => {
                                 onChange={(e) =>
                                     setPrefs({ ...prefs, topP: Number(e.target.value) })
                                 }
-                                className="w-full accent-[#da7756]"
+                                className="w-full slider-accent"
+                                style={
+                                    {
+                                        "--fill": `${prefs.topP * 100}%`,
+                                    } as React.CSSProperties
+                                }
                             />
                         </div>
                     </div>
@@ -179,7 +184,7 @@ export const SettingsPage: React.FC = () => {
                         <button
                             onClick={handleSave}
                             disabled={saving}
-                            className="px-4 py-2.5 bg-[#da7756] hover:bg-[#c86544] text-white text-xs font-medium rounded-xl flex items-center gap-2 disabled:opacity-50 shadow-md shadow-[#da7756]/20 transition-all"
+                            className="btn-accent px-4 py-2.5 text-white text-xs font-medium rounded-xl flex items-center gap-2 disabled:opacity-50"
                         >
                             {saving ? (
                                 <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -196,9 +201,11 @@ export const SettingsPage: React.FC = () => {
 
             {/* 服务端配置（只读） */}
             {settings && (
-                <div className="p-6 rounded-2xl bg-white dark:bg-[#1a1917] border border-[#e6e2d8] dark:border-[#282724] space-y-4 shadow-sm">
-                    <div className="flex items-center gap-2 pb-3 border-b border-[#e6e2d8] dark:border-[#282724]">
-                        <Server className="w-4 h-4 text-[#da7756]" />
+                <div className="card-surface p-6 rounded-2xl space-y-4 relative z-10 anim-fade-up stagger-2">
+                    <div className="flex items-center gap-2.5 pb-3 border-b border-[#e6e2d8] dark:border-[#282724]">
+                        <span className="w-6 h-6 rounded-lg bg-[#da7756]/12 text-[#da7756] flex items-center justify-center">
+                            <Server className="w-3.5 h-3.5" />
+                        </span>
                         <h4 className="text-sm font-semibold text-[#1f1e1d] dark:text-[#edece8]">
                             服务端配置
                         </h4>
@@ -228,8 +235,31 @@ export const SettingsPage: React.FC = () => {
                 </div>
             )}
 
-            {/* 用量与成本 */}
-            <UsagePanel />
+            {/* 迁移提示 */}
+            <div className="card-surface rounded-2xl p-5 relative z-10 anim-fade-up stagger-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <span className="w-10 h-10 rounded-xl bg-[#da7756]/12 text-[#da7756] flex items-center justify-center">
+                    <Server className="w-5 h-5" />
+                  </span>
+                  <div>
+                    <div className="text-sm font-semibold text-[#1f1e1d] dark:text-[#edece8]">
+                      用量与运行轨迹
+                    </div>
+                    <div className="text-xs text-[#6e6b63] dark:text-[#a19f96] mt-0.5">
+                      用量统计与 Agent 运行轨迹已移至工作台和运行轨迹页
+                    </div>
+                  </div>
+                </div>
+                <button
+                  onClick={() => navigate("/dashboard")}
+                  className="btn-accent px-4 py-2 text-xs font-medium rounded-xl flex items-center gap-2"
+                >
+                  <ArrowRight className="w-3.5 h-3.5" />
+                  前往
+                </button>
+              </div>
+            </div>
 
             {/* 数据库状态卡 */}
             <div className="grid grid-cols-3 gap-4">
@@ -284,7 +314,7 @@ const StatusCard: React.FC<{
     value: string;
     ok?: boolean;
 }> = ({ icon, title, value, ok }) => (
-    <div className="p-5 rounded-2xl bg-white dark:bg-[#1a1917] border border-[#e6e2d8] dark:border-[#282724] space-y-1 shadow-sm">
+    <div className="card-surface card-lift p-5 rounded-2xl space-y-1.5 relative z-10">
         <div
             className={`flex items-center gap-2 text-xs font-semibold tracking-wide ${
                 ok

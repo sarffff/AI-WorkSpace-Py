@@ -4,6 +4,7 @@ import type {
     ChatSession,
     NavTab,
     Citation,
+    GuardrailNotice,
 } from "@/shared/types/api.types";
 
 interface ChatState {
@@ -15,7 +16,24 @@ interface ChatState {
     sessions: ChatSession[];
     messagesBySession: Record<string, UIMessage[]>;
     pendingInput: string | null;
+    /**
+     * 提示词实验台里选中的系统提示词版本。null = 用服务端默认版本。
+     * 存在这里而不是每次从后端读:它是"这次实验用哪版"的本地意图,
+     * 不是服务端状态——后端那边的默认版本并不会因为你在界面上试了一版而改变。
+     */
+    promptVersion: string | null;
 }
+
+// 刷新页面不该悄悄把实验组切回对照组,所以选择要落盘
+const PROMPT_VERSION_KEY = "prompt_version";
+
+const readStoredPromptVersion = (): string | null => {
+    try {
+        return localStorage.getItem(PROMPT_VERSION_KEY);
+    } catch {
+        return null;
+    }
+};
 
 const initialState: ChatState = {
     activeTab: "chat",
@@ -26,6 +44,7 @@ const initialState: ChatState = {
     sessions: [],
     messagesBySession: {},
     pendingInput: null,
+    promptVersion: readStoredPromptVersion(),
 };
 
 let _nextId = 1;
@@ -168,6 +187,36 @@ export const chatSlice = createSlice({
             if (msg) msg.citations = action.payload.citations;
         },
 
+        /** 覆盖某条消息的护栏提示（检索资料里发现可疑指令时） */
+        setMessageGuardrail: (
+            state,
+            action: PayloadAction<{
+                sessionId: string;
+                messageId: string;
+                notice: GuardrailNotice;
+            }>,
+        ) => {
+            const msgs = state.messagesBySession[action.payload.sessionId];
+            if (!msgs) return;
+            const msg = msgs.find((m) => m.id === action.payload.messageId);
+            if (msg) msg.guardrail = action.payload.notice;
+        },
+
+        /** 流式 done 后回写服务端消息 id,用于关联运行轨迹 */
+        setMessageServerId: (
+            state,
+            action: PayloadAction<{
+                sessionId: string;
+                localId: string;
+                serverId: string;
+            }>,
+        ) => {
+            const msgs = state.messagesBySession[action.payload.sessionId];
+            if (!msgs) return;
+            const msg = msgs.find((m) => m.id === action.payload.localId);
+            if (msg) msg.messageId = action.payload.serverId;
+        },
+
         setMessages: (
             state,
             action: PayloadAction<{ sessionId: string; messages: UIMessage[] }>,
@@ -191,6 +240,20 @@ export const chatSlice = createSlice({
         setPendingInput: (state, action: PayloadAction<string | null>) => {
             state.pendingInput = action.payload;
         },
+
+        /** 选中要试的系统提示词版本;null 表示回到服务端默认版本 */
+        setPromptVersion: (state, action: PayloadAction<string | null>) => {
+            state.promptVersion = action.payload;
+            try {
+                if (action.payload) {
+                    localStorage.setItem(PROMPT_VERSION_KEY, action.payload);
+                } else {
+                    localStorage.removeItem(PROMPT_VERSION_KEY);
+                }
+            } catch {
+                // 隐私模式下 localStorage 会抛异常，选择只在本次会话内有效
+            }
+        },
     },
 });
 
@@ -213,6 +276,9 @@ export const {
     truncateMessagesAfter,
     setPendingInput,
     setMessageCitations,
+    setMessageServerId,
+    setMessageGuardrail,
+    setPromptVersion,
 } = chatSlice.actions;
 
 export default chatSlice.reducer;

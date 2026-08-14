@@ -56,6 +56,59 @@ class Settings(BaseSettings):
     # 一次回答中所有工具结果的总字符预算,防止多轮累积撑爆上下文窗口
     TOOL_RESULT_TOTAL_CHARS: int = 12000
 
+    # ========== 工具轨迹（跨回合记忆） ==========
+    # 回合内工具结果是靠 messages 回灌的,回合结束那个列表就没了,落库的只有
+    # 最终回答。开启后把每步工具执行存进 message_tool_steps,下一回合按预算
+    # 回灌成一段记录,模型才知道自己上一回合读过什么。
+    # 关掉即退回"每个回合从零开始",可作为对照。
+    TOOL_HISTORY_ENABLED: bool = True
+    # 回灌的 token 预算,超出的部分从最旧的步骤开始丢
+    TOOL_HISTORY_TOKEN_BUDGET: int = 600
+    # 单步摘要的字符上限。给得太小就只剩工具名,给得太大不如让模型重新调一次工具
+    TOOL_HISTORY_STEP_CHARS: int = 240
+    # 每回合从数据库取回多少条备选步骤,再由 token 预算决定留几条
+    TOOL_HISTORY_FETCH_LIMIT: int = 20
+    # 单步结果落库的字符上限。存的是原始正文,不是摘要
+    TOOL_HISTORY_STORE_MAX_CHARS: int = 4000
+
+    # ========== Workspace 工具 ==========
+    # 知识库那三个工具由界面上的「知识库」开关(use_rag)控制,这里几个各自独立:
+    # 查网页、算数、读附件都不需要知识库,绑在同一个开关上等于关掉知识库就没了
+    # 计算器。默认全部关闭——打开一个工具就是把它的失败模式和攻击面一起打开。
+    #
+    # 打开之后建议把 PROMPT_CHAT_SYSTEM_VERSION 切到 v4-workspace:默认的 v2
+    # 只讲了知识库那三个工具,新工具全靠 schema 里的 description 自己撑着。
+    TOOL_CALCULATE_ENABLED: bool = False
+    TOOL_READ_ATTACHMENT_ENABLED: bool = False
+    TOOL_WEB_SEARCH_ENABLED: bool = False
+    # 唯一的写操作。默认关闭不是保守:内容可能是模型转述的网页,写进知识库就等于
+    # 让注入内容获得持久化,并在之后每一轮 RAG 里被复用。
+    TOOL_WRITE_KNOWLEDGE_ENABLED: bool = False
+    AGENT_WRITE_MAX_CHARS: int = 20000
+
+    # 读附件:单个文件的字节上限与注入上下文的字符上限
+    ATTACHMENT_READ_MAX_BYTES: int = 5 * 1024 * 1024
+    ATTACHMENT_READ_MAX_CHARS: int = 8000
+
+    # web 搜索。provider 为空或缺 API key 时这个工具**根本不注册**
+    WEB_SEARCH_PROVIDER: str = ""  # tavily | serper
+    WEB_SEARCH_API_KEY: str = ""
+    # 留空则用提供商默认端点;填了可指向自建代理或区域端点
+    WEB_SEARCH_BASE_URL: str = ""
+    WEB_SEARCH_RESULTS: int = 5
+    WEB_SEARCH_SNIPPET_CHARS: int = 300
+    WEB_SEARCH_TIMEOUT_SECONDS: float = 10.0
+
+    # ========== 视觉 ==========
+    # 能接收 image_url 内容块的模型白名单(逗号分隔)。留空即关闭多模态,
+    # 图片仍以 Markdown 链接留在提示词里(也就是模型看不见)。
+    # 用白名单而不是猜名字:模型命名毫无规律,猜错的代价是每个带图请求都拿到 400。
+    VISION_MODELS: str = ""
+    # 单张图片的字节上限。base64 会把体积放大三分之一,直接决定请求体大小
+    VISION_MAX_IMAGE_BYTES: int = 4 * 1024 * 1024
+    # 一轮最多带几张。图片按面积折算 token,一张高清图能顶几千字
+    VISION_MAX_IMAGES: int = 4
+
     # ========== 分块配置 ==========
     # token 计数器: heuristic(零依赖估算) | tiktoken(精确,需额外安装且首次会下载词表)
     TOKEN_COUNTER: str = "heuristic"
@@ -86,6 +139,36 @@ class Settings(BaseSettings):
     # 超出预算的早期历史是否压成滚动摘要(关闭则直接丢弃)
     HISTORY_SUMMARY: bool = True
     HISTORY_SUMMARY_MAX_TOKENS: int = 400
+
+    # ========== 语义缓存 ==========
+    # 默认关闭:嵌入向量对时间、否定这类"改变答案"的差异不敏感,
+    # 命中一条相似但不同的问题会直接答错。开启即接受这个取舍。
+    SEMANTIC_CACHE_ENABLED: bool = False
+    # 余弦相似度阈值。这个数应该由评估集扫出来,不是拍脑袋定的
+    SEMANTIC_CACHE_THRESHOLD: float = 0.95
+    SEMANTIC_CACHE_TTL_SECONDS: int = 86400
+    # 每个用户最多缓存多少条(进程内存储,超量丢最旧)
+    SEMANTIC_CACHE_MAX_ENTRIES: int = 200
+
+    # ========== 安全护栏 ==========
+    # 关闭后检索内容原样拼进提示词(只建议在排查护栏误报时临时关闭)
+    GUARDRAIL_ENABLED: bool = True
+    # 注入模式累计分数达到该值时,整段检索结果不再注入(0 = 只标记不拦截)。
+    # 默认只观测:误报的表现是"明明有资料却答不出来",比漏报更难排查,
+    # 先在 trace 里看一段时间命中情况再决定收紧到多少。
+    GUARDRAIL_BLOCK_SCORE: int = 0
+
+    # ========== 提示词版本 ==========
+    # 实际正文在 back-end/prompts/<key>/<version>.md,这里只选用哪一版。
+    # 之所以做成配置项:提示词是改动最频繁的那部分"代码",而"换一版提示词"
+    # 必须能像换检索开关一样被 eval/variants.py 扫,否则只能靠感觉调词。
+    PROMPT_CHAT_SYSTEM_VERSION: str = "v2"
+    PROMPT_EVAL_ANSWER_VERSION: str = "v1"
+
+    # ========== 时区 ==========
+    # 应用写入 naive DATETIME 列时使用的时区偏移(小时)。必须与数据库服务器的
+    # 墙上时间一致,否则 server_default=func.now() 写的行和应用写的行会差一个时区。
+    APP_TZ_OFFSET_HOURS: int = 8
 
     # ========== 可观测性 ==========
     # 关闭后所有埋点退化为无副作用的空操作,不写库

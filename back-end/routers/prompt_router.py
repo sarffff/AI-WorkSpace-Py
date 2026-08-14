@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from auth import get_current_user
 from database import get_db
 from models import User
+from services import prompt_library
 from services.prompt_service import PromptService
 
 router = APIRouter(prefix="/prompts", tags=["提示词"])
@@ -36,6 +37,20 @@ async def list_prompts(
 ):
     """获取提示词列表（当前用户的 + 公开的）"""
     return await prompt_service.list_prompts(db, user_id=current_user.id)
+
+
+@router.get("/library")
+async def get_prompt_library(
+    current_user: User = Depends(get_current_user),
+):
+    """系统提示词注册表（只读）。
+
+    只读是刻意的：这些版本是仓库里的文件，要经过 code review 和 git 历史。
+    如果开一个"在线编辑系统提示词"的接口，评估跑出的分数就不再对应任何
+    可回溯的版本——"上次那组数是哪版提示词跑的"会变成没人能回答的问题。
+    想试新写法，就在 prompts/<key>/ 下加一个版本文件。
+    """
+    return {"entries": prompt_library.catalog()}
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)

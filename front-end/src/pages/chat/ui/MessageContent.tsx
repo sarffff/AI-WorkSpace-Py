@@ -94,7 +94,7 @@ const MarkdownBlock: React.FC<{ text: string }> = ({ text }) => {
                 components={{
                     code: CodeBlock as never,
                     pre: ({ children }) => <>{children}</>,
-                    a: ({ node, ...props }) => (
+                    a: ({ node: _node, ...props }) => (
                         <a
                             {...props}
                             target="_blank"
@@ -102,7 +102,7 @@ const MarkdownBlock: React.FC<{ text: string }> = ({ text }) => {
                             className="text-[#da7756] underline hover:opacity-80"
                         />
                     ),
-                    table: ({ node, ...props }) => (
+                    table: ({ node: _node, ...props }) => (
                         <div className="overflow-x-auto my-3">
                             <table
                                 {...props}
@@ -110,38 +110,47 @@ const MarkdownBlock: React.FC<{ text: string }> = ({ text }) => {
                             />
                         </div>
                     ),
-                    th: ({ node, ...props }) => (
+                    th: ({ node: _node, ...props }) => (
                         <th
                             {...props}
                             className="px-3 py-2 bg-[#f3f0e6] dark:bg-[#201f1c] border border-[#e6e2d8] dark:border-[#282724] text-left font-semibold"
                         />
                     ),
-                    td: ({ node, ...props }) => (
+                    td: ({ node: _node, ...props }) => (
                         <td
                             {...props}
                             className="px-3 py-2 border border-[#e6e2d8] dark:border-[#282724]"
                         />
                     ),
-                    ul: ({ node, ...props }) => (
+                    ul: ({ node: _node, ...props }) => (
                         <ul {...props} className="list-disc pl-5 my-2 space-y-1" />
                     ),
-                    ol: ({ node, ...props }) => (
+                    ol: ({ node: _node, ...props }) => (
                         <ol {...props} className="list-decimal pl-5 my-2 space-y-1" />
                     ),
-                    blockquote: ({ node, ...props }) => (
+                    blockquote: ({ node: _node, ...props }) => (
                         <blockquote
                             {...props}
-                            className="border-l-2 border-[#da7756] pl-3 my-2 text-[#6e6b63] dark:text-[#a19f96]"
+                            className="border-l-[3px] border-[#da7756]/60 bg-[#da7756]/5 rounded-r-lg py-1.5 px-3 my-2 text-[#6e6b63] dark:text-[#a19f96] italic"
                         />
                     ),
-                    h1: ({ node, ...props }) => (
-                        <h1 {...props} className="text-lg font-bold my-3" />
+                    h1: ({ node: _node, ...props }) => (
+                        <h1
+                            {...props}
+                            className="font-display text-lg font-semibold mt-4 mb-2.5"
+                        />
                     ),
-                    h2: ({ node, ...props }) => (
-                        <h2 {...props} className="text-base font-bold my-2" />
+                    h2: ({ node: _node, ...props }) => (
+                        <h2
+                            {...props}
+                            className="font-display text-base font-semibold mt-3.5 mb-2"
+                        />
                     ),
-                    h3: ({ node, ...props }) => (
-                        <h3 {...props} className="text-sm font-bold my-2" />
+                    h3: ({ node: _node, ...props }) => (
+                        <h3
+                            {...props}
+                            className="text-sm font-semibold mt-3 mb-1.5"
+                        />
                     ),
                 }}
             >
@@ -164,7 +173,8 @@ const CodeBlock: React.FC<CodeProps> = ({ inline, className, children }) => {
     if (inline) {
         return (
             <code
-                className={`px-1.5 py-0.5 rounded bg-[#f3f0e6] dark:bg-[#201f1c] text-[#da7756] text-[0.85em] font-mono ${className ?? ""}`}
+                className={`px-1.5 py-0.5 rounded-md bg-[#da7756]/10 text-[#c86544] dark:text-[#e08a6a] text-[0.85em] border border-[#da7756]/20 ${className ?? ""}`}
+                style={{ fontFamily: "var(--font-mono)" }}
             >
                 {children}
             </code>
@@ -179,14 +189,28 @@ const CodeBlock: React.FC<CodeProps> = ({ inline, className, children }) => {
     };
 
     return (
-        <div className="relative group my-3 rounded-xl overflow-hidden border border-[#282724] bg-[#1a1917]">
-            <div className="flex items-center justify-between px-3 py-1.5 bg-[#201f1c] border-b border-[#282724]">
-                <span className="text-[10px] text-[#918d83] font-mono">
-                    {extractLang(className)}
-                </span>
+        <div className="relative group my-3 rounded-xl overflow-hidden border border-[#e3dfd5] dark:border-[#2e2d2a] bg-[var(--hl-code-bg)] shadow-sm">
+            <div className="flex items-center justify-between px-3.5 py-2 border-b border-[#e3dfd5]/70 dark:border-[#2e2d2a]">
+                <div className="flex items-center gap-2.5">
+                    <span className="flex items-center gap-1.5">
+                        <span className="w-2.5 h-2.5 rounded-full bg-[#ff5f57]/80" />
+                        <span className="w-2.5 h-2.5 rounded-full bg-[#febc2e]/80" />
+                        <span className="w-2.5 h-2.5 rounded-full bg-[#28c840]/80" />
+                    </span>
+                    <span
+                        className="text-[10px] text-[#918d83] uppercase tracking-wider"
+                        style={{ fontFamily: "var(--font-mono)" }}
+                    >
+                        {extractLang(className) || "code"}
+                    </span>
+                </div>
                 <button
                     onClick={handleCopy}
-                    className="flex items-center gap-1 text-[10px] text-[#918d83] hover:text-[#edece8] transition-colors"
+                    className={`flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded-md transition-all ${
+                        copied
+                            ? "text-emerald-600 dark:text-emerald-400"
+                            : "text-[#918d83] hover:text-[#da7756] hover:bg-[#da7756]/10"
+                    }`}
                 >
                     {copied ? (
                         <>
@@ -199,8 +223,13 @@ const CodeBlock: React.FC<CodeProps> = ({ inline, className, children }) => {
                     )}
                 </button>
             </div>
-            <pre className="overflow-x-auto p-3 text-xs leading-relaxed">
-                <code className={`font-mono ${className ?? ""}`}>{children}</code>
+            <pre className="overflow-x-auto p-3.5 text-xs leading-relaxed">
+                <code
+                    className={className ?? ""}
+                    style={{ fontFamily: "var(--font-mono)" }}
+                >
+                    {children}
+                </code>
             </pre>
         </div>
     );

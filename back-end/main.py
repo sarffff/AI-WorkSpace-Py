@@ -21,7 +21,10 @@ from routers import (
     settings_router,
     attachment_router,
     metrics_router,
+    feedback_router,
 )
+from services import prompt_library
+from services import workspace_tools
 
 app = FastAPI(
     title="AI Workspace API",
@@ -67,6 +70,7 @@ app.include_router(prompt_router.router)
 app.include_router(settings_router.router)
 app.include_router(attachment_router.router)
 app.include_router(metrics_router.router)
+app.include_router(feedback_router.router)
 
 # 静态文件服务：附件上传后的访问入口
 os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
@@ -130,6 +134,15 @@ async def startup():
     """应用启动时执行"""
     init_db()
     _seed_prompts()
+    # 提示词模板有问题（占位符对不上、条件段没闭合、默认版本已归档）就在这里
+    # 起不来，而不是等第一个用户提问时才在 500 里暴露。
+    prompt_library.validate()
+    # 工具是按开关注册的，而"开关开了但没配 key 的 web_search 根本不注册"这类
+    # 静默行为在界面上只表现为"模型不用那个工具"——分不清是没注册还是模型不想用。
+    # 所以启动时把实际注册了哪些打出来，这是排查工具类问题的第一现场。
+    print(f"Workspace tools: {', '.join(workspace_tools.enabled_names()) or '(全部关闭)'}")
+    print(f"Vision models: {settings.VISION_MODELS or '(未启用，图片只会以链接形式留在提示词里)'}")
+    print(f"Chat system prompt: chat_system_rag/{settings.PROMPT_CHAT_SYSTEM_VERSION}")
     print(f"AI Workspace Server (Python) is running on: http://localhost:{settings.PORT}")
 
 

@@ -13,6 +13,7 @@ from services.settings_service import (
     load_preferences,
     save_preferences,
 )
+from services.web_search import web_search_client
 
 router = APIRouter(prefix="/settings", tags=["设置"])
 
@@ -40,6 +41,21 @@ async def get_settings(
         },
         "preferences": prefs,
         "availableModels": available_models(),
+        # 前端需要据此改变行为，不只是显示一个开关状态：
+        # ``readAttachment`` 决定文本附件是"只给路径"还是"内联全文"——工具没开
+        # 却只给路径，等于把附件内容彻底丢掉，模型拿到一个它读不了的字符串。
+        # ``toolHistory`` 决定工具轨迹面板在历史回合里为空时该怎么解释。
+        # web_search 报的是"真的注册了吗"，而不是开关值：开关开了但没配 key 时
+        # 那个工具根本不注册，只报开关值会让界面说谎。
+        "capabilities": {
+            "calculate": app_settings.TOOL_CALCULATE_ENABLED,
+            "readAttachment": app_settings.TOOL_READ_ATTACHMENT_ENABLED,
+            "webSearch": (
+                app_settings.TOOL_WEB_SEARCH_ENABLED and web_search_client.configured
+            ),
+            "writeKnowledge": app_settings.TOOL_WRITE_KNOWLEDGE_ENABLED,
+            "toolHistory": app_settings.TOOL_HISTORY_ENABLED,
+        },
     }
 
 

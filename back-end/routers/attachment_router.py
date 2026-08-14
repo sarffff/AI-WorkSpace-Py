@@ -6,13 +6,13 @@
 """
 import os
 import uuid
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse
 
 from auth import get_current_user
 from config import settings
+from services.clock import now as app_now
 
 router = APIRouter(prefix="/chats/attachments", tags=["对话附件"])
 
@@ -89,7 +89,7 @@ async def upload_attachment(
             )
 
     # 按年月分目录
-    ym = datetime.now(timezone.utc).strftime("%Y%m")
+    ym = app_now().strftime("%Y%m")
     upload_dir = os.path.join(settings.UPLOAD_DIR, ym)
     os.makedirs(upload_dir, exist_ok=True)
 

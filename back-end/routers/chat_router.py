@@ -11,6 +11,7 @@ from auth import get_current_user
 from database import get_db
 from models import Message, User
 from services.chat_service import ChatService
+from services import prompt_library
 from services.settings_service import is_model_allowed, load_preferences
 
 router = APIRouter(prefix="/chats", tags=["对话"])
@@ -24,6 +25,9 @@ class ChatRequest(BaseModel):
     chat_id: str | None = None
     use_rag: bool = False
     message_id: uuid.UUID | None = None
+    # 只对这一次请求生效的系统提示词版本。不传则用 settings 里的默认版本。
+    # 做成请求级而不是全局开关:提示词实验台上试新版时,别人的对话不该被改。
+    prompt_version: str | None = None
 
 
 class CreateChatRequest(BaseModel):
@@ -40,6 +44,22 @@ class ReviseMessageRequest(BaseModel):
 
 def _assistant_message_id(user_message_id: str) -> str:
     return str(uuid.uuid5(uuid.UUID(user_message_id), "assistant-response"))
+
+
+def _prompt_version(requested: str | None) -> str | None:
+    """校验请求指定的系统提示词版本。
+
+    版本不存在直接 400,不做"回退到默认版本"——静默回退会让实验组的请求
+    悄悄跑成对照组,拿到的对比结论是错的,而且没有任何迹象。
+    """
+    if requested is None:
+        return None
+    available = prompt_library.available_request_versions()
+    if requested not in available:
+        raise HTTPException(
+            status_code=400, detail=f"提示词版本不存在，可用：{available}"
+        )
+    return requested
 
 
 def _generation_options(user_id: str, requested_model: str | None) -> dict:
@@ -77,6 +97,24 @@ async def get_chat_messages(
         raise HTTPException(status_code=404, detail="对话不存在")
     
     return await chat_service.get_chat_messages(db, chat_id)
+
+
+@router.get("/{chat_id}/tool-steps")
+async def get_chat_tool_steps(
+    chat_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """获取指定对话的工具执行轨迹（只读）。
+
+    和消息分成两个接口:SSE 里的 tool_start / tool_result 是瞬时事件,刷新页面
+    就没了,这里是把那条时间线找回来的唯一入口。
+    """
+    chat = await chat_service.get_chat_by_id(db, chat_id)
+    if not chat or chat.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="对话不存在")
+
+    return {"steps": await chat_service.get_chat_tool_steps(db, chat_id)}
 
 
 @router.post("")
@@ -201,6 +239,7 @@ async def completions(
         options["temperature"],
         options["max_tokens"],
         options["top_p"],
+        _prompt_version(request.prompt_version),
     )
 
     # 保存 AI 响应
@@ -240,6 +279,9 @@ async def stream_completions(
             raise HTTPException(status_code=404, detail="对话不存在")
 
     options = _generation_options(current_user.id, request.model)
+    # 在进入 SSE 生成器之前校验:生成器里抛 HTTPException 只会得到一条
+    # 已经建立、然后突然断掉的流,前端拿不到 400 也看不到原因。
+    prompt_version = _prompt_version(request.prompt_version)
     user_message_id = str(request.message_id or uuid.uuid4())
     try:
         await chat_service.save_message(
@@ -298,6 +340,7 @@ async def stream_completions(
                 options["temperature"],
                 options["max_tokens"],
                 options["top_p"],
+                prompt_version,
             ):
                 payload = {**event, "chat_id": chat_id}
                 if event["type"] == "message_delta":
@@ -308,7 +351,9 @@ async def stream_completions(
                 if failed:
                     break
 
-            # 仅持久化最终面向用户的文本;工具事件为瞬时状态,不落库。
+            # 这里只落最终面向用户的文本。工具轨迹已经在循环内逐步写进
+            # message_tool_steps 了,不需要(也不该)等到流跑完才存——
+            # 流被掐断时那几步的检索成本是真花掉了。
             if not failed and full_response.strip():
                 await chat_service.save_message(
                     db,

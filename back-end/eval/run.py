@@ -15,23 +15,25 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timezone
 from typing import Any
 
 from eval import runner
 from eval.variants import VARIANTS, resolve
+from services.clock import now as app_now
 
 _REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports")
 
 # 报告表格里展示的列。None 值渲染成 "-"，不要粉饰成 0
 _COLUMNS = [
     ("variant", "变体"),
+    ("answerPrompt", "提示词"),
     ("recall", "recall@k"),
     ("ndcg", "nDCG@k"),
     ("mrr", "MRR"),
     ("faithfulness", "忠实度"),
     ("relevance", "相关性"),
     ("abstentionRate", "拒答率"),
+    ("injectionResistRate", "抗注入率"),
     ("promptTokens", "输入 token"),
     ("completionTokens", "输出 token"),
     ("cost", "成本"),
@@ -60,7 +62,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines = [
         "# RAG 配置对照报告",
         "",
-        f"生成时间：{datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+        f"生成时间：{app_now().isoformat(timespec='seconds')}",
         f"问题数：{summaries[0]['questions'] if summaries else 0}",
         "",
         "| " + " | ".join(label for _key, label in _COLUMNS) + " |",
@@ -93,7 +95,12 @@ def render_markdown(report: dict[str, Any]) -> str:
         "- 成本列为空表示没配价目表（见 model_prices.example.json），不代表零成本。",
         "- 忠实度/相关性是 LLM 裁判打分，只用于变体间相对比较，不是绝对质量。",
         "- 探针类型里 `lexical` 考字面精确匹配，`paraphrase` 考语义改写，",
-        "  `cross_section` / `cross_document` 考跨段落与跨文档，`absent` 考拒答。",
+        "  `cross_section` / `cross_document` 考跨段落与跨文档，`absent` 考拒答，",
+        "  `injection` 考资料夹带指令时会不会被带走。",
+        "- 抗注入率只统计带 must_avoid 的样本；它衡量的是「提示词 + 护栏」的联合表现，",
+        "  单独下降不能断定是哪一侧退化，要回到 trace 里看 guardrail.* 属性有没有命中。",
+        "- 提示词列是本轮用的 eval_rag_answer 版本（正文见 prompts/eval_rag_answer/）。",
+        "  只换提示词的变体，检索指标应当与 baseline 逐位相同；不同就说明配置串了。",
         "",
     ]
     return "\n".join(lines)
@@ -107,6 +114,11 @@ async def main() -> None:
         help=f"逗号分隔，或 all。可用：{', '.join(VARIANTS)}",
     )
     parser.add_argument("--limit", type=int, default=None, help="只跑前 N 个问题")
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help="改用别的数据集文件（如 eval/datasets/feedback_regression.jsonl）",
+    )
     parser.add_argument("--out", default=_REPORT_DIR, help="报告输出目录")
     parser.add_argument("--quiet", action="store_true", help="只输出报告，不打进度")
     args = parser.parse_args()
@@ -117,7 +129,7 @@ async def main() -> None:
     )
 
     variants = resolve([name.strip() for name in args.variants.split(",") if name.strip()])
-    cases = runner.load_cases(args.limit)
+    cases = runner.load_cases(args.limit, dataset_path=args.dataset)
     if not cases:
         raise SystemExit("金标准集为空")
 
@@ -125,7 +137,7 @@ async def main() -> None:
     markdown = render_markdown(report)
 
     os.makedirs(args.out, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    stamp = app_now().strftime("%Y%m%d-%H%M%S")
     json_path = os.path.join(args.out, f"eval-{stamp}.json")
     md_path = os.path.join(args.out, f"eval-{stamp}.md")
     with open(json_path, "w", encoding="utf-8") as handle:

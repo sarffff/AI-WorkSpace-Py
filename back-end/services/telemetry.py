@@ -28,11 +28,12 @@ import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from typing import Any, AsyncIterator
 
 from config import settings
+from services import clock
 
 logger = logging.getLogger("telemetry")
 
@@ -132,7 +133,8 @@ _current_span: ContextVar[Span | None] = ContextVar("_current_span", default=Non
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    # 与业务表的 func.now() 对齐，否则 span 时间和消息时间会差一个时区
+    return clock.now()
 
 
 def _encode_attributes(attributes: dict[str, Any]) -> str | None:

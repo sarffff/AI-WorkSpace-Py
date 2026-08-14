@@ -13,11 +13,16 @@ import type {
   TokenResponse,
   Prompt,
   PromptCreateRequest,
+  PromptLibraryEntry,
   AppSettings,
   UserPreferences,
   UsageSummary,
   TraceSummary,
   TraceDetail,
+  KnowledgeQueryResult,
+  MessageFeedback,
+  FeedbackSummary,
+  ToolStep,
 } from "../types/api.types";
 
 /**
@@ -311,6 +316,25 @@ export class ApiClient {
   }
 
   /**
+   * 取回一个对话已落库的工具执行轨迹。
+   *
+   * SSE 里的 tool_start / tool_result 是瞬时事件，刷新页面就没了；这是把那条
+   * 时间线找回来的唯一入口。返回的步骤按时间升序，`messageId` 指向触发那一回合的
+   * **用户**消息，不是回答。
+   */
+  async getToolSteps(chatId: string): Promise<ToolStep[]> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/chats/${chatId}/tool-steps`,
+      { method: "GET" },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch tool steps: ${response.statusText}`);
+    }
+    const payload = await response.json();
+    return payload.steps ?? [];
+  }
+
+  /**
    * 创建新对话
    * POST /chats
    */
@@ -575,16 +599,7 @@ export class ApiClient {
   async queryKnowledge(
     query: string,
     topK: number = 5,
-  ): Promise<{
-    query: string;
-    results: Array<{
-      id: string;
-      document_id: string;
-      content: string;
-      score: number;
-    }>;
-    total: number;
-  }> {
+  ): Promise<KnowledgeQueryResult> {
     const response = await this.authedFetch(`${this.baseUrl}/knowledge/query`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -628,6 +643,22 @@ export class ApiClient {
       throw new Error(`Failed to fetch prompts: ${response.statusText}`);
     }
     return response.json();
+  }
+
+  /**
+   * 获取系统提示词注册表（只读）。
+   * 与 getPrompts 不是一回事：那个是用户自己攒的提示词片段（数据库里的行），
+   * 这个是驱动对话与评估的系统提示词版本（仓库里的文件）。
+   */
+  async getPromptLibrary(): Promise<PromptLibraryEntry[]> {
+    const response = await this.authedFetch(`${this.baseUrl}/prompts/library`, {
+      method: "GET",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to fetch prompt library: ${response.statusText}`);
+    }
+    const data = await response.json();
+    return data.entries ?? [];
   }
 
   /** 创建提示词 */
@@ -803,6 +834,80 @@ export class ApiClient {
     );
     if (!response.ok) {
       throw new Error(`Failed to fetch trace: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 提交或更新一条消息反馈（同一条消息只保留一份）
+   * POST /feedback
+   */
+  async submitFeedback(body: {
+    messageId: string;
+    rating: "up" | "down";
+    reason?: string;
+    comment?: string;
+    expectedAnswer?: string;
+  }): Promise<MessageFeedback> {
+    const response = await this.authedFetch(`${this.baseUrl}/feedback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to submit feedback: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 撤销反馈（再次点击同一个按钮）
+   * DELETE /feedback/{messageId}
+   */
+  async revokeFeedback(messageId: string): Promise<{ success: boolean }> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/feedback/${messageId}`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to revoke feedback: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 批量取回某些消息的反馈状态，用于切换会话后点亮按钮
+   * GET /feedback?messageIds=a,b,c
+   */
+  async getFeedback(messageIds: string[]): Promise<MessageFeedback[]> {
+    if (!messageIds.length) return [];
+    const params = new URLSearchParams({ messageIds: messageIds.join(",") });
+    const response = await this.authedFetch(
+      `${this.baseUrl}/feedback?${params.toString()}`,
+      { method: "GET" },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch feedback: ${response.statusText}`);
+    }
+    const payload = await response.json();
+    return payload.items ?? [];
+  }
+
+  /**
+   * 满意度概览
+   * GET /feedback/summary
+   */
+  async getFeedbackSummary(): Promise<FeedbackSummary> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/feedback/summary`,
+      {
+        method: "GET",
+      },
+    );
+    if (!response.ok) {
+      throw new Error(
+        `Failed to fetch feedback summary: ${response.statusText}`,
+      );
     }
     return response.json();
   }

@@ -80,5 +80,9 @@ htmlcov/
 # 评估报告（每次运行都会生成，不进版本库）
 back-end/eval/reports/
 
+# 从线上反馈导出的回归用例：内容是真实对话里的提问与期望答案，
+# 属于用户数据，不进版本库。rag_golden.jsonl 是自造语料，可以提交。
+back-end/eval/datasets/feedback_regression.jsonl
+
 # 真实价目表（示例见 model_prices.example.json）
 back-end/model_prices.json

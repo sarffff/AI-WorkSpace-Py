@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { RetrievalDebugger } from "@/features/knowledge-debug/ui/RetrievalDebugger";
 import { apiClient } from "@/shared/api/client";
 import type { KnowledgeDocument } from "@/shared/types/api.types";
 import {
@@ -9,6 +10,7 @@ import {
     Trash2,
     Loader2,
     X,
+    FlaskConical,
 } from "lucide-react";
 
 function formatSize(bytes: number): string {
@@ -24,6 +26,7 @@ const DOCUMENT_STATUS_LABELS: Record<KnowledgeDocument["status"], string> = {
 };
 
 export const KnowledgePage: React.FC = () => {
+    const [activeTab, setActiveTab] = useState<"documents" | "debug">("documents");
     const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
     const [totalDocs, setTotalDocs] = useState(0);
     const [totalChunks, setTotalChunks] = useState(0);
@@ -137,6 +140,36 @@ export const KnowledgePage: React.FC = () => {
                     onChange={handleFileChange}
                 />
             </div>
+
+            {/* Tab 切换 */}
+            <div className="flex items-center gap-1 rounded-xl bg-[#f3f0e6] dark:bg-[#1e1d1b] p-1 w-fit relative z-10">
+                <button
+                    onClick={() => setActiveTab("documents")}
+                    className={`px-3.5 py-1.5 text-xs font-medium rounded-lg transition-all ${
+                        activeTab === "documents"
+                            ? "bg-white dark:bg-[#262522] text-[#1f1e1d] dark:text-[#edece8] shadow-sm"
+                            : "text-[#6e6b63] dark:text-[#a19f96] hover:text-[#1f1e1d] dark:hover:text-[#edece8]"
+                    }`}
+                >
+                    <FileText className="w-3.5 h-3.5 inline mr-1.5" />
+                    文档管理
+                </button>
+                <button
+                    onClick={() => setActiveTab("debug")}
+                    className={`px-3.5 py-1.5 text-xs font-medium rounded-lg transition-all ${
+                        activeTab === "debug"
+                            ? "bg-white dark:bg-[#262522] text-[#1f1e1d] dark:text-[#edece8] shadow-sm"
+                            : "text-[#6e6b63] dark:text-[#a19f96] hover:text-[#1f1e1d] dark:hover:text-[#edece8]"
+                    }`}
+                >
+                    <FlaskConical className="w-3.5 h-3.5 inline mr-1.5" />
+                    检索调试
+                </button>
+            </div>
+
+            {activeTab === "documents" ? (
+
+            <div className="space-y-6">
 
             {errorMsg && (
                 <div className="flex items-center justify-between gap-3 p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-600 dark:text-rose-400 text-xs">
@@ -259,6 +292,10 @@ export const KnowledgePage: React.FC = () => {
                     )}
                 </div>
             </div>
+            </div>
+          ) : (
+            <RetrievalDebugger />
+          )}
         </div>
     );
 };

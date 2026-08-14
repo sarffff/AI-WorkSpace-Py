@@ -8,7 +8,7 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -19,13 +19,16 @@ from auth import get_current_user
 from config import settings
 from database import get_db
 from models import TraceSpan, User
+from services.clock import naive_now
 from services.pricing import price_table
+from services.semantic_cache import semantic_cache
 
 router = APIRouter(prefix="/metrics", tags=["用量与追踪"])
 
 
 def _window_start(days: int) -> datetime:
-    return datetime.utcnow() - timedelta(days=days)
+    # 用应用时钟而非 UTC：trace_spans.started_at 存的是应用时区的墙上时间
+    return naive_now() - timedelta(days=days)
 
 
 def _as_float(value: Any) -> float | None:
@@ -141,6 +144,8 @@ async def get_usage(
         "byName": _grouped(db, current_user.id, since, TraceSpan.name),
         "byModel": _grouped(db, current_user.id, since, TraceSpan.model),
         "byKind": _grouped(db, current_user.id, since, TraceSpan.kind),
+        # 缓存统计存在进程内，重启归零，也不受 days 窗口约束——面板上要说清楚
+        "cache": semantic_cache.stats(),
     }
 
 

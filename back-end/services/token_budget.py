@@ -93,6 +93,28 @@ def count_message_tokens(message: dict[str, str], counter: TokenCounter) -> int:
     )
 
 
+def message_text(content: object) -> str:
+    """从消息的 ``content`` 里取出纯文本，兼容多模态的内容块列表。
+
+    多模态消息的 content 是 ``[{"type": "text", ...}, {"type": "image_url", ...}]``，
+    直接丢给 tokenizer 会 TypeError。这条路径只在"提供商没回传 usage、退回本地
+    估算"时才走，平时跑不到，所以必须在这里挡住而不是等它在线上炸。
+
+    图像按面积折算 token，没法按字符估——本地估算因此会更低。它本来就标成
+    ``estimated``，这里只是又多欠了一笔。
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            str(block.get("text") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        return "\n".join(part for part in parts if part)
+    return "" if content is None else str(content)
+
+
 @dataclass(slots=True)
 class HistoryMessage:
     """历史消息。带 id 是为了给摘要缓存算指纹。"""

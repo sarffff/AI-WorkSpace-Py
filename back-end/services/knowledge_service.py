@@ -15,22 +15,28 @@ from models import Document, DocumentChunk
 from services.chunking import split_document
 from services.embedding_service import EmbeddingService
 from services.retrieval_index import invalidate_user_indexes
+from services.semantic_cache import semantic_cache
 from services.retriever import HybridRetriever, RetrievedChunk, format_context
 from services.token_budget import get_token_counter
 
 logger = logging.getLogger("knowledge_service")
 
-_TEXT_EXTENSIONS = {
+TEXT_EXTENSIONS = {
     "txt", "md", "js", "ts", "tsx", "jsx", "json", "xml", "yaml", "yml",
     "css", "csv", "log", "sh", "java", "go", "rs", "c", "cpp", "py",
 }
 
 
-def _parse_file_content(filename: str, content: bytes) -> str:
-    """根据文件类型解析文本内容。不支持的格式抛 ValueError,由路由转成 400。"""
-    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+def parse_file_content(filename: str, content: bytes) -> str:
+    """根据文件类型解析文本内容。不支持的格式抛 ValueError,由路由转成 400。
 
-    if extension in _TEXT_EXTENSIONS:
+    公开而不是私有:上传链路和 Agent 的 read_attachment 工具必须用同一套解析,
+    各写一份的结果是"同一个 PDF 进知识库能读、当附件读不了"这类难查的不一致。
+    """
+    base_name = filename.split("#", 1)[0]
+    extension = base_name.rsplit(".", 1)[-1].lower() if "." in base_name else ""
+
+    if extension in TEXT_EXTENSIONS:
         return content.decode("utf-8", errors="replace")
 
     if extension == "pdf":
@@ -72,7 +78,7 @@ class KnowledgeService:
         self, db: Session, filename: str, content: bytes, user_id: str
     ) -> Document:
         """解析并落库，状态置 processing。分块与向量化交给 index_document。"""
-        text = _parse_file_content(filename, content)
+        text = parse_file_content(filename, content)
         document = Document(
             name=filename,
             size=len(content),
@@ -133,6 +139,8 @@ class KnowledgeService:
             document.status = "indexed"
             db.commit()
             invalidate_user_indexes(document.user_id)
+            # 知识库变了，旧答案可能已经错了：整桶清掉而不是逐条判断
+            semantic_cache.invalidate_user(document.user_id)
         except Exception:
             logger.exception("Indexing failed for document %s", document_id)
             db.rollback()
@@ -225,4 +233,5 @@ class KnowledgeService:
         db.delete(document)
         db.commit()
         invalidate_user_indexes(user_id)
+        semantic_cache.invalidate_user(user_id)
         return True

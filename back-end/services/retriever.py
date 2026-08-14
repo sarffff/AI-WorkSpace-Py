@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from config import settings
 from models import Document, DocumentChunk
 from services.embedding_service import EmbeddingService
+from services.guardrails import ScanReport, guard, mask_markup
 from services.telemetry import SpanKind, tracer
 from services.retrieval_index import (
     BM25Index,
@@ -60,20 +61,28 @@ class RetrievedChunk:
 
 
 def format_context(chunks: list[RetrievedChunk]) -> str:
-    """把检索结果格式化成喂给模型的参考内容。"""
+    """把检索结果格式化成喂给模型的参考内容。
+
+    每块正文单独过一遍护栏再拼表头——顺序反了就会把我们自己加的【参考 N】表头
+    当成伪造表头屏蔽掉。拼好之后整段用随机定界符围一次,让模型能分清哪些是数据。
+    """
     if not chunks:
         return ""
     parts = ["以下是知识库中与当前问题相关的参考内容：\n"]
+    report = ScanReport()
     for position, chunk in enumerate(chunks, start=1):
         low, high = chunk.chunk_range
         span = f"{low}" if low == high else f"{low}-{high}"
         relevance = "-" if chunk.dense_score is None else f"{chunk.dense_score:.4f}"
+        body, chunk_report = guard.sanitize(chunk.content)
+        report = report.merge(chunk_report)
         parts.append(
-            f"【参考 {position}】来源: {chunk.document_name}，"
+            f"【参考 {position}】来源: {mask_markup(chunk.document_name)}，"
             f"document_id: {chunk.document_id}，分块: {span}，"
-            f"相关度: {relevance}\n{chunk.content}\n"
+            f"相关度: {relevance}\n{body}\n"
         )
-    return "\n".join(parts)
+    guard.record(report, kind="retrieval")
+    return guard.fence("\n".join(parts), label="参考资料")
 
 
 def _parse_json_array(text: str) -> list[Any]:

@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { apiClient } from "@/shared/api/client";
 import type {
+  FeedbackSummary,
   TraceDetail,
   TraceSpanNode,
   TraceSummary,
@@ -8,37 +9,17 @@ import type {
   UsageSummary,
 } from "@/shared/types/api.types";
 import { Activity, ChevronRight, Coins, Loader2, Timer } from "lucide-react";
+import { fmtCost, fmtInt, fmtMs, spanLabel } from "@/shared/lib/format";
 
 const RANGES = [1, 7, 30] as const;
 
-/** span 名到中文标签。未登记的原样显示，避免加了新埋点就"消失" */
-const SPAN_LABELS: Record<string, string> = {
-  "chat.turn": "整轮回答",
-  "llm.chat": "对话生成",
-  "llm.summary": "历史摘要",
-  "llm.query_rewrite": "查询改写",
-  "llm.rerank": "结果重排",
-  "llm.judge": "评估裁判",
-  "llm.eval_answer": "评估作答",
-  "retrieval.hybrid": "混合检索",
-  "retrieval.dense": "向量检索",
-  "embedding.embed": "文本向量化",
-};
-
-const spanLabel = (name: string) =>
-  SPAN_LABELS[name] ?? (name.startsWith("tool.") ? `工具 · ${name.slice(5)}` : name);
-
-const fmtInt = (value: number) => value.toLocaleString();
-
-const fmtMs = (value: number | null) => {
-  if (value === null) return "-";
-  return value >= 1000 ? `${(value / 1000).toFixed(1)}s` : `${Math.round(value)}ms`;
-};
-
-const fmtCost = (amount: number | null, currency: string | null) => {
-  if (amount === null) return "-";
-  const symbol = currency === "USD" ? "$" : currency === "CNY" ? "¥" : "";
-  return `${symbol}${amount.toFixed(4)}${symbol ? "" : ` ${currency ?? ""}`}`;
+/** 与后端 services/feedback_service.py 的 REASONS 对齐 */
+const REASON_LABELS: Record<string, string> = {
+  inaccurate: "内容不准确",
+  no_citation: "没引用来源",
+  off_topic: "答非所问",
+  bad_format: "格式问题",
+  other: "其它",
 };
 
 export const UsagePanel: React.FC = () => {
@@ -46,6 +27,7 @@ export const UsagePanel: React.FC = () => {
   const [usage, setUsage] = useState<UsageSummary | null>(null);
   const [traces, setTraces] = useState<TraceSummary[]>([]);
   const [trace, setTrace] = useState<TraceDetail | null>(null);
+  const [feedback, setFeedback] = useState<FeedbackSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -67,6 +49,15 @@ export const UsagePanel: React.FC = () => {
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
+    // 满意度是独立数据源，拉不到不该让整个面板报错
+    apiClient
+      .getFeedbackSummary()
+      .then((summary) => {
+        if (!cancelled) setFeedback(summary);
+      })
+      .catch(() => {
+        if (!cancelled) setFeedback(null);
+      });
     return () => {
       cancelled = true;
     };
@@ -84,10 +75,12 @@ export const UsagePanel: React.FC = () => {
   };
 
   return (
-    <div className="rounded-2xl border border-[#e3dfd5] dark:border-[#2e2d2a] bg-white dark:bg-[#1e1d1b] p-5 space-y-5">
+    <div className="card-surface rounded-2xl p-5 space-y-5 relative z-10 anim-fade-up stagger-2">
       <div className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-2">
-          <Activity className="w-4 h-4 text-[#da7756]" />
+        <div className="flex items-center gap-2.5">
+          <span className="w-6 h-6 rounded-lg bg-[#da7756]/12 text-[#da7756] flex items-center justify-center">
+            <Activity className="w-3.5 h-3.5" />
+          </span>
           <h3 className="text-sm font-semibold text-[#1f1e1d] dark:text-[#edece8]">
             用量与成本
           </h3>
@@ -166,6 +159,82 @@ export const UsagePanel: React.FC = () => {
             rows={usage.byModel.filter((row) => row.model)}
             labelOf={(row) => row.model ?? "-"}
           />
+
+          {usage.cache?.enabled && (
+            <div className="space-y-2">
+              <h4 className="text-[11px] font-semibold text-[#6e6b63] dark:text-[#a19f96]">
+                语义缓存
+              </h4>
+              <div className="grid grid-cols-4 gap-3">
+                <Metric
+                  label="命中率"
+                  value={
+                    usage.cache.hitRate === null
+                      ? "-"
+                      : `${Math.round(usage.cache.hitRate * 100)}%`
+                  }
+                />
+                <Metric label="命中" value={fmtInt(usage.cache.hits)} />
+                <Metric label="未命中" value={fmtInt(usage.cache.misses)} />
+                <Metric
+                  label="省下 token"
+                  value={fmtInt(usage.cache.tokensSaved)}
+                />
+              </div>
+              <p className="text-[11px] text-[#918d83]">
+                相似度阈值 {usage.cache.threshold}
+                。统计存在服务进程内存里，重启归零，也不随上面的时间窗口变化。
+              </p>
+            </div>
+          )}
+
+          {feedback && feedback.rated > 0 && (
+            <div className="space-y-2">
+              <h4 className="text-[11px] font-semibold text-[#6e6b63] dark:text-[#a19f96]">
+                回答满意度
+              </h4>
+              <div className="grid grid-cols-4 gap-3">
+                <Metric
+                  label="满意率"
+                  value={
+                    feedback.satisfaction === null
+                      ? "-"
+                      : `${Math.round(feedback.satisfaction * 100)}%`
+                  }
+                />
+                <Metric label="赞" value={fmtInt(feedback.up)} />
+                <Metric
+                  label="踩"
+                  value={fmtInt(feedback.down)}
+                  warn={feedback.down > 0}
+                />
+                <Metric
+                  label="待导出用例"
+                  value={fmtInt(feedback.pendingExport)}
+                />
+              </div>
+              {feedback.downReasons.length > 0 && (
+                <p className="text-[11px] text-[#918d83]">
+                  差评原因：
+                  {feedback.downReasons
+                    .map(
+                      (entry) =>
+                        `${REASON_LABELS[entry.reason] ?? entry.reason} ${entry.count}`,
+                    )
+                    .join(" · ")}
+                </p>
+              )}
+              {feedback.pendingExport > 0 && (
+                <p className="text-[11px] text-[#918d83]">
+                  跑 <code>python -m eval.from_feedback</code>{" "}
+                  把这些差评变成离线回归用例
+                </p>
+              )}
+              <p className="text-[11px] text-[#918d83]">
+                分母只算「被评价过的回答」，不是全部回答——没人点的那些既不算好也不算坏。
+              </p>
+            </div>
+          )}
 
           <div className="space-y-2">
             <h4 className="text-[11px] font-semibold text-[#6e6b63] dark:text-[#a19f96]">

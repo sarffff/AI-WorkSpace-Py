@@ -187,12 +187,88 @@ class _FakeQuery:
 
 
 class FakeDB:
-    """只满足 Agent 循环所需的最小 Session 接口（历史消息查询返回空）。"""
+    """只满足 Agent 循环所需的最小 Session 接口（历史消息查询返回空）。
+
+    ``add`` / ``commit`` 是空操作:工具轨迹落库在循环里是顺带发生的,用这个替身
+    的测试关心的是事件流与 messages,不是持久化。真要断言落库就用 ``db_real``。
+    """
 
     def query(self, *args, **kwargs):
         return _FakeQuery()
+
+    def add(self, *args, **kwargs):
+        return None
+
+    def commit(self):
+        return None
+
+    def rollback(self):
+        return None
 
 
 @pytest.fixture
 def db() -> FakeDB:
     return FakeDB()
+
+
+@pytest.fixture
+def db_real():
+    """真正建表的内存 SQLite session。
+
+    反馈那套逻辑的重点是唯一约束、越权检查和聚合查询——用 FakeDB 全测不出来。
+    SQLite 与 MySQL 在这些行为上一致，够用；真正依赖 MySQL 方言的地方另说。
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from database import Base
+    import models  # noqa: F401  确保所有表都已注册到 Base.metadata
+
+    engine = create_engine("sqlite://", future=True)
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine, future=True)()
+    try:
+        yield session
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def _seed_chat(session, *, user_id: str = "u1"):
+    from models import Chat, Message
+    from services.clock import naive_now
+
+    now = naive_now()
+    chat = Chat(id="c1", user_id=user_id, title="测试会话", created_at=now, updated_at=now)
+    session.add(chat)
+    question = Message(
+        id="m-user", chat_id="c1", role="user", content="试用期多久？", created_at=now
+    )
+    session.add(question)
+    session.commit()
+    return chat, question
+
+
+@pytest.fixture
+def chat_with_question(db_real) -> tuple[str, str]:
+    _chat, question = _seed_chat(db_real)
+    return "c1", question.id
+
+
+@pytest.fixture
+def chat_with_answer(db_real) -> tuple[str, str]:
+    from models import Message
+    from services.clock import naive_now
+
+    _seed_chat(db_real)
+    answer = Message(
+        id="m-assistant",
+        chat_id="c1",
+        role="assistant",
+        content="试用期 6 个月。",
+        model="glm-4.5-air",
+        created_at=naive_now(),
+    )
+    db_real.add(answer)
+    db_real.commit()
+    return "c1", answer.id

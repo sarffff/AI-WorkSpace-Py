@@ -12,7 +12,7 @@ from typing import Any, AsyncGenerator
 
 from config import settings
 from services.telemetry import SpanKind, TokenSource, tracer
-from services.token_budget import count_message_tokens, get_token_counter
+from services.token_budget import count_message_tokens, get_token_counter, message_text
 
 logger = logging.getLogger("model_adapter")
 
@@ -31,12 +31,17 @@ def _estimate_usage(
     """提供商没回传 usage 时的本地估算。
 
     只算消息正文，不含工具 schema 与提供商内部的特殊 token，所以会低估。
-    落库时会标成 ``estimated``，聚合成本时必须与真实用量区分开。
+    多模态消息的 ``content`` 是内容块列表，这里只取其中的文本——图像按面积
+    折算 token，没法按字符估。落库时会标成 ``estimated``，聚合成本时必须与
+    真实用量区分开。
     """
     counter = get_token_counter(settings.TOKEN_COUNTER)
     prompt = sum(
         count_message_tokens(
-            {"role": str(message.get("role") or ""), "content": message.get("content") or ""},
+            {
+                "role": str(message.get("role") or ""),
+                "content": message_text(message.get("content")),
+            },
             counter,
         )
         for message in messages

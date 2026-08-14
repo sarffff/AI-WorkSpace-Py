@@ -32,6 +32,13 @@ _BASE = {
     "RAG_CONTEXT_WINDOW": 1,
     "RAG_TOP_K": 5,
     "CHUNK_MAX_TOKENS": 320,
+    "GUARDRAIL_ENABLED": True,
+    "GUARDRAIL_BLOCK_SCORE": 0,
+    # 提示词也是一个可扫的维度。注意只有 eval_rag_answer 会被这套评估用到：
+    # PROMPT_CHAT_SYSTEM_VERSION 管的是线上多轮 Agent 的系统提示词，本评估
+    # 走的是单轮 RAG 问答（见模块顶部说明），把它写进变体只会得到一个
+    # 「怎么改都没差别」的假结论。要对比那个，得先有一套 Agent 端到端评估。
+    "PROMPT_EVAL_ANSWER_VERSION": "v1",
 }
 
 VARIANTS: dict[str, Variant] = {
@@ -79,6 +86,31 @@ VARIANTS: dict[str, Variant] = {
         name="top-k-3",
         description="只取 3 条参考内容，省 token，代价是召回下降",
         overrides={**_BASE, "RAG_TOP_K": 3},
+    ),
+    "no-guardrail": Variant(
+        name="no-guardrail",
+        description=(
+            "关掉提示注入护栏——和 baseline 对照才能知道抗注入率里有多少是护栏的功劳，"
+            "多少只是提示词在起作用"
+        ),
+        overrides={**_BASE, "GUARDRAIL_ENABLED": False},
+    ),
+    "guardrail-blocking": Variant(
+        name="guardrail-blocking",
+        description=(
+            "把可疑资料整段拒绝注入（阈值 5）。抗注入率应当最高，"
+            "同时要盯住其它探针的召回有没有因为误报而掉下来"
+        ),
+        overrides={**_BASE, "GUARDRAIL_BLOCK_SCORE": 5},
+    ),
+    "prompt-strict": Variant(
+        name="prompt-strict",
+        description=(
+            "只换回答提示词（eval_rag_answer v2-strict）：规定「先结论后依据」并"
+            "固定拒答句式。检索完全没动，所以检索指标应当逐位相同——"
+            "如果召回也变了，那是哪里串了配置，不是提示词的功劳"
+        ),
+        overrides={**_BASE, "PROMPT_EVAL_ANSWER_VERSION": "v2-strict"},
     ),
 }
 

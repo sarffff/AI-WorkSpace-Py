@@ -7,6 +7,7 @@ from . import (
     settings_router,
     attachment_router,
     metrics_router,
+    feedback_router,
 )
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     "settings_router",
     "attachment_router",
     "metrics_router",
+    "feedback_router",
 ]

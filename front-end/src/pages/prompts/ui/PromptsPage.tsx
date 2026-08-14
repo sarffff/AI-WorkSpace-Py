@@ -4,6 +4,7 @@ import { useNavigate } from "react-router-dom";
 import { apiClient } from "@/shared/api/client";
 import type { Prompt } from "@/shared/types/api.types";
 import { setPendingInput, setCurrentChat } from "@/entities/chat/model/chatSlice";
+import { PromptLab } from "@/widgets/prompt-lab/ui/PromptLab";
 import {
     Sparkles,
     Trash2,
@@ -15,6 +16,15 @@ import {
     Copy,
     Search,
 } from "lucide-react";
+
+/**
+ * 页面分两块，因为它们是两种完全不同的东西：
+ * - 「模板库」是用户自己攒的提示词片段，存在数据库里，可增删改。
+ * - 「系统提示词」是驱动对话与评估的那几段，存在仓库文件里，只读、可版本对比。
+ * 早先这页只有前者，于是"提示词工作台"名不副实——真正决定回答质量的那部分
+ * 根本没露出来。
+ */
+type PageTab = "templates" | "system";
 
 type EditingState = {
     id: string | null; // null = 新建
@@ -48,6 +58,7 @@ export const PromptsPage: React.FC = () => {
     const dispatch = useDispatch();
     const navigate = useNavigate();
     const [prompts, setPrompts] = useState<Prompt[]>([]);
+    const [tab, setTab] = useState<PageTab>("templates");
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [searchQuery, setSearchQuery] = useState("");
@@ -143,23 +154,46 @@ export const PromptsPage: React.FC = () => {
     };
 
     return (
-        <div className="p-8 h-full overflow-y-auto space-y-6 bg-[#fbf9f5] dark:bg-[#141413] transition-colors duration-200">
-            <div className="flex items-center justify-between">
-                <div>
-                    <h3 className="text-lg font-semibold text-[#1f1e1d] dark:text-[#edece8]">
+        <div className="p-8 h-full overflow-y-auto space-y-6 app-atmosphere transition-colors duration-200">
+            <div className="flex items-center justify-between relative z-10">
+                <div className="anim-fade-up">
+                    <h3 className="font-display text-[22px] font-semibold text-[#1f1e1d] dark:text-[#edece8]">
                         提示词工作台
                     </h3>
                     <p className="text-xs text-[#6e6b63] dark:text-[#a19f96] mt-1">
-                        管理系统提示词模板，一键应用到对话。
+                        管理自己的提示词模板，也能看清系统提示词每一版的差异。
                     </p>
                 </div>
-                <button
-                    onClick={() => setEditing({ ...EMPTY_EDITING })}
-                    className="px-4 py-2.5 bg-[#da7756] hover:bg-[#c86544] text-white text-xs font-medium rounded-xl flex items-center gap-2 shadow-md shadow-[#da7756]/20 transition-all"
-                >
-                    <Plus className="w-4 h-4" />
-                    新建提示词
-                </button>
+                {tab === "templates" && (
+                    <button
+                        onClick={() => setEditing({ ...EMPTY_EDITING })}
+                        className="btn-accent px-4 py-2.5 text-white text-xs font-medium rounded-xl flex items-center gap-2"
+                    >
+                        <Plus className="w-4 h-4" />
+                        新建提示词
+                    </button>
+                )}
+            </div>
+
+            <div className="flex items-center gap-1 p-1 rounded-xl bg-[#f3f0e6] dark:bg-[#201f1c] w-fit relative z-10">
+                {(
+                    [
+                        ["templates", "模板库"],
+                        ["system", "系统提示词"],
+                    ] as [PageTab, string][]
+                ).map(([key, label]) => (
+                    <button
+                        key={key}
+                        onClick={() => setTab(key)}
+                        className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                            tab === key
+                                ? "bg-white dark:bg-[#262522] text-[#1f1e1d] dark:text-[#edece8] shadow-sm"
+                                : "text-[#6e6b63] dark:text-[#a19f96] hover:text-[#1f1e1d] dark:hover:text-[#edece8]"
+                        }`}
+                    >
+                        {label}
+                    </button>
+                ))}
             </div>
 
             {error && (
@@ -174,39 +208,47 @@ export const PromptsPage: React.FC = () => {
                 </div>
             )}
 
-            <div className="flex items-center gap-2 bg-white dark:bg-[#1a1917] border border-[#e6e2d8] dark:border-[#282724] px-3.5 py-2 rounded-xl w-80 shadow-sm">
-                <Search className="w-4 h-4 text-[#918d83]" />
-                <input
-                    type="text"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="搜索标题/分类/描述..."
-                    className="bg-transparent border-none text-xs text-[#1f1e1d] dark:text-[#edece8] placeholder-[#918d83] focus:outline-none w-full"
-                />
-                {searchQuery && (
-                    <button
-                        onClick={() => setSearchQuery("")}
-                        className="text-[#918d83] hover:text-[#1f1e1d] dark:hover:text-[#edece8]"
-                    >
-                        <X className="w-3.5 h-3.5" />
-                    </button>
-                )}
-            </div>
+            {tab === "system" && <PromptLab />}
 
-            {loading ? (
-                <div className="flex justify-center py-16 text-[#918d83]">
-                    <Loader2 className="w-6 h-6 animate-spin" />
+            {tab === "templates" && (
+                <div className="flex items-center gap-2 card-surface px-3.5 py-2 rounded-xl w-80 relative z-10 focus-within:border-[#da7756]/50 transition-colors">
+                    <Search className="w-4 h-4 text-[#918d83]" />
+                    <input
+                        type="text"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        placeholder="搜索标题/分类/描述..."
+                        className="bg-transparent border-none text-xs text-[#1f1e1d] dark:text-[#edece8] placeholder-[#918d83] focus:outline-none w-full"
+                    />
+                    {searchQuery && (
+                        <button
+                            onClick={() => setSearchQuery("")}
+                            className="text-[#918d83] hover:text-[#1f1e1d] dark:hover:text-[#edece8]"
+                        >
+                            <X className="w-3.5 h-3.5" />
+                        </button>
+                    )}
                 </div>
-            ) : filtered.length === 0 ? (
-                <div className="p-12 text-center text-xs text-[#918d83] bg-white dark:bg-[#1a1917] rounded-2xl border border-[#e6e2d8] dark:border-[#282724]">
-                    {searchQuery ? "未找到匹配的提示词。" : "暂无提示词，点击右上角创建。"}
-                </div>
-            ) : (
-                <div className="grid grid-cols-3 gap-6">
-                    {filtered.map((p) => (
+            )}
+
+            {tab === "templates" &&
+                (loading ? (
+                    <div className="flex justify-center py-16 text-[#918d83]">
+                        <Loader2 className="w-6 h-6 animate-spin" />
+                    </div>
+                ) : filtered.length === 0 ? (
+                    <div className="p-12 text-center text-xs text-[#918d83] bg-white dark:bg-[#1a1917] rounded-2xl border border-[#e6e2d8] dark:border-[#282724]">
+                        {searchQuery
+                            ? "未找到匹配的提示词。"
+                            : "暂无提示词，点击右上角创建。"}
+                    </div>
+                ) : (
+                    <div className="grid grid-cols-3 gap-5 relative z-10">
+                    {filtered.map((p, idx) => (
                         <div
                             key={p.id}
-                            className="p-6 rounded-2xl bg-white dark:bg-[#1a1917] border border-[#e6e2d8] dark:border-[#282724] space-y-4 flex flex-col justify-between hover:border-[#da7756] transition-all group shadow-sm"
+                            className="card-surface card-lift p-6 rounded-2xl space-y-4 flex flex-col justify-between group anim-fade-up"
+                            style={{ animationDelay: `${Math.min(idx, 8) * 0.05}s` }}
                         >
                             <div className="space-y-3">
                                 <div className="flex items-center justify-between">
@@ -254,7 +296,7 @@ export const PromptsPage: React.FC = () => {
                             <div className="flex items-center gap-2">
                                 <button
                                     onClick={() => handleUse(p)}
-                                    className="flex-1 py-2.5 bg-[#f3f0e6] hover:bg-[#da7756] text-[#1f1e1d] dark:text-[#edece8] hover:text-white text-xs font-medium rounded-xl transition-all flex items-center justify-center gap-2 border border-[#e3dfd5] dark:border-[#2e2d2a]"
+                                    className="flex-1 py-2.5 bg-[#f3f0e6] hover:bg-[#da7756] dark:bg-[#201f1c] text-[#1f1e1d] dark:text-[#edece8] hover:text-white text-xs font-medium rounded-xl transition-all duration-200 flex items-center justify-center gap-2 border border-[#e3dfd5] dark:border-[#2e2d2a] hover:border-[#da7756] hover:shadow-[0_6px_18px_-6px_rgba(218,119,86,0.5)]"
                                 >
                                     <Terminal className="w-3.5 h-3.5" />
                                     使用
@@ -269,17 +311,17 @@ export const PromptsPage: React.FC = () => {
                             </div>
                         </div>
                     ))}
-                </div>
-            )}
+                    </div>
+                ))}
 
             {/* 编辑/新建 Modal */}
             {editing && (
                 <div
-                    className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4"
+                    className="fixed inset-0 bg-black/45 backdrop-blur-sm flex items-center justify-center z-50 p-4"
                     onClick={() => !saving && setEditing(null)}
                 >
                     <div
-                        className="bg-[#fbf9f5] dark:bg-[#1a1917] rounded-2xl border border-[#e6e2d8] dark:border-[#282724] shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto"
+                        className="bg-[#fbf9f5] dark:bg-[#1a1917] rounded-2xl border border-[#e6e2d8] dark:border-[#282724] shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto anim-fade-up"
                         onClick={(e) => e.stopPropagation()}
                     >
                         <div className="flex items-center justify-between p-5 border-b border-[#e6e2d8] dark:border-[#282724]">
@@ -376,7 +418,7 @@ export const PromptsPage: React.FC = () => {
                             <button
                                 onClick={handleSave}
                                 disabled={saving}
-                                className="px-4 py-2 text-xs font-medium rounded-xl bg-[#da7756] hover:bg-[#c86544] text-white disabled:opacity-50 flex items-center gap-2"
+                                className="btn-accent px-4 py-2 text-xs font-medium rounded-xl text-white disabled:opacity-50 flex items-center gap-2"
                             >
                                 {saving && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
                                 保存
