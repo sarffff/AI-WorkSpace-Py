@@ -3,7 +3,9 @@ import { useNavigate } from "react-router-dom";
 import { apiClient } from "@/shared/api/client";
 import type { TraceSummary } from "@/shared/types/api.types";
 import { fmtInt, fmtMs } from "@/shared/lib/format";
+import { toastMessageFrom, useToast } from "@/shared/ui/Toast";
 import {
+  Bot,
   BookOpen,
   RefreshCw,
   ShieldAlert,
@@ -20,6 +22,8 @@ export interface InsightEvent {
     | "context_compacted"
     | "guardrail"
     | "cache_hit"
+    | "agent_step"
+    | "agent_state"
     | "done";
   label: string;
   status?: string;
@@ -38,6 +42,7 @@ export const ChatInsightPanel: React.FC<Props> = ({
   onClose,
 }) => {
   const navigate = useNavigate();
+  const toast = useToast();
   const [sessionTraces, setSessionTraces] = useState<TraceSummary[]>([]);
   const [tracesLoading, setTracesLoading] = useState(false);
 
@@ -47,15 +52,21 @@ export const ChatInsightPanel: React.FC<Props> = ({
     apiClient
       .getTraces(sessionId, 5)
       .then(setSessionTraces)
-      .catch(() => {})
+      .catch((e) => {
+        toast.error(toastMessageFrom(e, "加载运行轨迹失败"));
+      })
       .finally(() => setTracesLoading(false));
-  }, [sessionId]);
+  }, [sessionId, toast]);
 
   return (
-    <div className="w-72 border-l border-[#e6e2d8] dark:border-[#282724] bg-[#fbf9f5]/60 dark:bg-[#141413]/60 flex flex-col h-full overflow-y-auto">
-      {/* 头部 */}
+    <div className="w-72 border-l border-[#e6e2d8] dark:border-[#282724] bg-[#f3f0e6]/40 dark:bg-[#1a1917]/40 backdrop-blur-sm flex flex-col h-full overflow-y-auto">
       <div className="flex items-center justify-between px-4 py-3 border-b border-[#e6e2d8] dark:border-[#282724]">
-        <span className="label-eyebrow">运行洞察</span>
+        <div>
+          <div className="label-eyebrow">Insight</div>
+          <span className="text-xs font-semibold text-[#1f1e1d] dark:text-[#edece8]">
+            运行洞察
+          </span>
+        </div>
         {onClose && (
           <button
             onClick={onClose}
@@ -73,11 +84,12 @@ export const ChatInsightPanel: React.FC<Props> = ({
             <h4 className="text-[10px] font-semibold uppercase tracking-wider text-[#918d83]">
               本轮过程
             </h4>
-            <div className="space-y-1.5">
+            <div className="rail-track space-y-1.5 pl-1">
               {events.map((evt, i) => (
                 <div
                   key={i}
-                  className="flex items-center gap-2 text-[11px] px-2.5 py-1.5 rounded-lg bg-[#faf9f5] dark:bg-[#191817]"
+                  className="relative flex items-center gap-2 text-[11px] px-2.5 py-1.5 rounded-lg bg-[#faf9f5] dark:bg-[#191817] anim-fade-up"
+                  style={{ animationDelay: `${i * 0.04}s` }}
                 >
                   {evt.type === "tool_start" && (
                     <span className="w-1.5 h-1.5 rounded-full bg-[#da7756] animate-pulse shrink-0" />
@@ -96,6 +108,20 @@ export const ChatInsightPanel: React.FC<Props> = ({
                   )}
                   {evt.type === "cache_hit" && (
                     <Zap className="w-3 h-3 text-sky-500 shrink-0" />
+                  )}
+                  {evt.type === "agent_step" && (
+                    <Bot className="w-3 h-3 text-violet-500 shrink-0" />
+                  )}
+                  {evt.type === "agent_state" && (
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                        evt.status === "failed"
+                          ? "bg-rose-500"
+                          : evt.status === "completed"
+                            ? "bg-emerald-500"
+                            : "bg-violet-500 animate-pulse"
+                      }`}
+                    />
                   )}
                   {evt.type === "done" && (
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />

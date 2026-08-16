@@ -4,8 +4,8 @@ import { useDispatch } from "react-redux";
 import { apiClient } from "@/shared/api/client";
 import { setUser, setToken } from "@/entities/auth/model/authSlice";
 import { useTheme } from "@/shared/lib/ThemeContext";
+import { BrandMark } from "@/shared/ui/BrandMark";
 import {
-  Bot,
   Mail,
   Lock,
   User as UserIcon,
@@ -115,8 +115,7 @@ export const RegisterPage: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen app-atmosphere flex items-center justify-center p-4 relative transition-colors duration-200">
-      {/* Top right theme toggle */}
+    <div className="min-h-screen app-atmosphere flex transition-colors duration-200">
       <div className="absolute top-6 right-6 z-20">
         <button
           onClick={toggleTheme}
@@ -126,23 +125,53 @@ export const RegisterPage: React.FC = () => {
         </button>
       </div>
 
-      <div className="relative w-full max-w-md my-8">
-        {/* Logo 和标题 */}
-        <div className="text-center mb-8">
-          <div className="relative inline-flex anim-fade-up">
-            <div className="absolute inset-0 rounded-[22px] bg-[#da7756] blur-2xl opacity-30" />
-            <div className="relative inline-flex items-center justify-center w-16 h-16 rounded-[22px] btn-accent mb-4">
-              <Bot className="w-8 h-8 text-white" />
-            </div>
+      <aside className="hidden lg:flex w-[44%] relative flex-col justify-between p-12 border-r border-[#e6e2d8] dark:border-[#282724]">
+        <div className="absolute inset-0 pointer-events-none overflow-hidden">
+          <div className="absolute inset-0 lab-grid" />
+        </div>
+        <div className="relative z-10">
+          <div className="flex items-center gap-3 mb-10">
+            <BrandMark size={40} />
+            <span className="font-display text-lg font-semibold">AI Workspace</span>
           </div>
-          <h1 className="font-display text-[28px] font-semibold text-[#1f1e1d] dark:text-[#edece8] mb-2 anim-fade-up stagger-1">创建账号</h1>
-          <p className="text-[#6e6b63] dark:text-[#a19f96] text-sm anim-fade-up stagger-2">
-            开始使用 AI Workspace 体验智能对话
+          <p className="label-eyebrow mb-3">New bench</p>
+          <h1 className="font-display text-[40px] leading-[1.15] font-semibold text-[#1f1e1d] dark:text-[#edece8] text-balance">
+            搭一张<br />能核对的台子
+          </h1>
+          <p className="mt-4 text-sm text-[#6e6b63] dark:text-[#a19f96] max-w-sm leading-relaxed">
+            注册之后就能上传文档、挂提示词版本、回放每一次回答。这里练的是工程，不是聊天。
           </p>
         </div>
+        <div className="relative z-10 space-y-3">
+          {["文档进库即可引用", "工具轨迹跨回合回灌", "差评能变成回归用例"].map(
+            (line, i) => (
+              <div
+                key={line}
+                className="flex items-center gap-2.5 text-sm text-[#1f1e1d] dark:text-[#edece8] anim-fade-up"
+                style={{ animationDelay: `${0.12 + i * 0.07}s` }}
+              >
+                <span className="capability-dot" />
+                {line}
+              </div>
+            ),
+          )}
+        </div>
+      </aside>
 
-        {/* 注册表单卡片 */}
-        <div className="card-surface rounded-2xl p-8 transition-colors duration-200 anim-fade-up stagger-3 relative z-10">
+      <div className="flex-1 flex items-center justify-center p-6 relative overflow-y-auto">
+        <div className="relative w-full max-w-md my-8">
+          <div className="lg:hidden text-center mb-8">
+            <BrandMark size={48} className="mx-auto mb-3 !rounded-[16px]" />
+            <h1 className="font-display text-[26px] font-semibold">创建账号</h1>
+          </div>
+          <div className="hidden lg:block mb-6 anim-fade-up">
+            <h2 className="font-display text-[28px] font-semibold">创建账号</h2>
+            <p className="text-sm text-[#6e6b63] dark:text-[#a19f96] mt-1">
+              开始使用工作台，体验可核对的智能对话。
+            </p>
+          </div>
+
+          <div className="card-surface rounded-2xl p-8 relative z-10 anim-fade-up stagger-1">
           <form onSubmit={handleRegister} className="space-y-4">
             {/* 错误提示 */}
             {error && (
@@ -317,6 +346,7 @@ export const RegisterPage: React.FC = () => {
             >
               立即登录
             </button>
+          </div>
           </div>
         </div>
       </div>

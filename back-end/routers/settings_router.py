@@ -14,6 +14,7 @@ from services.settings_service import (
     save_preferences,
 )
 from services.web_search import web_search_client
+from services import agent_roles, subagent
 
 router = APIRouter(prefix="/settings", tags=["设置"])
 
@@ -55,6 +56,15 @@ async def get_settings(
             ),
             "writeKnowledge": app_settings.TOOL_WRITE_KNOWLEDGE_ENABLED,
             "toolHistory": app_settings.TOOL_HISTORY_ENABLED,
+            # 委派模式与可用角色。前端据此决定工具轨迹里要不要按角色分组,
+            # 以及在 delegate 那一步下面留出缩进的位置。
+            "delegation": {
+                "mode": app_settings.AGENT_DELEGATION_MODE
+                if subagent.enabled()
+                else "off",
+                "roles": agent_roles.names() if subagent.enabled() else [],
+                "maxDelegations": app_settings.AGENT_MAX_DELEGATIONS,
+            },
         },
     }
 

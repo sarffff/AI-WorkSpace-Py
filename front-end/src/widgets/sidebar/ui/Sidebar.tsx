@@ -11,14 +11,13 @@ import {
 } from "@/entities/chat/model/chatSlice";
 import { clearAuth } from "@/entities/auth/model/authSlice";
 import { apiClient } from "@/shared/api/client";
+import { BrandMark } from "@/shared/ui/BrandMark";
+import { toastMessageFrom, useToast } from "@/shared/ui/Toast";
 import {
   BookOpen,
   Sparkles,
   Settings,
   Plus,
-  Bot,
-  Database,
-  Cpu,
   Pin,
   PinOff,
   Trash2,
@@ -33,6 +32,7 @@ export const Sidebar: React.FC = () => {
   const dispatch = useDispatch();
   const navigate = useNavigate();
   const location = useLocation();
+  const toast = useToast();
   const { currentChatId, sessions, selectedModel } = useSelector(
     (state: RootState) => state.chat,
   );
@@ -58,8 +58,10 @@ export const Sidebar: React.FC = () => {
           ),
         );
       })
-      .catch(() => {});
-  }, [dispatch]);
+      .catch((e) => {
+        toast.error(toastMessageFrom(e, "加载会话列表失败"));
+      });
+  }, [dispatch, toast]);
 
   const navGroups = [
     {
@@ -103,8 +105,14 @@ export const Sidebar: React.FC = () => {
   const handleSaveRename = (id: string) => {
     const trimmed = editValue.trim();
     if (trimmed) {
+      const previousTitle =
+        sessions.find((c) => c.id === id)?.title ?? trimmed;
       dispatch(renameAction({ id, title: trimmed }));
-      apiClient.renameChat(id, trimmed).catch(() => {});
+      apiClient.renameChat(id, trimmed).catch((e) => {
+        // 乐观更新失败时把标题滚回去，侧栏不能和后端悄悄分叉
+        dispatch(renameAction({ id, title: previousTitle }));
+        toast.error(toastMessageFrom(e, "重命名失败"));
+      });
     }
     setEditingId(null);
     setEditValue("");
@@ -112,7 +120,11 @@ export const Sidebar: React.FC = () => {
 
   const handleDelete = (id: string) => {
     dispatch(deleteChatAction(id));
-    apiClient.deleteChat(id).catch(() => {});
+    apiClient
+      .deleteChat(id)
+      .catch((e) =>
+        toast.error(toastMessageFrom(e, "删除失败，请刷新页面后重试")),
+      );
   };
 
   const handleTogglePin = (id: string) => {
@@ -137,12 +149,9 @@ export const Sidebar: React.FC = () => {
   });
 
   return (
-    <aside className="w-64 bg-[#f3f0e6] dark:bg-[#1a1917] border-r border-[#e6e2d8] dark:border-[#282724] flex flex-col h-full select-none transition-colors duration-200 relative z-10">
-      {/* Brand & User Header */}
+    <aside className="w-64 bg-[#f3f0e6]/90 dark:bg-[#1a1917]/90 backdrop-blur-sm border-r border-[#e6e2d8] dark:border-[#282724] flex flex-col h-full select-none transition-colors duration-200 relative z-10">
       <div className="p-4 flex items-center gap-3 border-b border-[#e6e2d8]/80 dark:border-[#282724]/80">
-        <div className="w-9 h-9 rounded-xl btn-accent text-white flex items-center justify-center">
-          <Bot className="w-5 h-5" />
-        </div>
+        <BrandMark size={36} />
         <div className="min-w-0 flex-1">
           <h1 className="font-display font-semibold text-[15px] text-[#1f1e1d] dark:text-[#edece8] truncate">
             AI Workspace
@@ -232,6 +241,7 @@ export const Sidebar: React.FC = () => {
                   }}
                   onBlur={() => handleSaveRename(chat.id)}
                   autoFocus
+                  aria-label="重命名会话"
                   onClick={(e) => e.stopPropagation()}
                 />
               ) : (
@@ -249,6 +259,7 @@ export const Sidebar: React.FC = () => {
                     }}
                     className="p-1 rounded hover:bg-[#dcd7cb] dark:hover:bg-[#33312d] text-[#6e6b63] dark:text-[#a19f96] hover:text-[#da7756] transition-colors"
                     title={chat.pinned ? "取消固定" : "固定"}
+                    aria-label={chat.pinned ? "取消固定会话" : "固定会话"}
                   >
                     {chat.pinned ? (
                       <PinOff className="w-3 h-3" />
@@ -263,6 +274,7 @@ export const Sidebar: React.FC = () => {
                     }}
                     className="p-1 rounded hover:bg-[#dcd7cb] dark:hover:bg-[#33312d] text-[#6e6b63] dark:text-[#a19f96] hover:text-[#1f1e1d] dark:hover:text-[#edece8] transition-colors"
                     title="重命名"
+                    aria-label="重命名会话"
                   >
                     <Pencil className="w-3 h-3" />
                   </button>
@@ -273,6 +285,7 @@ export const Sidebar: React.FC = () => {
                     }}
                     className="p-1 rounded hover:bg-[#dcd7cb] dark:hover:bg-[#33312d] text-[#6e6b63] dark:text-[#a19f96] hover:text-rose-600 transition-colors"
                     title="删除"
+                    aria-label="删除会话"
                   >
                     <Trash2 className="w-3 h-3" />
                   </button>
@@ -283,33 +296,28 @@ export const Sidebar: React.FC = () => {
         </div>
       </div>
 
-      {/* Bottom Status Card */}
-      <div className="p-3.5 m-3 rounded-2xl bg-[#eae6db]/60 dark:bg-[#201f1c] border border-[#e3dfd5] dark:border-[#2a2926] space-y-2.5">
-        <div className="flex items-center gap-2 text-xs font-semibold text-[#1f1e1d] dark:text-[#edece8]">
-          <span className="w-5 h-5 rounded-md bg-[#da7756]/12 text-[#da7756] flex items-center justify-center">
-            <Cpu className="w-3 h-3" />
-          </span>
-          <span>服务提供节点</span>
-        </div>
-        <div className="text-[11px] text-[#6e6b63] dark:text-[#a19f96] flex items-center justify-between gap-2">
-          <span>当前模型</span>
-          <span
-            className="text-[#1f1e1d] dark:text-[#edece8] text-[10px] px-1.5 py-0.5 bg-[#dcd7cb]/70 dark:bg-[#2b2a27] rounded-md font-semibold truncate max-w-[130px]"
+      <div className="p-3.5 m-3 rounded-2xl bg-[#eae6db]/60 dark:bg-[#201f1c] border border-[#e3dfd5] dark:border-[#2a2926] space-y-3">
+        <div className="space-y-1.5">
+          <div className="label-eyebrow">当前模型</div>
+          <div
+            className="text-[11px] font-semibold text-[#1f1e1d] dark:text-[#edece8] truncate"
             style={{ fontFamily: "var(--font-mono)" }}
             title={selectedModel}
           >
             {selectedModel}
-          </span>
+          </div>
         </div>
-        <div className="text-[11px] text-[#6e6b63] dark:text-[#a19f96] flex items-center justify-between">
-          <span>存储</span>
-          <span className="text-[#1f1e1d] dark:text-[#edece8] text-[10px] px-1.5 py-0.5 bg-[#dcd7cb]/70 dark:bg-[#2b2a27] rounded-md flex items-center gap-1 font-semibold">
-            <Database className="w-2.5 h-2.5 text-emerald-500" /> MySQL + Redis
-          </span>
+        <div className="flex items-center gap-1.5">
+          {["检索", "轨迹", "护栏"].map((label) => (
+            <span key={label} className="chip text-[9px] px-1.5 py-0.5">
+              <span className="capability-dot !w-1.5 !h-1.5 !shadow-none" />
+              {label}
+            </span>
+          ))}
         </div>
         <button
           onClick={handleLogout}
-          className="w-full mt-1 py-1.5 px-3 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 text-[11px] font-medium flex items-center justify-center gap-1.5 transition-colors border border-rose-500/20"
+          className="w-full py-1.5 px-3 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 text-[11px] font-medium flex items-center justify-center gap-1.5 transition-colors border border-rose-500/20"
         >
           <LogOut className="w-3 h-3" />
           退出登录

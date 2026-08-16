@@ -114,6 +114,10 @@ class MessageToolStep(Base):
     tool_call_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     # 调用参数的 JSON。这是模型写的，不是用户文本
     arguments: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 哪个子代理执行的这一步。NULL = 主代理自己调的。
+    # 不区分的话"这次回答查了 8 次知识库"既可能是主代理反复检索，也可能是一次
+    # 委派里 researcher 查了 6 次——这两种情况的改进方向正好相反。
+    agent_role: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
     # ToolStatus 的三档（ok / invalid_arguments / unavailable），预检索失败记 error
     status: Mapped[str] = mapped_column(String(20), default="ok")

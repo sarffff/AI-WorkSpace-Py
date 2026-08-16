@@ -90,6 +90,25 @@ SPECS: dict[str, PromptSpec] = {
         setting="PROMPT_EVAL_ANSWER_VERSION",
         required=("context", "question"),
     ),
+    # 子代理各自一个 key,而不是共用一个带 [[if role]] 分支的模板:三个角色的
+    # 约束几乎不重叠(researcher 要讲出处分层,analyst 要讲"缺输入就停",
+    # critic 要讲"没依据别提"),塞进一版会变成一个谁都不好改的大文件,
+    # 而且改 researcher 那段会让 critic 的评估结果一起失效。
+    "agent_researcher": PromptSpec(
+        key="agent_researcher",
+        purpose="researcher 子代理：查资料并如实汇报出处",
+        default_version="v1",
+    ),
+    "agent_analyst": PromptSpec(
+        key="agent_analyst",
+        purpose="analyst 子代理：精确计算与读取附件",
+        default_version="v1",
+    ),
+    "agent_critic": PromptSpec(
+        key="agent_critic",
+        purpose="critic 子代理：只依据给定材料审查草稿",
+        default_version="v1",
+    ),
 }
 
 _FRONTMATTER = re.compile(r"^---\r?\n(.*?)\r?\n---\r?\n?", re.DOTALL)

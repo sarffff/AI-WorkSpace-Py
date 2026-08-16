@@ -39,6 +39,9 @@ import {
   type InsightEvent,
 } from "@/widgets/chat-insight/ui/ChatInsightPanel";
 import { useNavigate } from "react-router-dom";
+import { BrandMark } from "@/shared/ui/BrandMark";
+import { CapabilityStrip } from "@/shared/ui/CapabilityStrip";
+import { toastMessageFrom, useToast } from "@/shared/ui/Toast";
 import {
   Send,
   Bot,
@@ -57,6 +60,9 @@ import {
   ImageIcon,
   ShieldAlert,
   Route as RouteIcon,
+  Wrench,
+  Shield,
+  Zap,
 } from "lucide-react";
 
 const FLUSH_INTERVAL = 60;
@@ -66,10 +72,20 @@ const TOOL_LABELS: Record<string, string> = {
   search_knowledge_base: "检索知识库",
   list_knowledge_documents: "查看知识库文档",
   read_document_chunk: "读取文档分块",
+  delegate: "委派子代理",
+};
+
+const AGENT_LABELS: Record<string, string> = {
+  researcher: "资料研究员",
+  analyst: "分析员",
+  critic: "审阅员",
 };
 
 const toolLabel = (tool?: string) =>
   (TOOL_LABELS[tool ?? ""] ?? tool) || "工具";
+
+const agentLabel = (agent?: string) =>
+  (AGENT_LABELS[agent ?? ""] ?? agent) || "子代理";
 
 /** 同一段内容可能在多轮检索里重复命中，按文档 + 分块区间去重 */
 const dedupeCitations = (citations: Citation[]): Citation[] => {
@@ -139,6 +155,7 @@ interface PendingAttachment {
 export const ChatPage: React.FC = () => {
   const dispatch = useDispatch();
   const navigate = useNavigate();
+  const toast = useToast();
   const {
     currentChatId,
     messagesBySession,
@@ -394,8 +411,11 @@ export const ChatPage: React.FC = () => {
           }),
         );
       })
-      .catch(() => {});
-  }, [currentChatId, dispatch, messagesBySession]);
+      .catch((e) => {
+        // 历史消息是主内容，加载失败必须让用户知道（否则像空会话）
+        toast.error(toastMessageFrom(e, "加载历史消息失败"));
+      });
+  }, [currentChatId, dispatch, messagesBySession, toast]);
 
   // 后端能力清单只在挂载时拉一次：它由 .env 决定，改了要重启后端，
   // 也就是说它在一次会话里不会变。
@@ -689,6 +709,98 @@ export const ChatPage: React.FC = () => {
             break;
           }
 
+          if (chunk.type === "agent_state") {
+            const label = agentLabel(chunk.agent);
+            const failed = chunk.status === "failed";
+            const completed = chunk.status === "completed";
+            setToolStatus(
+              failed
+                ? `${label}未完成，主代理正在调整策略...`
+                : completed
+                  ? `${label}已返回报告，主代理正在整理...`
+                  : `正在委派给${label}...`,
+            );
+            setInsightEvents((prev) => [
+              ...prev,
+              {
+                type: "agent_state",
+                label: `委派 · ${label}`,
+                status: chunk.status,
+                detail: completed
+                  ? `${chunk.rounds ?? 0}轮 · ${chunk.steps ?? 0}步`
+                  : failed
+                    ? "未完成"
+                    : "开始执行",
+              },
+            ]);
+            continue;
+          }
+
+          if (chunk.type === "agent_step") {
+            const agent = chunk.agent ?? "";
+            const agentRound = chunk.agentRound ?? 1;
+            const round = chunk.round ?? 0;
+            if (chunk.phase === "tool_start") {
+              setToolStatus(`${agentLabel(agent)} · ${toolLabel(chunk.tool)}...`);
+              setInsightEvents((prev) => [
+                ...prev,
+                {
+                  type: "agent_step",
+                  label: `${agentLabel(agent)} · ${toolLabel(chunk.tool)}`,
+                  detail: `子任务第${agentRound}轮`,
+                },
+              ]);
+              setToolStepsByMessage((prev) => {
+                const existing = prev[userMessageId] ?? [];
+                return {
+                  ...prev,
+                  [userMessageId]: [
+                    ...existing,
+                    {
+                      round,
+                      callIndex: 10_000 + existing.filter((step) => step.agentRole === agent).length,
+                      tool: chunk.tool ?? "",
+                      input: chunk.input,
+                      agentRole: agent,
+                      agentRound,
+                    },
+                  ],
+                };
+              });
+            } else {
+              setToolStepsByMessage((prev) => {
+                const steps = prev[userMessageId];
+                if (!steps?.length) return prev;
+                let target = -1;
+                for (let i = steps.length - 1; i >= 0; i -= 1) {
+                  if (
+                    steps[i].tool === chunk.tool &&
+                    steps[i].agentRole === agent &&
+                    steps[i].agentRound === agentRound &&
+                    !steps[i].status
+                  ) {
+                    target = i;
+                    break;
+                  }
+                }
+                if (target < 0) return prev;
+                const next = [...steps];
+                next[target] = {
+                  ...next[target],
+                  status:
+                    chunk.status === "ok" ||
+                    chunk.status === "invalid_arguments" ||
+                    chunk.status === "unavailable" ||
+                    chunk.status === "error"
+                      ? chunk.status
+                      : "ok",
+                };
+                return { ...prev, [userMessageId]: next };
+              });
+            }
+            continue;
+          }
+
           if (chunk.type === "citations") {
             citationsRef.current = [
               ...citationsRef.current,
@@ -830,7 +942,16 @@ export const ChatPage: React.FC = () => {
               }
               if (target < 0) return prev;
               const next = [...steps];
-              next[target] = { ...next[target], status: chunk.status ?? "ok" };
+              next[target] = {
+                  ...next[target],
+                  status:
+                    chunk.status === "ok" ||
+                    chunk.status === "invalid_arguments" ||
+                    chunk.status === "unavailable" ||
+                    chunk.status === "error"
+                      ? chunk.status
+                      : "ok",
+                };
               return { ...prev, [userMessageId]: next };
             });
             continue;
@@ -954,7 +1075,9 @@ export const ChatPage: React.FC = () => {
               ...sessions,
             ]),
           );
-        } catch {
+        } catch (e) {
+          // 首条消息发不出去时输入框还没清空，提示后让用户直接重试
+          toast.error(toastMessageFrom(e, "创建会话失败，请重试"));
           return;
         }
       }
@@ -1012,17 +1135,22 @@ export const ChatPage: React.FC = () => {
       // 附件走路径还是内联全文由它决定，漏了这一项会一直用挂载时那份能力清单
       capabilities,
       runCompletion,
+      toast,
     ],
   );
 
   /** 复制单条消息到剪贴板 */
-  const handleCopyMessage = useCallback(async (content: string) => {
-    try {
-      await navigator.clipboard.writeText(content);
-    } catch {
-      // 忽略
-    }
-  }, []);
+  const handleCopyMessage = useCallback(
+    async (content: string) => {
+      try {
+        await navigator.clipboard.writeText(content);
+        toast.success("已复制到剪贴板");
+      } catch {
+        toast.error("复制失败");
+      }
+    },
+    [toast],
+  );
 
   /** 重新生成：截断指定 assistant 消息，重新发上一条用户消息 */
   const handleRegenerate = useCallback(
@@ -1039,7 +1167,8 @@ export const ChatPage: React.FC = () => {
 
       try {
         await apiClient.reviseMessage(currentChatId, msgs[userIdx].id);
-      } catch {
+      } catch (e) {
+        toast.error(toastMessageFrom(e, "重新生成失败，请重试"));
         return;
       }
 
@@ -1052,7 +1181,7 @@ export const ChatPage: React.FC = () => {
       );
       await runCompletion(currentChatId, userMsg, msgs[userIdx].id);
     },
-    [currentChatId, isGenerating, messages, dispatch, runCompletion],
+    [currentChatId, isGenerating, messages, dispatch, runCompletion, toast],
   );
 
   /** 编辑用户消息并重发：截断该 user 消息开始的所有消息，用新内容重发 */
@@ -1066,7 +1195,8 @@ export const ChatPage: React.FC = () => {
           userMsgId,
           newContent.trim(),
         );
-      } catch {
+      } catch (e) {
+        toast.error(toastMessageFrom(e, "重发失败，请重试"));
         return;
       }
       dispatch(
@@ -1090,7 +1220,7 @@ export const ChatPage: React.FC = () => {
       );
       await runCompletion(currentChatId, newContent.trim(), userMsgId);
     },
-    [currentChatId, isGenerating, dispatch, runCompletion],
+    [currentChatId, isGenerating, dispatch, runCompletion, toast],
   );
 
   return (
@@ -1101,44 +1231,83 @@ export const ChatPage: React.FC = () => {
           className="flex-1 overflow-y-auto p-6 space-y-6"
         >
           {!currentChatId || messages.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full text-center max-w-lg mx-auto">
-              <div className="w-14 h-14 rounded-2xl bg-[#da7756] text-white flex items-center justify-center shadow-lg shadow-[#da7756]/25 mb-5">
-                <Bot className="w-7 h-7" />
+            <div className="flex flex-col items-center justify-center h-full text-center max-w-2xl mx-auto px-4">
+              <div className="relative mb-6">
+                <div className="absolute inset-0 rounded-[22px] bg-[#da7756] blur-2xl opacity-25" />
+                <BrandMark size={56} className="relative !rounded-[18px]" />
               </div>
-              <h2 className="text-xl font-semibold text-[#1f1e1d] dark:text-[#edece8] mb-2">
-                下午好，我是你的 AI 智能助手
+              <p className="label-eyebrow mb-2">Studio</p>
+              <h2 className="font-display text-[26px] font-semibold text-[#1f1e1d] dark:text-[#edece8] mb-2">
+                工作台已就绪
               </h2>
-              <p className="text-sm text-[#6e6b63] dark:text-[#a19f96] max-w-md mb-8 leading-relaxed">
-                随时与我探讨问题、编写代码或检索本地知识库，我将为你提供高质量的深度解答。
+              <p className="text-sm text-[#6e6b63] dark:text-[#a19f96] max-w-md mb-7 leading-relaxed">
+                对话只是入口。右侧洞察、工具轨迹、护栏与缓存命中，才是这套工作台真正要给你看的。
               </p>
+              <CapabilityStrip compact className="justify-center mb-8" />
               <div className="grid grid-cols-2 gap-3 w-full">
                 <button
                   onClick={() => {
                     setInput("请帮我分析当前项目的代码架构并给出重构建议");
                     if (textareaRef.current) textareaRef.current.focus();
                   }}
-                  className="p-3 rounded-xl bg-[#f3f0e6] hover:bg-[#eae6db] dark:bg-[#1e1d1b] dark:hover:bg-[#262522] border border-[#e3dfd5] dark:border-[#2e2d2a] text-xs text-[#1f1e1d] dark:text-[#edece8] text-left transition-all"
+                  className="card-surface card-lift p-4 rounded-2xl text-left"
                 >
-                  <div className="font-semibold mb-0.5">💻 代码重构分析</div>
-                  <div className="text-[11px] text-[#6e6b63] dark:text-[#a19f96] truncate">
-                    审查代码质量与性能瓶颈
+                  <div className="w-8 h-8 rounded-xl bg-[#da7756]/12 text-[#da7756] flex items-center justify-center mb-2.5">
+                    <Wrench className="w-4 h-4" />
+                  </div>
+                  <div className="text-xs font-semibold text-[#1f1e1d] dark:text-[#edece8] mb-1">
+                    代码重构分析
+                  </div>
+                  <div className="text-[11px] text-[#6e6b63] dark:text-[#a19f96] leading-relaxed">
+                    审查结构与性能瓶颈，工具轨迹会记下每一步。
                   </div>
                 </button>
                 <button
                   onClick={() => {
-                    setInput("请帮我从知识库中检索并总结公司相关制度");
+                    setInput("请帮我从知识库中检索并总结相关制度");
                     setUseRag(true);
                     if (textareaRef.current) textareaRef.current.focus();
                   }}
-                  className={`p-3 rounded-xl border text-left transition-all ${
-                    useRag
-                      ? "bg-[#da7756]/10 border-[#da7756]/40 text-[#1f1e1d] dark:text-[#edece8]"
-                      : "bg-[#f3f0e6] hover:bg-[#eae6db] dark:bg-[#1e1d1b] dark:hover:bg-[#262522] border-[#e3dfd5] dark:border-[#2e2d2a] text-[#1f1e1d] dark:text-[#edece8]"
+                  className={`card-surface card-lift p-4 rounded-2xl text-left ${
+                    useRag ? "border-[#da7756]/40" : ""
                   }`}
                 >
-                  <div className="font-semibold mb-0.5">📚 知识库 RAG 检索</div>
-                  <div className="text-[11px] text-[#6e6b63] dark:text-[#a19f96] truncate">
-                    基于本地文档的精准问答
+                  <div className="w-8 h-8 rounded-xl bg-[#da7756]/12 text-[#da7756] flex items-center justify-center mb-2.5">
+                    <BookOpen className="w-4 h-4" />
+                  </div>
+                  <div className="text-xs font-semibold text-[#1f1e1d] dark:text-[#edece8] mb-1">
+                    知识库 RAG 检索
+                  </div>
+                  <div className="text-[11px] text-[#6e6b63] dark:text-[#a19f96] leading-relaxed">
+                    混合检索 + 引用回显，答案能核对到来源分块。
+                  </div>
+                </button>
+                <button
+                  onClick={() => navigate("/traces")}
+                  className="card-surface card-lift p-4 rounded-2xl text-left"
+                >
+                  <div className="w-8 h-8 rounded-xl bg-[#da7756]/12 text-[#da7756] flex items-center justify-center mb-2.5">
+                    <Zap className="w-4 h-4" />
+                  </div>
+                  <div className="text-xs font-semibold text-[#1f1e1d] dark:text-[#edece8] mb-1">
+                    回放一次运行
+                  </div>
+                  <div className="text-[11px] text-[#6e6b63] dark:text-[#a19f96] leading-relaxed">
+                    span 瀑布拆开耗时、token 与失败点。
+                  </div>
+                </button>
+                <button
+                  onClick={() => navigate("/prompts")}
+                  className="card-surface card-lift p-4 rounded-2xl text-left"
+                >
+                  <div className="w-8 h-8 rounded-xl bg-[#da7756]/12 text-[#da7756] flex items-center justify-center mb-2.5">
+                    <Shield className="w-4 h-4" />
+                  </div>
+                  <div className="text-xs font-semibold text-[#1f1e1d] dark:text-[#edece8] mb-1">
+                    挂一版提示词
+                  </div>
+                  <div className="text-[11px] text-[#6e6b63] dark:text-[#a19f96] leading-relaxed">
+                    只读对比系统提示词，下一轮按版本分桶缓存。
                   </div>
                 </button>
               </div>
@@ -1147,10 +1316,10 @@ export const ChatPage: React.FC = () => {
             messages.map((msg) => (
               <div
                 key={msg.id}
-                className={`group flex items-start gap-4 ${
+                className={`group flex items-start gap-4 anim-msg-in ${
                   msg.role === "user"
                     ? "ml-auto flex-row-reverse max-w-2xl"
-                    : "max-w-xl"
+                    : "max-w-2xl"
                 }`}
               >
                 <div
@@ -1295,6 +1464,7 @@ export const ChatPage: React.FC = () => {
                       <button
                         onClick={() => handleCopyMessage(msg.content)}
                         title="复制"
+                        aria-label="复制消息"
                         className="p-1 rounded hover:bg-[#f3f0e6] dark:hover:bg-[#262522] hover:text-[#1f1e1d] dark:hover:text-[#edece8]"
                       >
                         <Copy className="w-3.5 h-3.5" />
@@ -1306,6 +1476,7 @@ export const ChatPage: React.FC = () => {
                             setEditingText(msg.content);
                           }}
                           title="编辑并重发"
+                          aria-label="编辑并重发消息"
                           className="p-1 rounded hover:bg-[#f3f0e6] dark:hover:bg-[#262522] hover:text-[#1f1e1d] dark:hover:text-[#edece8]"
                         >
                           <Pencil className="w-3.5 h-3.5" />
@@ -1315,6 +1486,7 @@ export const ChatPage: React.FC = () => {
                         <button
                           onClick={() => handleRegenerate(msg.id)}
                           title="重新生成"
+                          aria-label="重新生成回答"
                           className="p-1 rounded hover:bg-[#f3f0e6] dark:hover:bg-[#262522] hover:text-[#1f1e1d] dark:hover:text-[#edece8]"
                         >
                           <RefreshCw className="w-3.5 h-3.5" />
@@ -1326,6 +1498,7 @@ export const ChatPage: React.FC = () => {
                             navigate(`/traces?message=${msg.messageId}`)
                           }
                           title="查看运行轨迹"
+                          aria-label="查看运行轨迹"
                           className="p-1 rounded hover:bg-[#f3f0e6] dark:hover:bg-[#262522] hover:text-[#1f1e1d] dark:hover:text-[#edece8]"
                         >
                           <RouteIcon className="w-3.5 h-3.5" />
@@ -1372,7 +1545,7 @@ export const ChatPage: React.FC = () => {
           </div>
         )}
 
-        <div className="p-4 border-t border-[#e6e2d8] dark:border-[#282724] bg-[#fbf9f5]/60 dark:bg-[#141413]/60 backdrop-blur-md">
+        <div className="p-4 border-t border-[#e6e2d8] dark:border-[#282724] bg-[#fbf9f5]/70 dark:bg-[#141413]/70 backdrop-blur-md">
           {attachError && (
             <div className="max-w-4xl mx-auto mb-2 flex items-center justify-between gap-3 p-2.5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-600 dark:text-rose-400 text-xs">
               <span>{attachError}</span>
@@ -1442,7 +1615,7 @@ export const ChatPage: React.FC = () => {
             </div>
           )}
           <form onSubmit={handleSend} className="max-w-4xl mx-auto relative">
-            <div className="flex items-center rounded-2xl bg-white dark:bg-[#1e1d1b] border border-[#e3dfd5] dark:border-[#2e2d2a] focus-within:border-[#da7756] transition-all shadow-md p-2.5 gap-2">
+            <div className="flex items-center composer-dock focus-within:border-[#da7756] transition-all p-2.5 gap-2">
               <button
                 type="button"
                 onClick={() => setUseRag((v) => !v)}

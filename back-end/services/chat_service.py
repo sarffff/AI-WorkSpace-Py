@@ -18,6 +18,8 @@ from services import prompt_library
 from services.semantic_cache import semantic_cache
 from services.telemetry import SpanKind, set_span_defaults, tracer
 from services.token_budget import HistoryMessage
+from services import agent_roles
+from services import subagent
 from services import tool_history
 from services.tool_runtime import ToolDefinition, ToolRuntime, ToolStatus
 from services import vision
@@ -51,6 +53,34 @@ class _ToolResultBudget:
             return text
         self._remaining = 0
         return text[:limit] + f"\n\n[结果过长已截断，原始长度 {len(text)} 字符]"
+
+
+class _Delegations:
+    """一次回答里所有委派的共享状态。
+
+    子代理是在一个工具处理器内部跑的,那里既拿不到 SSE 的生成器也不该替主循环
+    决定轨迹怎么归属。所以结果先攒在 ``pending`` 里,由主循环在 ``delegate``
+    这一步返回之后立刻取走——事件因此是成批发出的,而不是子代理边跑边发。
+    这个取舍是有代价的:委派期间界面上只有一个"正在委派给 researcher"的状态,
+    看不到它此刻在查第几次。换成实时推送需要把整条链路改成 async 队列,
+    而收益只是一个进度条。
+    """
+
+    __slots__ = ("used", "limit", "pending")
+
+    def __init__(self, limit: int) -> None:
+        self.used = 0
+        self.limit = max(0, limit)
+        self.pending: list[subagent.SubAgentOutcome] = []
+
+    @property
+    def exhausted(self) -> bool:
+        return self.used >= self.limit
+
+    def take(self) -> list[subagent.SubAgentOutcome]:
+        outcomes = self.pending
+        self.pending = []
+        return outcomes
 
 
 class ChatService:
@@ -375,6 +405,68 @@ class ChatService:
         )
         return tools
 
+    @staticmethod
+    def _supervisor_tools(
+        tools: list[ToolDefinition], roles: list[agent_roles.AgentRole]
+    ) -> list[ToolDefinition]:
+        """supervisor 模式下主代理自己还留着哪些工具。
+
+        把已被某个角色接管的工具收走,剩下的留给主代理——目前就是
+        ``save_to_knowledge_base``:它需要用户明确要求才能执行,而子代理看不到
+        用户原话,判断不了"是否真的要求保存"(理由写在 agent_roles 的模块文档里)。
+
+        收走专用工具的代价很实在:简单问题也必须先委派一次才能查一下知识库,
+        多付一次完整的子代理循环。这正是 ``augment`` 模式存在的原因,也是
+        默认不开 ``supervisor`` 的原因。
+        """
+        owned = {name for role in roles for name in role.tools}
+        return [tool for tool in tools if tool.name not in owned]
+
+    @staticmethod
+    def _create_delegate_tool(
+        roles: list[agent_roles.AgentRole],
+        runner: subagent.SubAgentRunner,
+        state: _Delegations,
+    ) -> ToolDefinition:
+        """``delegate``:主代理把子任务交出去的那个工具。
+
+        它是一个普通工具,而不是循环里的一个特殊分支——于是"要不要委派、派给谁"
+        完全由模型在运行时决定,和它决定要不要检索是同一件事。做成分支就等于
+        把这个决定挪回编码时,那样它是流水线,不是 agent。
+        """
+        schema, description = subagent.build_delegate_schema(roles)
+        valid = {role.name: role for role in roles}
+
+        async def delegate(arguments: dict[str, Any]) -> str:
+            role_name = arguments.get("role")
+            task = arguments.get("task")
+            if not isinstance(role_name, str) or role_name not in valid:
+                return (
+                    f"委派失败：没有 {role_name!r} 这个子代理。"
+                    f"可用：{', '.join(valid)}。"
+                )
+            if not isinstance(task, str) or not task.strip():
+                return "委派失败：task 必须是非空字符串，且要把背景写全。"
+            # 上限在这里挡,而不是靠提示词劝:超了就告诉它自己动手,
+            # 而不是静默拒绝——静默拒绝的话它下一轮还会再派一次。
+            if state.exhausted:
+                return (
+                    f"委派失败：本次回答的委派次数已达上限（{state.limit} 次）。"
+                    "请自己调用工具完成剩下的部分，或基于已有信息作答。"
+                )
+
+            state.used += 1
+            outcome = await runner.run(valid[role_name], task.strip())
+            state.pending.append(outcome)
+            return subagent.format_report(outcome)
+
+        return ToolDefinition(
+            name="delegate",
+            description=description,
+            parameters=schema,
+            handler=delegate,
+        )
+
     def _create_knowledge_tools(
         self,
         db: Session,
@@ -635,6 +727,68 @@ class ChatService:
                         prompt_ref=system_template.ref,
                     )
 
+    @staticmethod
+    async def _emit_subagent_steps(
+        db: Session,
+        outcome: subagent.SubAgentOutcome,
+        *,
+        chat_id: str,
+        message_id: str | None,
+        round_index: int,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """把子代理内部轨迹翻译成主 SSE 流，并逐步落库。
+
+        子代理有自己的轮次，但把那个数字直接塞进 ``round`` 会和主代理轮次冲突：
+        UI 会把 researcher 的第 1 轮排到主代理第 1 轮旁边，看起来像并行调用。
+        所以 SSE 的 ``round`` 保持外层主代理轮次，内层轮次单独放 ``agentRound``。
+        数据库仍用外层轮次排序，``agent_role`` 用来区分归属。
+        """
+        for index, step in enumerate(outcome.steps):
+            yield {
+                "type": "agent_step",
+                "agent": outcome.role,
+                "phase": "tool_start",
+                "tool": step.tool,
+                "input": step.arguments,
+                "round": round_index,
+                "agentRound": step.round_index,
+            }
+            yield {
+                "type": "agent_step",
+                "agent": outcome.role,
+                "phase": "tool_result",
+                "tool": step.tool,
+                "status": step.status,
+                "round": round_index,
+                "agentRound": step.round_index,
+            }
+            # call_index 乘一个固定槽宽再加内部序号:外层同一轮里可能委派多次,
+            # 而每个子代理的 call_index 都从 0 开始。不做偏移,落库后的稳定排序
+            # 会把几次委派里的第 0 步全排在一起。
+            tool_history.record(
+                db,
+                chat_id=chat_id,
+                message_id=message_id,
+                round_index=round_index,
+                call_index=10_000 + index,
+                tool_name=step.tool,
+                status=step.status,
+                result=step.result,
+                tool_call_id=step.tool_call_id,
+                arguments=step.arguments,
+                citations=step.citations,
+                agent_role=outcome.role,
+            )
+        yield {
+            "type": "agent_state",
+            "agent": outcome.role,
+            "status": "failed" if outcome.failed else "completed",
+            "round": round_index,
+            "rounds": outcome.rounds,
+            "steps": len(outcome.steps),
+            "truncated": outcome.truncated,
+        }
+
     async def _run_turn(
         self,
         db: Session,
@@ -657,7 +811,47 @@ class ChatService:
         工具结果预算耗尽、或本轮请求的工具全部不可用。
         """
         citations: list[dict] = []
-        runtime = ToolRuntime(self._create_tools(db, user_id, use_rag, citations))
+        budget = _ToolResultBudget(
+            settings.TOOL_RESULT_TOTAL_CHARS, settings.TOOL_RESULT_MAX_CHARS
+        )
+        generation: dict[str, Any] = {
+            "model": model or settings.LLM_MODEL,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_p": top_p,
+        }
+
+        base_tools = self._create_tools(db, user_id, use_rag, citations)
+        # ---- 多代理:委派 ----
+        # 子代理的运行时拿的是**未经角色过滤的**完整工具集合,按角色过滤发生在
+        # SubAgentRunner._schemas_for(下发哪些 schema)和它的执行前检查(越权拦截)
+        # 两处。让运行时本身只装该角色的工具也能做到,但那样每次委派都要重建一次
+        # ToolRuntime,而这几个工具里有的持有数据库会话与 HTTP 客户端。
+        delegations: _Delegations | None = None
+        tools = base_tools
+        if subagent.enabled():
+            registered = {tool.name for tool in base_tools}
+            roles = agent_roles.available(registered)
+            if roles:
+                delegations = _Delegations(settings.AGENT_MAX_DELEGATIONS)
+                runner = subagent.SubAgentRunner(
+                    self.model_adapter,
+                    ToolRuntime(base_tools),
+                    generation=generation,
+                    take_budget=budget.take,
+                )
+                if settings.AGENT_DELEGATION_MODE == "supervisor":
+                    tools = self._supervisor_tools(base_tools, roles)
+                tools = [
+                    *tools,
+                    self._create_delegate_tool(roles, runner, delegations),
+                ]
+                turn.set(
+                    delegation_mode=settings.AGENT_DELEGATION_MODE,
+                    delegation_roles=[role.name for role in roles],
+                )
+
+        runtime = ToolRuntime(tools)
         history = await self._get_chat_history_messages(
             db, chat_id, exclude_message_id=message_id
         )
@@ -748,16 +942,6 @@ class ChatService:
             *trajectory,
             {"role": "user", "content": self._user_content(user_content, turn, model)},
         ]
-        generation: dict[str, Any] = {
-            "model": model or settings.LLM_MODEL,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "top_p": top_p,
-        }
-
-        budget = _ToolResultBudget(
-            settings.TOOL_RESULT_TOTAL_CHARS, settings.TOOL_RESULT_MAX_CHARS
-        )
         max_rounds = max(1, settings.AGENT_MAX_TOOL_ROUNDS)
         emitted_any = False
         force_final = False
@@ -845,6 +1029,15 @@ class ChatService:
                     "input": arguments,
                     "round": round_index,
                 }
+                # 委派要等一整个子代理循环跑完才返回,几十秒不出声的话界面上
+                # 只有一个转圈。先说清正在等谁。
+                if call.name == "delegate":
+                    yield {
+                        "type": "agent_state",
+                        "agent": str(arguments.get("role") or "?"),
+                        "status": "started",
+                        "round": round_index,
+                    }
                 async with tracer.span(
                     f"tool.{call.name}", SpanKind.TOOL, arguments=len(arguments) or None
                 ) as tool_span:
@@ -855,6 +1048,20 @@ class ChatService:
                         # 工具失败要能在 trace 里直接筛出来,而不是埋在 attributes 里
                         tool_span.status = "error"
                         tool_span.error_type = result.status.value
+                # 子代理的步骤在它自己那次 delegate 返回之后才拿得到(理由见
+                # _Delegations 的文档串)。这里先把它们发出去并落库,再发外层
+                # delegate 的 tool_result——顺序反了的话界面上会先看到"委派完成",
+                # 然后才冒出它做过的那几步。
+                if delegations is not None and delegations.pending:
+                    for outcome in delegations.take():
+                        async for event in self._emit_subagent_steps(
+                            db,
+                            outcome,
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            round_index=round_index,
+                        ):
+                            yield event
                 yield {
                     "type": "tool_result",
                     "tool": call.name,

@@ -96,6 +96,7 @@ export const FeedbackButtons: React.FC<Props> = ({ messageId, initial }) => {
           onClick={() => void send("up")}
           disabled={disabled}
           title={messageId ? "回答有帮助" : "等回答结束后可评价"}
+          aria-label="评价回答有帮助"
           className={`p-1.5 rounded-lg transition-colors disabled:opacity-40 ${
             rating === "up"
               ? "text-emerald-600 bg-emerald-500/10"
@@ -108,6 +109,7 @@ export const FeedbackButtons: React.FC<Props> = ({ messageId, initial }) => {
           onClick={handleDown}
           disabled={disabled}
           title={messageId ? "回答有问题" : "等回答结束后可评价"}
+          aria-label="评价回答有问题"
           className={`p-1.5 rounded-lg transition-colors disabled:opacity-40 ${
             rating === "down"
               ? "text-rose-600 bg-rose-500/10"
@@ -126,6 +128,7 @@ export const FeedbackButtons: React.FC<Props> = ({ messageId, initial }) => {
             </span>
             <button
               onClick={() => setExpanded(false)}
+              aria-label="收起反馈面板"
               className="text-[#918d83] hover:text-[#1f1e1d] dark:hover:text-[#edece8]"
             >
               <X className="w-3 h-3" />

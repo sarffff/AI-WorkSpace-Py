@@ -24,6 +24,7 @@ from routers import (
     feedback_router,
 )
 from services import prompt_library
+from services import subagent
 from services import workspace_tools
 
 app = FastAPI(
@@ -143,6 +144,16 @@ async def startup():
     print(f"Workspace tools: {', '.join(workspace_tools.enabled_names()) or '(全部关闭)'}")
     print(f"Vision models: {settings.VISION_MODELS or '(未启用，图片只会以链接形式留在提示词里)'}")
     print(f"Chat system prompt: chat_system_rag/{settings.PROMPT_CHAT_SYSTEM_VERSION}")
+    print(f"Agent delegation: {subagent.describe_mode()}")
+    # 开了委派却没切提示词是最容易犯的配置错误：模型能从 schema 里看到 delegate，
+    # 但不知道任务描述必须自包含、也不知道什么时候不该委派。表现是它把简单问题
+    # 也派出去，或者写一句"帮我查一下这个"就派出去，看起来像"多代理没用"。
+    if subagent.enabled() and settings.PROMPT_CHAT_SYSTEM_VERSION != "v5-supervisor":
+        print(
+            "  警告：委派已开启，但 PROMPT_CHAT_SYSTEM_VERSION="
+            f"{settings.PROMPT_CHAT_SYSTEM_VERSION}。"
+            "该版本没有讲 delegate 怎么用，建议切到 v5-supervisor。"
+        )
     print(f"AI Workspace Server (Python) is running on: http://localhost:{settings.PORT}")
 
 

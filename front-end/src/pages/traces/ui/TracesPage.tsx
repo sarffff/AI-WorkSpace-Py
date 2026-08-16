@@ -7,6 +7,9 @@ import type {
   TraceSpanNode,
 } from "@/shared/types/api.types";
 import { fmtCost, fmtInt, fmtMs, spanLabel } from "@/shared/lib/format";
+import { PageHeader } from "@/shared/ui/PageHeader";
+import { EmptyState } from "@/shared/ui/EmptyState";
+import { BrandMark } from "@/shared/ui/BrandMark";
 import {
   Loader2,
   RefreshCw,
@@ -80,36 +83,30 @@ export const TracesPage: React.FC = () => {
     : traces;
 
   return (
-    <div className="p-8 h-full overflow-y-auto app-atmosphere transition-colors duration-200">
-      <div className="relative z-10 space-y-5 h-full flex flex-col">
-        {/* 顶栏 */}
-        <div className="flex items-center justify-between shrink-0 anim-fade-up">
-          <div>
-            <h1 className="font-display text-[22px] font-semibold text-[#1f1e1d] dark:text-[#edece8]">
-              运行轨迹
-            </h1>
-            <p className="text-xs text-[#6e6b63] dark:text-[#a19f96] mt-1">
-              Agent 运行回放与 span 瀑布
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => {
-                setFailuresOnly(!failuresOnly);
-              }}
-              className={`chip ${failuresOnly ? "chip-accent" : ""}`}
-            >
-              {failuresOnly ? "仅失败" : "全部"}
-            </button>
-            <button
-              onClick={fetchTraces}
-              className="btn-accent px-3 py-1.5 rounded-lg text-[11px] flex items-center gap-1.5"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-              刷新
-            </button>
-          </div>
-        </div>
+    <div className="page-shell app-atmosphere transition-colors duration-200">
+      <div className="relative z-10 space-y-5 h-full flex flex-col max-w-6xl">
+        <PageHeader
+          eyebrow="Replay"
+          title="运行轨迹"
+          description="把一次回答拆成 span 瀑布。核对耗时、token、失败点——不是看热闹。"
+          actions={
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setFailuresOnly(!failuresOnly)}
+                className={`chip ${failuresOnly ? "chip-accent" : ""}`}
+              >
+                {failuresOnly ? "仅失败" : "全部"}
+              </button>
+              <button
+                onClick={fetchTraces}
+                className="btn-accent px-3 py-1.5 rounded-lg text-[11px] flex items-center gap-1.5"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                刷新
+              </button>
+            </div>
+          }
+        />
 
         {error && (
           <div className="flex items-center gap-2 p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-600 dark:text-rose-400 text-xs">
@@ -125,9 +122,15 @@ export const TracesPage: React.FC = () => {
         )}
 
         {!loading && traces.length === 0 && !error && (
-          <div className="flex flex-col items-center justify-center py-20 text-xs text-[#918d83]">
-            {messageParam ? "trace 尚未入库,稍后刷新" : "还没有埋点数据"}
-          </div>
+          <EmptyState
+            icon={<BrandMark size={48} className="!rounded-[16px]" />}
+            title="还没有可回放的轨迹"
+            description={
+              messageParam
+                ? "这条消息的 trace 尚未入库，稍后刷新。"
+                : "去对话一次。回答结束后，这里会出现一条可以拆开看的 span 瀑布。"
+            }
+          />
         )}
 
         {!loading && traces.length > 0 && (

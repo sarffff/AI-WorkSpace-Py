@@ -4,7 +4,9 @@ import { useNavigate } from "react-router-dom";
 import { apiClient } from "@/shared/api/client";
 import type { Prompt } from "@/shared/types/api.types";
 import { setPendingInput, setCurrentChat } from "@/entities/chat/model/chatSlice";
+import { PageHeader } from "@/shared/ui/PageHeader";
 import { PromptLab } from "@/widgets/prompt-lab/ui/PromptLab";
+import { useToast } from "@/shared/ui/Toast";
 import {
     Sparkles,
     Trash2,
@@ -57,6 +59,7 @@ const formatCategory = (category: string) => CATEGORY_LABELS[category] ?? catego
 export const PromptsPage: React.FC = () => {
     const dispatch = useDispatch();
     const navigate = useNavigate();
+    const toast = useToast();
     const [prompts, setPrompts] = useState<Prompt[]>([]);
     const [tab, setTab] = useState<PageTab>("templates");
     const [loading, setLoading] = useState(true);
@@ -105,8 +108,9 @@ export const PromptsPage: React.FC = () => {
     const handleCopy = async (p: Prompt) => {
         try {
             await navigator.clipboard.writeText(p.content);
+            toast.success("已复制到剪贴板");
         } catch {
-            // 忽略
+            toast.error("复制失败");
         }
     };
 
@@ -154,28 +158,26 @@ export const PromptsPage: React.FC = () => {
     };
 
     return (
-        <div className="p-8 h-full overflow-y-auto space-y-6 app-atmosphere transition-colors duration-200">
-            <div className="flex items-center justify-between relative z-10">
-                <div className="anim-fade-up">
-                    <h3 className="font-display text-[22px] font-semibold text-[#1f1e1d] dark:text-[#edece8]">
-                        提示词工作台
-                    </h3>
-                    <p className="text-xs text-[#6e6b63] dark:text-[#a19f96] mt-1">
-                        管理自己的提示词模板，也能看清系统提示词每一版的差异。
-                    </p>
-                </div>
-                {tab === "templates" && (
-                    <button
-                        onClick={() => setEditing({ ...EMPTY_EDITING })}
-                        className="btn-accent px-4 py-2.5 text-white text-xs font-medium rounded-xl flex items-center gap-2"
-                    >
-                        <Plus className="w-4 h-4" />
-                        新建提示词
-                    </button>
-                )}
-            </div>
+        <div className="page-shell app-atmosphere transition-colors duration-200">
+            <div className="relative z-10 space-y-6 max-w-6xl">
+            <PageHeader
+                eyebrow="Lab"
+                title="提示词工作台"
+                description="左边是自己攒的模板，右边是驱动对话与评估的系统提示词——只读，因为版本是仓库里的文件。"
+                actions={
+                    tab === "templates" ? (
+                        <button
+                            onClick={() => setEditing({ ...EMPTY_EDITING })}
+                            className="btn-accent px-4 py-2.5 text-white text-xs font-medium rounded-xl flex items-center gap-2"
+                        >
+                            <Plus className="w-4 h-4" />
+                            新建提示词
+                        </button>
+                    ) : undefined
+                }
+            />
 
-            <div className="flex items-center gap-1 p-1 rounded-xl bg-[#f3f0e6] dark:bg-[#201f1c] w-fit relative z-10">
+            <div className="seg-switch w-fit relative z-10">
                 {(
                     [
                         ["templates", "模板库"],
@@ -184,12 +186,8 @@ export const PromptsPage: React.FC = () => {
                 ).map(([key, label]) => (
                     <button
                         key={key}
+                        data-active={tab === key}
                         onClick={() => setTab(key)}
-                        className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-                            tab === key
-                                ? "bg-white dark:bg-[#262522] text-[#1f1e1d] dark:text-[#edece8] shadow-sm"
-                                : "text-[#6e6b63] dark:text-[#a19f96] hover:text-[#1f1e1d] dark:hover:text-[#edece8]"
-                        }`}
                     >
                         {label}
                     </button>
@@ -427,6 +425,7 @@ export const PromptsPage: React.FC = () => {
                     </div>
                 </div>
             )}
+            </div>
         </div>
     );
 };

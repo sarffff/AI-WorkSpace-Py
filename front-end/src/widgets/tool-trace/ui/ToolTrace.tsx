@@ -1,6 +1,7 @@
 import React from "react";
 import {
   AlertTriangle,
+  Bot,
   ChevronDown,
   ChevronRight,
   Loader2,
@@ -54,6 +55,15 @@ const RUNNING = {
   icon: <Loader2 className="w-3 h-3 animate-spin" />,
 };
 
+const AGENT_LABELS: Record<string, string> = {
+  researcher: "资料研究员",
+  analyst: "分析员",
+  critic: "审阅员",
+};
+
+const agentLabel = (role?: string | null): string =>
+  role ? AGENT_LABELS[role] ?? role : "子代理";
+
 /** 把参数对象压成 `key=value` 一行。太长的值截断——完整参数在轨迹接口里。 */
 const formatInput = (input?: Record<string, unknown>): string => {
   if (!input) return "";
@@ -80,18 +90,24 @@ export const ToolTrace: React.FC<ToolTraceProps> = ({
 
   const modelCalls = steps.filter((step) => step.round > 0);
   const prefetches = steps.length - modelCalls.length;
+  const delegated = steps.filter((step) => step.agentRole);
   // 摘要行按出现顺序去重：连着三轮查同一个工具，标题里写三遍没有信息量
-  const uniqueTools = Array.from(new Set(modelCalls.map((step) => step.tool)));
+  const uniqueTools = Array.from(
+    new Set(modelCalls.filter((step) => step.tool !== "delegate").map((step) => step.tool)),
+  );
+  const agents = Array.from(
+    new Set(delegated.map((step) => agentLabel(step.agentRole))),
+  );
   const failed = steps.filter(
     (step) => step.status && step.status !== "ok",
   ).length;
 
   return (
-    <div className="rounded-xl border border-[#e3dfd5] dark:border-[#2e2d2a] bg-[#faf9f5] dark:bg-[#191817]">
+    <div className="rounded-xl border border-[#e3dfd5] dark:border-[#2e2d2a] bg-[#faf9f5] dark:bg-[#191817] overflow-hidden">
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
-        className="w-full flex items-center gap-1.5 px-3 py-2 text-[11px] font-semibold text-[#6e6b63] dark:text-[#a19f96] hover:text-[#1f1e1d] dark:hover:text-[#edece8]"
+        className="w-full flex items-center gap-1.5 px-3 py-2 text-[11px] font-semibold text-[#6e6b63] dark:text-[#a19f96] hover:text-[#1f1e1d] dark:hover:text-[#edece8] hover:bg-[#f3f0e6]/50 dark:hover:bg-[#22211e]"
       >
         {open ? (
           <ChevronDown className="w-3 h-3 shrink-0" />
@@ -104,6 +120,7 @@ export const ToolTrace: React.FC<ToolTraceProps> = ({
           <span className="min-w-0 truncate font-normal opacity-70">
             {uniqueTools.join(" → ") || "仅系统预检索"}
             {prefetches > 0 ? ` · 预检索 ${prefetches}` : ""}
+            {agents.length > 0 ? ` · ${agents.join("、")}` : ""}
           </span>
         )}
         {failed > 0 && (
@@ -123,15 +140,33 @@ export const ToolTrace: React.FC<ToolTraceProps> = ({
             return (
               <li
                 key={step.id ?? `${step.round}-${step.callIndex}-${index}`}
-                className="text-[11px] text-[#6e6b63] dark:text-[#a19f96]"
+                className={`text-[11px] text-[#6e6b63] dark:text-[#a19f96] ${
+                  step.agentRole
+                    ? "ml-3 pl-2.5 border-l border-violet-400/40 dark:border-violet-400/30"
+                    : ""
+                }`}
               >
                 <div className="flex items-center gap-1.5 flex-wrap">
-                  <span className="shrink-0 px-1.5 py-0.5 rounded bg-[#e3dfd5] dark:bg-[#2e2d2a] text-[10px]">
-                    {step.round === 0 ? "预检索" : `第 ${step.round} 轮`}
-                  </span>
+                  {step.agentRole ? (
+                    <span className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-violet-500/10 text-violet-700 dark:text-violet-300 text-[10px]">
+                      <Bot className="w-3 h-3" />
+                      {agentLabel(step.agentRole)}
+                      {step.agentRound ? ` · 第 ${step.agentRound} 轮` : ""}
+                    </span>
+                  ) : (
+                    <span className="shrink-0 px-1.5 py-0.5 rounded bg-[#e3dfd5] dark:bg-[#2e2d2a] text-[10px]">
+                      {step.round === 0 ? "预检索" : `第 ${step.round} 轮`}
+                    </span>
+                  )}
                   <span className="font-mono text-[#1f1e1d] dark:text-[#edece8]">
                     {step.tool}
                   </span>
+                  {step.tool === "delegate" &&
+                    typeof step.input?.role === "string" && (
+                      <span className="shrink-0 px-1.5 py-0.5 rounded bg-violet-500/10 text-violet-700 dark:text-violet-300 text-[10px]">
+                        → {agentLabel(step.input.role)}
+                      </span>
+                    )}
                   <span
                     className={`shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] ${style.className}`}
                   >

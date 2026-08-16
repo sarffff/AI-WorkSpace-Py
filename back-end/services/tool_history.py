@@ -121,6 +121,10 @@ def _format_citations(raw: str | None) -> str:
 
 def _render_step(step: MessageToolStep, *, step_chars: int) -> str:
     where = "预检索" if step.round_index == 0 else f"第 {step.round_index} 轮"
+    # 子代理执行的步骤要标出来:回灌时不标的话,模型会把 researcher 查到的东西
+    # 当成自己查的,下个回合被追问细节时答不上来也不知道该重新委派。
+    if step.agent_role:
+        where += f" {step.agent_role}"
     status = _STATUS_LABEL.get(step.status, step.status)
     lines = [
         f"- {where} {step.tool_name}({_format_arguments(step.arguments)}) → {status}"
@@ -203,6 +207,7 @@ def record(
     tool_call_id: str | None = None,
     arguments: Any = None,
     citations: list[dict[str, Any]] | None = None,
+    agent_role: str | None = None,
 ) -> None:
     """记一步工具执行。
 
@@ -226,6 +231,7 @@ def record(
                 tool_name=tool_name[:120],
                 tool_call_id=str(tool_call_id)[:80] if tool_call_id else None,
                 arguments=_dump(arguments),
+                agent_role=agent_role[:40] if agent_role else None,
                 status=status,
                 result_content=body[:store_limit] if store_limit else None,
                 # 截断前的真实长度。摘要里要靠它告诉模型"原文还有多少"
@@ -324,6 +330,8 @@ def serialize(step: MessageToolStep) -> dict[str, Any]:
         "round": step.round_index,
         "callIndex": step.call_index,
         "tool": step.tool_name,
+        # None 表示主代理自己调的。前端据此把子代理的步骤缩进到 delegate 那一步下面
+        "agentRole": step.agent_role,
         "status": step.status,
         "input": _load(step.arguments) or {},
         "citations": _load(step.citations) or [],

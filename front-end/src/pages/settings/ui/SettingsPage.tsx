@@ -2,9 +2,10 @@ import React, { useEffect, useState } from "react";
 import { useDispatch } from "react-redux";
 import { apiClient } from "@/shared/api/client";
 import type { AppSettings, UserPreferences } from "@/shared/types/api.types";
+import { PageHeader } from "@/shared/ui/PageHeader";
 import { setSelectedModel } from "@/entities/chat/model/chatSlice";
 import { useNavigate } from "react-router-dom";
-import { Server, Cpu, X, Loader2, Save, Check, Database, ArrowRight } from "lucide-react";
+import { Server, Cpu, X, Loader2, Save, Check, Database, ArrowRight, Wrench, Paperclip, Globe, BookPlus, History } from "lucide-react";
 
 export const SettingsPage: React.FC = () => {
     const dispatch = useDispatch();
@@ -62,15 +63,13 @@ export const SettingsPage: React.FC = () => {
     }
 
     return (
-        <div className="p-8 h-full overflow-y-auto space-y-6 app-atmosphere transition-colors duration-200">
-            <div className="relative z-10 anim-fade-up">
-                <h3 className="font-display text-[22px] font-semibold text-[#1f1e1d] dark:text-[#edece8]">
-                    设置
-                </h3>
-                <p className="text-xs text-[#6e6b63] dark:text-[#a19f96] mt-1">
-                    管理模型、生成参数与服务端配置。
-                </p>
-            </div>
+        <div className="page-shell app-atmosphere transition-colors duration-200">
+            <div className="relative z-10 space-y-6 max-w-5xl">
+            <PageHeader
+                eyebrow="System"
+                title="设置"
+                description="模型参数、服务端配置，以及后端实际注册了哪些能力。"
+            />
 
             {error && (
                 <div className="flex items-center justify-between gap-3 p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-600 dark:text-rose-400 text-xs">
@@ -81,6 +80,52 @@ export const SettingsPage: React.FC = () => {
                     >
                         <X className="w-3.5 h-3.5" />
                     </button>
+                </div>
+            )}
+
+            {/* 后端能力矩阵：不是开关值，是「能不能用」 */}
+            {settings?.capabilities && (
+                <div className="card-surface p-6 rounded-2xl space-y-4 relative z-10 anim-fade-up">
+                    <div className="flex items-center gap-2.5 pb-3 border-b border-[#e6e2d8] dark:border-[#282724]">
+                        <span className="w-6 h-6 rounded-lg bg-[#da7756]/12 text-[#da7756] flex items-center justify-center">
+                            <Wrench className="w-3.5 h-3.5" />
+                        </span>
+                        <div>
+                            <h4 className="text-sm font-semibold text-[#1f1e1d] dark:text-[#edece8]">
+                                已注册能力
+                            </h4>
+                            <p className="text-[11px] text-[#918d83] mt-0.5">
+                                开关打开但没配密钥时工具根本不注册，这里报的是「能不能用」。
+                            </p>
+                        </div>
+                    </div>
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                        <CapCell
+                            icon={<Cpu className="w-3.5 h-3.5" />}
+                            label="计算器"
+                            on={settings.capabilities.calculate}
+                        />
+                        <CapCell
+                            icon={<Paperclip className="w-3.5 h-3.5" />}
+                            label="按需读附件"
+                            on={settings.capabilities.readAttachment}
+                        />
+                        <CapCell
+                            icon={<Globe className="w-3.5 h-3.5" />}
+                            label="联网搜索"
+                            on={settings.capabilities.webSearch}
+                        />
+                        <CapCell
+                            icon={<BookPlus className="w-3.5 h-3.5" />}
+                            label="写入知识库"
+                            on={settings.capabilities.writeKnowledge}
+                        />
+                        <CapCell
+                            icon={<History className="w-3.5 h-3.5" />}
+                            label="工具轨迹落库"
+                            on={settings.capabilities.toolHistory}
+                        />
+                    </div>
                 </div>
             )}
 
@@ -282,9 +327,38 @@ export const SettingsPage: React.FC = () => {
                     ok
                 />
             </div>
+            </div>
         </div>
     );
 };
+
+const CapCell: React.FC<{
+    icon: React.ReactNode;
+    label: string;
+    on: boolean;
+}> = ({ icon, label, on }) => (
+    <div
+        className={`flex items-center gap-2.5 px-3.5 py-3 rounded-xl border ${
+            on
+                ? "border-[#da7756]/25 bg-[#da7756]/8"
+                : "border-[#e3dfd5] dark:border-[#2e2d2a] bg-[#f3f0e6]/50 dark:bg-[#201f1c]/50"
+        }`}
+    >
+        <span className={on ? "text-[#da7756]" : "text-[#918d83]"}>{icon}</span>
+        <span className="text-xs font-medium text-[#1f1e1d] dark:text-[#edece8]">
+            {label}
+        </span>
+        <span
+            className={`ml-auto text-[10px] font-semibold ${
+                on
+                    ? "text-emerald-600 dark:text-emerald-400"
+                    : "text-[#918d83]"
+            }`}
+        >
+            {on ? "可用" : "未注册"}
+        </span>
+    </div>
+);
 
 const ConfigRow: React.FC<{ label: string; value: string; badge?: "ok" }> = ({
     label,

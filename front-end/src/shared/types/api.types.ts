@@ -159,6 +159,19 @@ export interface ServerCapabilities {
   webSearch: boolean;
   writeKnowledge: boolean;
   toolHistory: boolean;
+  /** 旧版后端不返回这一块 */
+  delegation?: DelegationCapability;
+}
+
+/**
+ * 多代理委派的配置。``mode`` 为 "off" 时后端根本不注册 delegate 工具，
+ * 界面上不该出现任何和子代理有关的东西。
+ */
+export interface DelegationCapability {
+  /** off = 单代理；augment = 主代理保留全部工具并多一个 delegate；supervisor = 专用工具归子代理 */
+  mode: "off" | "augment" | "supervisor";
+  roles: string[];
+  maxDelegations: number;
 }
 
 export interface UserPreferences {
@@ -225,6 +238,8 @@ export interface StreamChunk {
     | "context_compacted"
     | "guardrail"
     | "cache_hit"
+    | "agent_step"
+    | "agent_state"
     | "done"
     | "error";
   content?: string;
@@ -234,12 +249,32 @@ export interface StreamChunk {
   /** 工具调用所在的 Agent 轮次，从 1 开始 */
   round?: number;
   /**
-   * tool_result 的执行结果分级：ok / invalid_arguments / unavailable。
-   * round 0 的预检索走的是另一套取值，检索失败时报 error。
+   * agent_step / agent_state 携带：哪个子代理。
+   * 这两类事件都发生在主代理的一次 delegate 调用内部。
    */
-  status?: "ok" | "invalid_arguments" | "unavailable" | "error";
-  /** tool_rounds_ended 携带：已经用掉的工具轮次数 */
+  agent?: string;
+  /** agent_step 携带：这一步是开始还是结束。子代理的步骤是成批发出的，两者紧邻 */
+  phase?: "tool_start" | "tool_result";
+  /**
+   * agent_step 携带：子代理**自己**的轮次。
+   * 和 ``round``（主代理轮次）分开：混用会让 researcher 的第 1 轮排到主代理
+   * 第 1 轮旁边，看起来像并行调用。
+   */
+  agentRound?: number;
+  /** agent_state / tool_rounds_ended 携带：子代理或主代理已跑的轮次数 */
   rounds?: number;
+  /** agent_state 携带：子代理做过的工具步骤数，以及是否因轮次用尽而截断 */
+  steps?: number;
+  truncated?: boolean;
+  /** SSE 的子代理状态会额外出现 started / completed / failed */
+  status?:
+    | "ok"
+    | "invalid_arguments"
+    | "unavailable"
+    | "error"
+    | "started"
+    | "completed"
+    | "failed";
   /** citations 携带：本次检索命中的引用 */
   items?: Citation[];
   /** context_compacted 携带：被摘要压缩 / 原样保留的历史条数 */
@@ -288,6 +323,10 @@ export interface ToolStep {
   round: number;
   callIndex: number;
   tool: string;
+  /** 子代理名称。无此字段表示主代理自己执行的步骤 */
+  agentRole?: string | null;
+  /** 子代理自己的工具轮次；``round`` 始终是外层主代理轮次 */
+  agentRound?: number;
   /** 流式期间 tool_start 先到、tool_result 才带回状态，所以会短暂为空 */
   status?: "ok" | "invalid_arguments" | "unavailable" | "error";
   input?: Record<string, unknown>;

@@ -175,8 +175,21 @@ export const RetrievalDebugger: React.FC = () => {
       )}
 
       {!loading && results.length === 0 && query && (
-        <div className="p-8 text-center text-xs text-[#918d83]">
-          未检索到相关结果
+        <div className="card-surface rounded-2xl p-12 text-center">
+          <p className="text-xs text-[#918d83]">
+            未检索到相关结果。换个说法，或先上传文档。
+          </p>
+        </div>
+      )}
+
+      {!loading && results.length === 0 && !query && (
+        <div className="card-surface rounded-2xl p-10 text-center space-y-2">
+          <p className="text-sm font-medium text-[#1f1e1d] dark:text-[#edece8]">
+            不经过对话，直接看检索器
+          </p>
+          <p className="text-[11px] text-[#918d83] max-w-sm mx-auto leading-relaxed">
+            输入一个问题。结果会标出 dense / sparse 通道和 fusion 得分——这是核对「它为什么引用这段」的地方。
+          </p>
         </div>
       )}
     </div>
