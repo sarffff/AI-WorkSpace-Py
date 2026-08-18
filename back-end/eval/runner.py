@@ -35,7 +35,7 @@ from services.knowledge_service import KnowledgeService
 from services.model_adapter import OpenAICompatibleAdapter
 from services.pricing import estimate_cost
 from services import prompt_library
-from services.retrieval_index import invalidate_user_indexes
+from services.retrieval_index import invalidate_scope_indexes
 from services.telemetry import tracer
 
 logger = logging.getLogger("eval.runner")
@@ -61,21 +61,26 @@ def ensure_eval_user(session: Any) -> None:
     from auth import get_password_hash
     from models import User
 
-    if session.query(User).filter(User.id == EVAL_USER_ID).first() is not None:
-        return
-    session.add(
-        User(
-            id=EVAL_USER_ID,
-            email="eval-harness@invalid.local",
-            name="离线评估专用（非真实用户）",
-            hashed_password=get_password_hash(secrets.token_urlsafe(32)),
-            provider="local",
-            is_active=False,
-            is_verified=False,
+    from services import workspace_service
+
+    user = session.query(User).filter(User.id == EVAL_USER_ID).first()
+    if user is None:
+        session.add(
+            User(
+                id=EVAL_USER_ID,
+                email="eval-harness@invalid.local",
+                name="离线评估专用（非真实用户）",
+                hashed_password=get_password_hash(secrets.token_urlsafe(32)),
+                provider="local",
+                is_active=False,
+                is_verified=False,
+            )
         )
-    )
-    session.commit()
-    logger.info("created eval harness user %s", EVAL_USER_ID)
+        session.commit()
+        user = session.query(User).filter(User.id == EVAL_USER_ID).first()
+        logger.info("created eval harness user %s", EVAL_USER_ID)
+    # 语料挂在 eval 用户的工作区上,检索按工作区过滤——与线上同一套作用域逻辑
+    workspace_service.resolve_for_user(session, user)
 
 # 回答提示词的正文在 prompts/eval_rag_answer/<version>.md，版本由
 # settings.PROMPT_EVAL_ANSWER_VERSION 决定，因此可以作为变体维度被扫。
@@ -164,8 +169,11 @@ async def ensure_corpus(knowledge: KnowledgeService) -> tuple[int, bool]:
     session = SessionLocal()
     try:
         ensure_eval_user(session)
+        eval_user = session.query(User).filter(User.id == EVAL_USER_ID).first()
         existing = (
-            session.query(Document).filter(Document.user_id == EVAL_USER_ID).all()
+            session.query(Document)
+            .filter(Document.workspace_id == eval_user.workspace_id)
+            .all()
         )
         current = [doc for doc in existing if doc.name.endswith(f"#{fingerprint}")]
         stale = [doc for doc in existing if not doc.name.endswith(f"#{fingerprint}")]
@@ -180,19 +188,25 @@ async def ensure_corpus(knowledge: KnowledgeService) -> tuple[int, bool]:
         for doc in stale + [doc for doc in current if doc.status != "indexed"]:
             session.delete(doc)
         session.commit()
-        invalidate_user_indexes(EVAL_USER_ID)
+        invalidate_scope_indexes(eval_user.workspace_id)
 
         total_chunks = 0
         for name in files:
             with open(os.path.join(CORPUS_DIR, name), "rb") as handle:
                 content = handle.read()
             document = await knowledge.upload_document(
-                session, f"{name}#{fingerprint}", content, EVAL_USER_ID
+                session, f"{name}#{fingerprint}", content,
+                eval_user.workspace_id, uploader_id=EVAL_USER_ID,
             )
             total_chunks += document.chunks
         return total_chunks, True
     finally:
         session.close()
+
+
+def _eval_workspace_id(session: Any) -> str:
+    user = session.query(User).filter(User.id == EVAL_USER_ID).first()
+    return user.workspace_id if user and user.workspace_id else EVAL_USER_ID
 
 
 def _document_label(name: str) -> str:
@@ -236,7 +250,7 @@ async def _run_case(
             started = time.perf_counter()
             retrieval_started = time.perf_counter()
             context, citations = await knowledge.build_rag_context_with_citations(
-                session, case.question, EVAL_USER_ID, top_k=top_k
+                session, case.question, _eval_workspace_id(session), top_k=top_k
             )
             retrieval_ms = int((time.perf_counter() - retrieval_started) * 1000)
 

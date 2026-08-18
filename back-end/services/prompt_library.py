@@ -90,6 +90,12 @@ SPECS: dict[str, PromptSpec] = {
         setting="PROMPT_EVAL_ANSWER_VERSION",
         required=("context", "question"),
     ),
+    "rag_query_condense": PromptSpec(
+        key="rag_query_condense",
+        purpose="预检索前把追问改写成自包含问题（指代消解）",
+        default_version="v1",
+        required=("recent_turns", "question"),
+    ),
     # 子代理各自一个 key,而不是共用一个带 [[if role]] 分支的模板:三个角色的
     # 约束几乎不重叠(researcher 要讲出处分层,analyst 要讲"缺输入就停",
     # critic 要讲"没依据别提"),塞进一版会变成一个谁都不好改的大文件,

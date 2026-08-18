@@ -56,13 +56,19 @@ from database import SessionLocal, engine
 from eval import agent_metrics, agent_stubs, metrics
 from eval.agent_variants import AgentVariant
 from eval.judge import TaskJudge, TaskVerdict
-from eval.runner import CORPUS_DIR, EVAL_USER_ID, ensure_corpus, ensure_eval_user
+from eval.runner import (
+    CORPUS_DIR,
+    EVAL_USER_ID,
+    _eval_workspace_id,
+    ensure_corpus,
+    ensure_eval_user,
+)
 from models import Document, MessageToolStep, TraceSpan
 from services import prompt_library
 from services.chat_service import ChatService
 from services.knowledge_service import KnowledgeService
 from services.model_adapter import OpenAICompatibleAdapter
-from services.retrieval_index import invalidate_user_indexes
+from services.retrieval_index import invalidate_scope_indexes
 from services.workspace_tools import WRITE_NAME_PREFIX
 from services.workspace_tools import enabled_names as workspace_enabled_names
 
@@ -408,7 +414,7 @@ def _sweep_written_documents(db: Any) -> list[str]:
     rows = (
         db.query(Document)
         .filter(
-            Document.user_id == EVAL_USER_ID,
+            Document.workspace_id == _eval_workspace_id(db),
             Document.name.like(f"{WRITE_NAME_PREFIX}%"),
         )
         .all()
@@ -418,7 +424,7 @@ def _sweep_written_documents(db: Any) -> list[str]:
         db.delete(row)
     if names:
         db.commit()
-        invalidate_user_indexes(EVAL_USER_ID)
+        invalidate_scope_indexes(_eval_workspace_id(db))
     return names
 
 

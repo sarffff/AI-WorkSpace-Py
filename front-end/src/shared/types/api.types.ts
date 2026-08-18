@@ -24,6 +24,8 @@ export interface RegisterRequest {
   username: string;
   password: string;
   name?: string;
+  /** 邀请码(可选):填了加入对应工作区成为 member,共享其知识库 */
+  inviteCode?: string;
 }
 
 export interface AuthResponse {
@@ -76,6 +78,29 @@ export interface KnowledgeDocument {
   chunks: number;
   status: "indexed" | "processing" | "failed";
   createdAt: string;
+}
+
+export interface UploadDocumentResponse extends KnowledgeDocument {
+  /** true 表示内容哈希命中已有文档,本次没有重复索引 */
+  duplicate: boolean;
+}
+
+// ========== Workspace相关类型 ==========
+
+export interface WorkspaceMember {
+  id: string;
+  name: string;
+  role: "admin" | "member";
+}
+
+export interface WorkspaceInfo {
+  id: string;
+  name: string;
+  role: "admin" | "member";
+  memberCount: number;
+  members: WorkspaceMember[];
+  /** 只有 admin 能看到邀请码;member 为 null */
+  inviteCode: string | null;
 }
 
 // ========== Prompt相关类型 ==========

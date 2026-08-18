@@ -31,6 +31,16 @@ class Settings(BaseSettings):
     # 部分 OpenAI 兼容端点不认这个参数,被拒一次后会自动停发并改用本地估算。
     LLM_STREAM_USAGE: bool = True
 
+    # ========== 模型路由 ==========
+    # 辅助任务(历史摘要/查询改写/重排/指代消解/记忆抽取)用的便宜模型。
+    # 留空回退 LLM_MODEL。这些任务对推理能力要求低、调用频次高,与主回答
+    # 同价是纯浪费——埋点里的 purpose 字段早就区分了用途,缺的只是这张路由表。
+    LLM_UTILITY_MODEL: str = ""
+    # 裁判模型。LLM-as-judge 的底线是裁判与被评模型分开:同一个模型给自己打分
+    # 存在系统性的自我偏好(self-preference bias),变体对比的结论会被污染。
+    # 留空依次回退 LLM_UTILITY_MODEL / LLM_MODEL。
+    JUDGE_MODEL: str = ""
+
     # ========== Redis 配置 (可选) ==========
     REDIS_URL: Optional[str] = None
 
@@ -46,6 +56,11 @@ class Settings(BaseSettings):
     # 开启时在模型首轮之前先做一次检索并注入结果(可靠但每轮固定消耗一次检索);
     # 关闭则为纯 agentic RAG,完全由模型自主决定何时、以什么查询检索。
     RAG_PREFETCH: bool = True
+    # 预检索前先把本轮问题结合近期历史改写成自包含问题(指代消解)。
+    # "那它的赔偿标准呢?"这类省略式追问,拿原文去检索会结构性召回漂移;
+    # 而系统提示词又告诉模型"预检索过了,够用就直接答",等于把弱检索的结果
+    # 包装成"已查过"。仅在存在历史消息时才发起,首轮不额外花钱。
+    RAG_CONDENSE_QUERY: bool = True
 
     # ========== Agent 循环配置 ==========
     # 单次回答中允许的最大模型轮次。最后一轮不再提供工具,强制模型给出最终回答,
@@ -173,6 +188,18 @@ class Settings(BaseSettings):
     # 先在 trace 里看一段时间命中情况再决定收紧到多少。
     GUARDRAIL_BLOCK_SCORE: int = 0
 
+    # ========== 跨会话长期记忆 ==========
+    # 每轮回答结束后用辅助模型从对话里抽取"值得跨会话记住"的用户事实与偏好,
+    # 存进 user_memories 表,并在之后的每一轮作为系统上下文注入。
+    # 这是"同一个用户每次都要重新自我介绍"和真正的个人助手之间的分水岭。
+    MEMORY_ENABLED: bool = True
+    # 每个用户最多保留多少条记忆,超量丢最旧
+    MEMORY_MAX_ITEMS: int = 100
+    # 每轮注入上下文的记忆条数上限(按最新优先)
+    MEMORY_INJECT_LIMIT: int = 20
+    # 单条记忆的字符上限,超长的"记忆"多半是把整段对话抄了一遍
+    MEMORY_ITEM_MAX_CHARS: int = 200
+
     # ========== 提示词版本 ==========
     # 实际正文在 back-end/prompts/<key>/<version>.md,这里只选用哪一版。
     # 之所以做成配置项:提示词是改动最频繁的那部分"代码",而"换一版提示词"
@@ -200,6 +227,16 @@ class Settings(BaseSettings):
     def embedding_api_key(self) -> str:
         """实际使用的 Embedding API Key (优先 EMBEDDING_API_KEY,回退 LLM_API_KEY)"""
         return self.EMBEDDING_API_KEY or self.LLM_API_KEY
+
+    @property
+    def utility_model(self) -> str:
+        """辅助任务(摘要/改写/重排/记忆抽取)实际使用的模型"""
+        return self.LLM_UTILITY_MODEL or self.LLM_MODEL
+
+    @property
+    def judge_model(self) -> str:
+        """裁判实际使用的模型。优先独立裁判模型,其次辅助模型,最后主模型"""
+        return self.JUDGE_MODEL or self.LLM_UTILITY_MODEL or self.LLM_MODEL
 
     @property
     def embedding_base_url(self) -> str:

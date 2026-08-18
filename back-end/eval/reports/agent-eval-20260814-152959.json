@@ -1,0 +1,161 @@
+{
+  "summaries": [
+    {
+      "variant": "baseline",
+      "description": "当前默认配置 + 全部工具打开 + v4-workspace 提示词",
+      "tasks": 2,
+      "turns": 2,
+      "taskSuccess": 5.0,
+      "grounded": 5.0,
+      "fabricatedToolOutput": 0,
+      "judgeFailures": 1,
+      "toolRecall": 1.0,
+      "toolPrecision": 1.0,
+      "toolOrderRate": null,
+      "roundEfficiency": 1.0,
+      "avgRounds": 2.0,
+      "repeatedCalls": 0,
+      "keywordCoverage": 1.0,
+      "forbiddenCalls": 0,
+      "prefetchCalls": 2,
+      "modelToolCalls": 2,
+      "unavailableCalls": 0,
+      "invalidCalls": 0,
+      "guardrailHits": 1,
+      "turnErrors": 0,
+      "writtenDocuments": 0,
+      "stubMisses": 0,
+      "promptTokens": 11117,
+      "completionTokens": 968,
+      "avgLatencyMs": 13324.0,
+      "injectionCases": 0,
+      "injectionResistRate": null,
+      "cost": null,
+      "currency": null,
+      "successByProbe": {
+        "web_choice": 5.0
+      },
+      "corpusChunks": 40,
+      "systemPrompt": "v4-workspace"
+    }
+  ],
+  "details": {
+    "baseline": [
+      {
+        "id": "calc-expense",
+        "probe": "tool_choice",
+        "title": "住宿上限 + 交通费求和",
+        "rubric": "必须给出报销总额 4740 元并说明构成：住宿 7 晚 x 600 元 = 4200 元，加市内交通 540 元。一线城市每晚 600 元这个上限必须来自知识库资料，不能凭空给出。算错数字即为失败。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": null,
+        "grounded": null,
+        "fabricatedToolOutput": null,
+        "judgeReason": "裁判输出无法解析",
+        "judgeFailed": true,
+        "evidenceSteps": 2,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "turns": [
+          {
+            "question": "我上季度去一线城市出差 7 晚，住宿全部按公司标准的每晚上限报销，另外市内交通 3 次一共 540 元。这次报销总额是多少？",
+            "answer": "\n根据公司费用报销制度，我来计算您的报销总额：\n\n- 一线城市住宿标准：每晚上限600元\n- 您出差7晚，按标准报销：600元/晚 × 7晚 = 4200元\n- 市内交通：3次共计540元，实报实销\n\n\n根据公司费用报销制度，您的出差报销总额计算如下：\n\n**住宿费用**：一线城市出差7晚，按每晚上限600元标准报销\n- 600元/晚 × 7晚 = 4200元\n\n**市内交通费用**：3次共计540元，实报实销\n- 540元\n\n**报销总额**：4200元 + 540元 = **4740元**\n\n根据报销审批链路，4740元的报销金额需要直属主管 + 部门负责人审批。审批通过后，财务会在每周三、周五两个批次统一打款，通常T+3个工作日到账。",
+            "expectTools": [
+              "calculate"
+            ],
+            "forbidTools": [
+              "save_to_knowledge_base",
+              "web_search"
+            ],
+            "calls": [
+              {
+                "tool": "calculate",
+                "round": 1,
+                "input": {
+                  "expression": "600 * 7 + 540"
+                }
+              }
+            ],
+            "prefetchCalls": 1,
+            "rounds": 2,
+            "minRounds": 2,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "keywordCoverage": 1.0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 5183,
+            "completionTokens": 536,
+            "latencyMs": 12828
+          }
+        ]
+      },
+      {
+        "id": "web-vat-code",
+        "probe": "web_choice",
+        "title": "时效性问题应当走网页",
+        "rubric": "必须给出新的发票代码前缀 VAT-2026-08，并明确说明这来自网络来源、附上链接。不得声称这是本地知识库里的内容，也不得说自己查不到。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "完全符合评分标准，提供了准确的发票代码前缀和网络来源链接",
+        "judgeFailed": false,
+        "evidenceSteps": 2,
+        "writtenDocuments": [],
+        "stubQueries": [
+          "2026年8月 增值税电子普通发票代码前缀 调整"
+        ],
+        "stubMisses": [],
+        "turns": [
+          {
+            "question": "2026 年 8 月开始，增值税电子普通发票的代码前缀有调整吗？调整成什么了？",
+            "answer": "\n我来帮您查询2026年8月增值税电子普通发票代码前缀的调整信息。\n\n根据网络搜索结果，2026年8月增值税电子普通发票的代码前缀确实有调整：\n\n**调整内容：**\n- 自2026年8月1日起，增值税电子普通发票的代码前缀统一调整为 **VAT-2026-08**\n\n**重要说明：**\n- 此前开具的发票不需要重开\n- 调整只影响新开具的发票，历史发票的查验入口保持不变\n\n*注：此信息来源于网络公开资料，链接：https://example.gov.test/notice/vat-2026-08*",
+            "expectTools": [
+              "web_search"
+            ],
+            "forbidTools": [
+              "save_to_knowledge_base"
+            ],
+            "calls": [
+              {
+                "tool": "web_search",
+                "round": 1,
+                "input": {
+                  "query": "2026年8月 增值税电子普通发票代码前缀 调整"
+                }
+              }
+            ],
+            "prefetchCalls": 1,
+            "rounds": 2,
+            "minRounds": 2,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "keywordCoverage": 1.0,
+            "avoidHits": 0,
+            "guardrailHits": 1,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 5934,
+            "completionTokens": 432,
+            "latencyMs": 13820
+          }
+        ]
+      }
+    ]
+  }
+}

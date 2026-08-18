@@ -3,8 +3,13 @@
 全部是纯函数、不调模型，所以跑起来是零成本且完全确定的——这也是为什么
 检索指标应该先看、答案质量的 LLM 评分后看：便宜的信号先用尽。
 
-关键约定：**相关性标在文档级，不是分块级**。分块配置一改，chunk id 全变，
-标在分块上的金标准立刻作废；标在文档上则任何分块/检索配置都能复用同一批标注。
+关键约定：
+1. **相关性标在文档级，不是分块级**。分块配置一改，chunk id 全变，
+   标在分块上的金标准立刻作废；标在文档上则任何分块/检索配置都能复用
+   同一批标注。
+2. **@k 按原始返回位置截断，去重只用于计数**。若先按文档去重再截断，
+   "同一文档的重复分块挤占 top-k"这一失效模式会被指标掩盖——而它
+   恰恰是这套系统明确关心的问题(文档级去重功能就是为它做的)。
 """
 from __future__ import annotations
 
@@ -24,19 +29,24 @@ def _first_occurrence(ranked: list[str]) -> list[str]:
 
 
 def recall_at_k(ranked: list[str], relevant: set[str], k: int) -> float:
-    """前 k 个结果覆盖了多少比例的相关文档。没有相关文档时返回 1.0（无从漏召）。"""
+    """前 k 个**位置**覆盖了多少比例的相关文档。
+
+    同一文档命中多个分块只算一次覆盖,但 k 数的是原始位置:前 2 位被同一
+    文档的两个分块占掉时,第二个位置没有带来新覆盖,recall 就是砍半的。
+    """
     if not relevant:
         return 1.0
-    top = set(_first_occurrence(ranked)[:k])
-    return len(top & relevant) / len(relevant)
+    covered = {item for item in ranked[:k] if item in relevant}
+    return len(covered) / len(relevant)
 
 
 def precision_at_k(ranked: list[str], relevant: set[str], k: int) -> float:
-    """前 k 个结果里有多少比例是相关的。"""
-    top = _first_occurrence(ranked)[:k]
+    """前 k 个位置里,相关文档的覆盖比例(每文档只计一次)。"""
+    top = ranked[:k]
     if not top:
         return 0.0
-    return sum(1 for item in top if item in relevant) / len(top)
+    hits = {item for item in top if item in relevant}
+    return len(hits) / len(top)
 
 
 def mrr(ranked: list[str], relevant: set[str]) -> float:
@@ -54,15 +64,16 @@ def ndcg_at_k(ranked: list[str], relevant: set[str], k: int) -> float:
 
     相比 recall，它对「相关结果排在第 1 位还是第 5 位」敏感——重排是否有效
     主要看这个指标，因为重排不改变召回集合，只改变顺序。
+    同一文档的重复命中只在首次出现的位置计一次增益。
     """
     if not relevant:
         return 1.0
-    top = _first_occurrence(ranked)[:k]
-    dcg = sum(
-        1.0 / log2(position + 1)
-        for position, item in enumerate(top, start=1)
-        if item in relevant
-    )
+    seen: set[str] = set()
+    dcg = 0.0
+    for position, item in enumerate(ranked[:k], start=1):
+        if item in relevant and item not in seen:
+            seen.add(item)
+            dcg += 1.0 / log2(position + 1)
     ideal_hits = min(len(relevant), k)
     idcg = sum(1.0 / log2(position + 1) for position in range(1, ideal_hits + 1))
     return dcg / idcg if idcg else 0.0

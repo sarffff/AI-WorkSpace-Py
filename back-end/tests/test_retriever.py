@@ -10,7 +10,7 @@ from config import settings
 from models import Document, DocumentChunk
 from services.embedding_service import EmbeddingService
 from services.model_adapter import ModelCompletion
-from services.retrieval_index import invalidate_user_indexes
+from services.retrieval_index import invalidate_scope_indexes
 from services.retriever import HybridRetriever, format_context
 from conftest import run
 
@@ -64,7 +64,10 @@ class StubRetriever(HybridRetriever):
         super().__init__(**kwargs)
         self._rows = rows
 
-    def _load_rows(self, db, user_id):  # type: ignore[override]
+    def _load_chunk_ids(self, db, user_id):  # type: ignore[override]
+        return [chunk.id for chunk, _document in self._rows]
+
+    def _load_rows(self, db, user_id, *, with_embeddings=True):  # type: ignore[override]
         return self._rows
 
 
@@ -80,13 +83,13 @@ def _corpus() -> list[tuple[DocumentChunk, Document]]:
 @pytest.fixture(autouse=True)
 def _isolate_indexes(monkeypatch):
     """索引按用户缓存在进程内，每个用例前后都清掉，避免相互污染。"""
-    invalidate_user_indexes(USER)
+    invalidate_scope_indexes(USER)
     monkeypatch.setattr(settings, "RAG_CONTEXT_WINDOW", 0)
     monkeypatch.setattr(settings, "RAG_MULTI_QUERY", False)
     monkeypatch.setattr(settings, "RAG_RERANK", False)
     monkeypatch.setattr(settings, "RAG_HYBRID", True)
     yield
-    invalidate_user_indexes(USER)
+    invalidate_scope_indexes(USER)
 
 
 def test_empty_corpus_returns_nothing():
@@ -130,7 +133,9 @@ def test_hybrid_disabled_uses_dense_only(monkeypatch):
 
 
 def test_min_score_filters_the_dense_channel(monkeypatch):
-    monkeypatch.setattr(settings, "RAG_MIN_SCORE", 0.95)
+    # a2([0.9, 0.1] 归一化后与查询的余弦 ≈ 0.9939),阈值必须卡在
+    # 1.0 与 0.9939 之间才能验证"只留满分命中"
+    monkeypatch.setattr(settings, "RAG_MIN_SCORE", 0.995)
     monkeypatch.setattr(settings, "RAG_HYBRID", False)
     embedding = FakeEmbedding({"budget": [1.0, 0.0]})
     retriever = StubRetriever(_corpus(), embedding=embedding)

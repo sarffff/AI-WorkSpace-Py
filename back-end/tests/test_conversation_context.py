@@ -125,9 +125,10 @@ def test_stale_summary_is_discarded_when_history_shrinks(monkeypatch, store):
     builder = _builder(adapter)
 
     run(builder.build("c1", _history(10)))
-    # 模拟编辑/重新生成删掉了后续分支：dropped 变少，旧摘要不再可信
-    store.data["c1"]["count"] = 99
-    context = run(builder.build("c1", _history(10)))
+    # 模拟编辑/重新生成删掉了 dropped 区间里的消息:dropped 集合既变了也
+    # 变少,缓存里记录的 count(8)超过新的 dropped 规模,旧摘要不再可信,
+    # 必须丢弃后从头重算,而不是把它当增量基础
+    context = run(builder.build("c1", _history(6)))
 
     assert "[已有摘要]" not in adapter.prompts[-1]
     assert "重算摘要" in context.messages[0]["content"]

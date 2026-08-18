@@ -22,6 +22,8 @@ from routers import (
     attachment_router,
     metrics_router,
     feedback_router,
+    memory_router,
+    workspace_router,
 )
 from services import prompt_library
 from services import subagent
@@ -72,6 +74,8 @@ app.include_router(settings_router.router)
 app.include_router(attachment_router.router)
 app.include_router(metrics_router.router)
 app.include_router(feedback_router.router)
+app.include_router(memory_router.router)
+app.include_router(workspace_router.router)
 
 # 静态文件服务：附件上传后的访问入口
 os.makedirs(settings.UPLOAD_DIR, exist_ok=True)

@@ -33,6 +33,31 @@ logger = logging.getLogger("eval.judge")
 
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 
+# 裁判的输出预算。推理型模型(glm-4.5 系列等)的思考 token 与可见输出共享
+# max_tokens,512 会被思考吃掉大半,可见 JSON 刚开头就截断——本轮全量评估
+# 因此 96% 的裁判调用解析失败。1500 给思考留出余量,同时下面的字段级
+# 兜底解析保证即使再截断也能把已经吐出来的分数捡回来。
+_JUDGE_MAX_TOKENS = 1500
+
+
+def _score_from_fragment(text: str, field: str) -> float | None:
+    """从被截断的输出里抢救单个数值字段。
+
+    JSON 截断通常发生在 reason(最后一个字段)上,而分数字段排在前边——
+    整体 loads 失败不代表分数没给。宁可少一个 reason,不要整题作废。
+    """
+    match = re.search(rf'"{field}"\s*:\s*([0-9]+(?:\.[0-9]+)?)', text)
+    if not match:
+        return None
+    return _clamp_score(match.group(1))
+
+
+def _bool_from_fragment(text: str, field: str) -> bool | None:
+    match = re.search(rf'"{field}"\s*:\s*(true|false)', text)
+    if match is None:
+        return None
+    return match.group(1) == "true"
+
 _RUBRIC = """你是严格的评审。根据「参考内容」判断「回答」的质量，不要用你自己的知识补充。
 
 按 1-5 打分：
@@ -100,7 +125,8 @@ def _clamp_score(value: object) -> float | None:
 class AnswerJudge:
     def __init__(self, model_adapter, model: str | None = None) -> None:
         self._adapter = model_adapter
-        self._model = model or settings.LLM_MODEL
+        # 默认用独立的裁判模型:裁判与被评模型同源会有系统性的自我偏好
+        self._model = model or settings.judge_model
 
     async def judge(
         self, *, question: str, answer: str, context: str, answerable: bool
@@ -120,15 +146,31 @@ class AnswerJudge:
                 tools=[],
                 model=self._model,
                 temperature=0.0,
-                max_tokens=512,
+                max_tokens=_JUDGE_MAX_TOKENS,
                 purpose="judge",
             )
         except Exception as exc:
             logger.warning("judge call failed: %s", type(exc).__name__)
             return JudgeVerdict(reason=f"裁判调用失败: {type(exc).__name__}", failed=True)
 
-        payload = _parse_json_object(completion.content)
+        raw = completion.content or ""
+        payload = _parse_json_object(raw)
         if not payload:
+            # 整体 JSON 解析失败(通常是截断),尝试按字段抢救
+            reason = "裁判输出截断，按字段抢救"
+            if not answerable:
+                abstained = _bool_from_fragment(raw, "abstained")
+                if abstained is not None:
+                    return JudgeVerdict(abstained=abstained, reason=reason)
+            else:
+                faithfulness = _score_from_fragment(raw, "faithfulness")
+                relevance = _score_from_fragment(raw, "relevance")
+                if faithfulness is not None or relevance is not None:
+                    return JudgeVerdict(
+                        faithfulness=faithfulness,
+                        relevance=relevance,
+                        reason=reason,
+                    )
             # 解析失败必须标成 failed 而不是当 0 分，否则会污染均值
             return JudgeVerdict(reason="裁判输出无法解析", failed=True)
 
@@ -178,7 +220,7 @@ class TaskJudge:
 
     def __init__(self, model_adapter, model: str | None = None) -> None:
         self._adapter = model_adapter
-        self._model = model or settings.LLM_MODEL
+        self._model = model or settings.judge_model
 
     async def judge(
         self, *, question: str, answer: str, evidence: str, rubric: str
@@ -204,15 +246,24 @@ class TaskJudge:
                 tools=[],
                 model=self._model,
                 temperature=0.0,
-                max_tokens=512,
+                max_tokens=_JUDGE_MAX_TOKENS,
                 purpose="judge_agent_task",
             )
         except Exception as exc:
             logger.warning("task judge call failed: %s", type(exc).__name__)
             return TaskVerdict(reason=f"裁判调用失败: {type(exc).__name__}", failed=True)
 
-        payload = _parse_json_object(completion.content)
+        raw = completion.content or ""
+        payload = _parse_json_object(raw)
         if not payload:
+            success = _score_from_fragment(raw, "success")
+            grounded = _score_from_fragment(raw, "grounded")
+            if success is not None or grounded is not None:
+                return TaskVerdict(
+                    success=success,
+                    grounded=grounded,
+                    reason="裁判输出截断，按字段抢救",
+                )
             return TaskVerdict(reason="裁判输出无法解析", failed=True)
 
         success = _clamp_score(payload.get("success"))

@@ -1,11 +1,12 @@
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any, AsyncGenerator
 
 from sqlalchemy.orm import Session
 
 from config import settings
-from models import Chat, Message, MessageToolStep
+from models import Chat, Message, MessageToolStep, User
 from redis_service import redis_service
 from services.clock import naive_now
 from services.conversation_context import ConversationContextBuilder
@@ -13,6 +14,7 @@ from services.feedback_service import feedback_service
 from services import guardrails
 from services.guardrails import guard, mask_markup
 from services.knowledge_service import KnowledgeService
+from services.memory_service import memory_service
 from services.model_adapter import ModelAdapter, ModelCompletion, OpenAICompatibleAdapter
 from services import prompt_library
 from services.semantic_cache import semantic_cache
@@ -21,6 +23,7 @@ from services.token_budget import HistoryMessage
 from services import agent_roles
 from services import subagent
 from services import tool_history
+from services import workspace_service
 from services.tool_runtime import ToolDefinition, ToolRuntime, ToolStatus
 from services import vision
 from services import workspace_tools
@@ -53,6 +56,19 @@ class _ToolResultBudget:
             return text
         self._remaining = 0
         return text[:limit] + f"\n\n[结果过长已截断，原始长度 {len(text)} 字符]"
+
+
+@dataclass(slots=True)
+class _ToolScope:
+    """一次回答里工具执行的作用域。
+
+    知识库的可见单位是工作区(全员共享、admin 管理),而记忆、附件这些
+    仍然是用户个人的——两个 id 必须一起传,否则总有一处作用域用错。
+    """
+
+    user_id: str
+    workspace_id: str
+    is_admin: bool
 
 
 class _Delegations:
@@ -385,7 +401,7 @@ class ChatService:
     def _create_tools(
         self,
         db: Session,
-        user_id: str,
+        scope: "_ToolScope",
         use_rag: bool,
         citation_sink: list[dict] | None = None,
     ) -> list[ToolDefinition]:
@@ -399,9 +415,9 @@ class ChatService:
         """
         tools: list[ToolDefinition] = []
         if use_rag:
-            tools.extend(self._create_knowledge_tools(db, user_id, citation_sink))
+            tools.extend(self._create_knowledge_tools(db, scope, citation_sink))
         tools.extend(
-            workspace_tools.build(db, user_id, self._get_knowledge_service())
+            workspace_tools.build(db, scope, self._get_knowledge_service())
         )
         return tools
 
@@ -470,7 +486,7 @@ class ChatService:
     def _create_knowledge_tools(
         self,
         db: Session,
-        user_id: str,
+        scope: "_ToolScope",
         citation_sink: list[dict] | None = None,
     ) -> list[ToolDefinition]:
         knowledge_service = self._get_knowledge_service()
@@ -482,7 +498,7 @@ class ChatService:
             context, citations = await knowledge_service.build_rag_context_with_citations(
                 db,
                 query.strip(),
-                user_id,
+                scope.workspace_id,
                 top_k=settings.RAG_TOP_K,
             )
             # 工具处理器不能直接产出 SSE 事件,命中的引用先放进 sink,由循环负责发出
@@ -494,7 +510,7 @@ class ChatService:
             )
 
         async def list_knowledge_documents(_arguments: dict[str, Any]) -> str:
-            documents = await knowledge_service.get_documents(db, user_id)
+            documents = await knowledge_service.get_documents(db, scope.workspace_id)
             indexed = [doc for doc in documents if doc["status"] == "indexed"]
             if not indexed:
                 return "本地知识库中没有已索引的文档。"
@@ -516,7 +532,7 @@ class ChatService:
                 return "读取失败：chunk_index 必须是非负整数。"
 
             chunks = await knowledge_service.read_chunks(
-                db, user_id, document_id.strip(), chunk_index
+                db, scope.workspace_id, document_id.strip(), chunk_index
             )
             if not chunks:
                 return (
@@ -592,14 +608,54 @@ class ChatService:
             ),
         ]
 
+    async def _condense_query(
+        self, history: list[HistoryMessage], prompt: str
+    ) -> str:
+        """把追问改写成自包含问题再做预检索。
+
+        "那它的赔偿标准呢?"拿原文去检索会因缺少指代对象而召回漂移。改写是
+        增强,不是依赖:任何失败(模型故障、空输出、输出长得像抄了一遍对话)
+        都回退原文。首轮没有历史,直接原样返回,不花这次调用。
+        """
+        if not settings.RAG_CONDENSE_QUERY or not history:
+            return prompt
+        recent = history[-6:]
+        turns = "\n".join(
+            f"{message.role}: {message.content[:400]}" for message in recent
+        )
+        try:
+            content = prompt_library.render(
+                "rag_query_condense", recent_turns=turns, question=prompt
+            )
+            completion = await self.model_adapter.complete(
+                messages=[{"role": "user", "content": content}],
+                tools=[],
+                model=settings.utility_model,
+                temperature=0.0,
+                max_tokens=256,
+                purpose="query_condense",
+            )
+        except Exception as exc:
+            logger.warning("query condense failed: %s", type(exc).__name__)
+            return prompt
+        # 长度检查针对整个输出而不是第一行:把整段对话抄一遍的"改写"第一行
+        # 可能很短,单看第一行拦不住
+        raw = (completion.content or "").strip()
+        if not raw or len(raw) > len(prompt) * 3 + 200:
+            return prompt
+        condensed = raw.splitlines()[0].strip().strip('"“”')
+        if not condensed:
+            return prompt
+        return condensed
+
     async def _prefetch_rag_context(
-        self, db: Session, user_id: str, prompt: str
+        self, db: Session, workspace_id: str, prompt: str
     ) -> tuple[str, list[dict], bool]:
         """首轮之前的一次性检索。失败时返回空内容并标记 failed,不影响主流程。"""
         try:
             context, citations = (
                 await self._get_knowledge_service().build_rag_context_with_citations(
-                    db, prompt, user_id, top_k=settings.RAG_TOP_K
+                    db, prompt, workspace_id, top_k=settings.RAG_TOP_K
                 )
             )
             return context, citations, False
@@ -646,6 +702,16 @@ class ChatService:
         两个人可以同时用不同版本互不干扰,这是"改全局开关"做不到的。
         """
         system_template = self._system_template(use_rag, prompt_version)
+        # 工具与检索的作用域:知识库按工作区共享(旧用户/OAuth 用户在此懒初始化)
+        user = db.query(User).filter(User.id == user_id).first()
+        workspace = workspace_service.resolve_for_user(db, user) if user else None
+        scope = _ToolScope(
+            user_id=user_id,
+            workspace_id=workspace.id if workspace else user_id,
+            is_admin=bool(
+                user and user.role == workspace_service.ROLE_ADMIN
+            ),
+        )
         async with tracer.trace(
             user_id=user_id, chat_id=chat_id, message_id=message_id
         ) as trace:
@@ -659,8 +725,10 @@ class ChatService:
                 prompt_version=system_template.ref,
             ) as turn:
                 resolved_model = model or settings.LLM_MODEL
+                # 语义缓存按工作区分桶:同空间的人问同一问题直接命中,
+                # 这正是共享知识库的收益之一
                 hit = await semantic_cache.lookup(
-                    user_id,
+                    scope.workspace_id,
                     prompt,
                     resolved_model,
                     use_rag,
@@ -688,6 +756,7 @@ class ChatService:
                 async for event in self._run_turn(
                     db,
                     user_id,
+                    scope,
                     chat_id,
                     prompt,
                     model,
@@ -717,7 +786,7 @@ class ChatService:
                         for span in getattr(trace, "spans", [])
                     )
                     await semantic_cache.store(
-                        user_id,
+                        scope.workspace_id,
                         prompt,
                         answer,
                         resolved_model,
@@ -793,6 +862,7 @@ class ChatService:
         self,
         db: Session,
         user_id: str,
+        scope: _ToolScope,
         chat_id: str,
         prompt: str,
         model: str | None,
@@ -821,7 +891,7 @@ class ChatService:
             "top_p": top_p,
         }
 
-        base_tools = self._create_tools(db, user_id, use_rag, citations)
+        base_tools = self._create_tools(db, scope, use_rag, citations)
         # ---- 多代理:委派 ----
         # 子代理的运行时拿的是**未经角色过滤的**完整工具集合,按角色过滤发生在
         # SubAgentRunner._schemas_for(下发哪些 schema)和它的执行前检查(越权拦截)
@@ -886,16 +956,17 @@ class ChatService:
         # 条件是 use_rag 而不是"有没有工具":workspace 工具打开之后,关掉知识库的
         # 请求也会有非空的 tools,拿它当代理会让预检索在 RAG 关闭时照样触发。
         if use_rag and settings.RAG_PREFETCH:
+            search_query = await self._condense_query(history, prompt)
             yield {
                 "type": "tool_start",
                 "tool": "search_knowledge_base",
-                "input": {"query": prompt},
+                "input": {"query": search_query},
                 "round": 0,
             }
             # 护栏埋在检索链路深处,用一个作用域收集器把命中情况带回这里
             with guardrails.collecting() as reports:
                 prefetch_context, prefetch_citations, prefetch_failed = (
-                    await self._prefetch_rag_context(db, user_id, prompt)
+                    await self._prefetch_rag_context(db, scope.workspace_id, search_query)
                 )
             prefetch_report = guardrails.summarize(reports)
             yield {
@@ -917,7 +988,7 @@ class ChatService:
                 tool_name="search_knowledge_base",
                 status="error" if prefetch_failed else "ok",
                 result=prefetch_context,
-                arguments={"query": prompt},
+                arguments={"query": search_query},
                 citations=prefetch_citations,
             )
             if prefetch_context:
@@ -931,11 +1002,22 @@ class ChatService:
                 if prefetch_citations:
                     yield {"type": "citations", "items": prefetch_citations}
 
+        # ---- 跨会话长期记忆 ----
+        # 独立的 system 消息而不是拼进主系统提示词:提示词是带版本管理的"代码",
+        # 记忆是逐用户增长的"数据",混在一起会让同一版提示词在不同用户间
+        # 表现不可比,也破坏语义缓存按 prompt_ref 分桶的前提。
+        memory_messages: list[dict[str, Any]] = []
+        if settings.MEMORY_ENABLED:
+            memory_block = memory_service.build_system_block(db, user_id)
+            if memory_block:
+                memory_messages = [{"role": "system", "content": memory_block}]
+
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
                 "content": self._system_prompt(system_template, prefetched),
             },
+            *memory_messages,
             *context.messages,
             # 轨迹紧贴当前问题:它讲的是"刚刚做过什么",离问题越近越不容易被
             # 当成更早的对话内容

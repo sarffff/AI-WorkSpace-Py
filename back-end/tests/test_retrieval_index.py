@@ -7,7 +7,11 @@ from services.embedding_service import EmbeddingService
 from services.retrieval_index import (
     BM25Index,
     VectorIndex,
+    get_scope_indexes,
+    indexes_fresh,
+    invalidate_scope_indexes,
     reciprocal_rank_fusion,
+    signature_from_ids,
     tokenize,
 )
 
@@ -24,6 +28,10 @@ def _chunk(chunk_id: str, content: str, vector: list[float] | None = None):
             else None
         ),
     )
+
+
+def _sig(chunks: list[DocumentChunk]) -> str:
+    return signature_from_ids([chunk.id for chunk in chunks])
 
 
 def test_tokenize_splits_cjk_into_bigrams():
@@ -52,7 +60,8 @@ def test_bm25_ranks_exact_term_match_first():
             _chunk("a", "预算审批流程说明"),
             _chunk("b", "员工入职手册"),
             _chunk("c", "报销与预算无关的杂项"),
-        ]
+        ],
+        _sig([_chunk("a", ""), _chunk("b", ""), _chunk("c", "")]),
     )
 
     results = index.search("预算", top_k=5)
@@ -62,7 +71,7 @@ def test_bm25_ranks_exact_term_match_first():
 
 def test_bm25_returns_nothing_when_no_term_matches():
     index = BM25Index()
-    index.build_if_stale([_chunk("a", "员工入职手册")])
+    index.build_if_stale([_chunk("a", "员工入职手册")], _sig([_chunk("a", "")]))
 
     assert index.search("量子纠缠", top_k=5) == []
     assert index.search("", top_k=5) == []
@@ -75,7 +84,8 @@ def test_bm25_penalises_longer_documents():
         [
             _chunk("short", "预算"),
             _chunk("long", "预算" + "其他内容" * 50),
-        ]
+        ],
+        _sig([_chunk("short", ""), _chunk("long", "")]),
     )
 
     results = dict((chunk_id, score) for score, chunk_id in index.search("预算", 5))
@@ -83,13 +93,18 @@ def test_bm25_penalises_longer_documents():
     assert results["short"] > results["long"]
 
 
-def test_bm25_rebuilds_when_content_changes():
+def test_bm25_rebuilds_when_id_set_changes():
+    """签名基于 chunk id 集合:增删 chunk 会触发重建。
+
+    同一 id 原地改 content **不会**触发重建——这是有意的契约:chunk 行只增删、
+    从不原地更新。见 signature_from_ids 的文档串。
+    """
     index = BM25Index()
-    index.build_if_stale([_chunk("a", "苹果香蕉")])
+    index.build_if_stale([_chunk("a", "苹果香蕉")], _sig([_chunk("a", "")]))
     assert index.search("苹果香蕉", 5)
 
-    index.build_if_stale([_chunk("a", "钢铁水泥")])
-
+    # id 集合变了(旧 a 删掉,换上新的 b),即使 content 相同也必须重建
+    index.build_if_stale([_chunk("b", "钢铁水泥")], _sig([_chunk("b", "")]))
     assert index.search("苹果香蕉", 5) == []
     assert index.search("钢铁水泥", 5)
 
@@ -115,7 +130,8 @@ def test_rrf_scores_decay_with_rank():
 def test_vector_index_returns_cosine_scores():
     index = VectorIndex()
     index.build_if_stale(
-        [_chunk("a", "x", [1.0, 0.0]), _chunk("b", "y", [0.0, 1.0])]
+        [_chunk("a", "x", [1.0, 0.0]), _chunk("b", "y", [0.0, 1.0])],
+        _sig([_chunk("a", ""), _chunk("b", "")]),
     )
 
     results = index.search([1.0, 0.0], top_k=2)
@@ -127,7 +143,10 @@ def test_vector_index_returns_cosine_scores():
 
 def test_vector_index_skips_chunks_without_embedding():
     index = VectorIndex()
-    index.build_if_stale([_chunk("a", "x"), _chunk("b", "y", [1.0, 0.0])])
+    index.build_if_stale(
+        [_chunk("a", "x"), _chunk("b", "y", [1.0, 0.0])],
+        _sig([_chunk("a", ""), _chunk("b", "")]),
+    )
 
     assert [chunk_id for _score, chunk_id in index.search([1.0, 0.0], 5)] == ["b"]
 
@@ -135,7 +154,8 @@ def test_vector_index_skips_chunks_without_embedding():
 def test_vector_index_skips_mismatched_dimensions():
     index = VectorIndex()
     index.build_if_stale(
-        [_chunk("a", "x", [1.0, 0.0]), _chunk("b", "y", [1.0, 0.0, 0.0])]
+        [_chunk("a", "x", [1.0, 0.0]), _chunk("b", "y", [1.0, 0.0, 0.0])],
+        _sig([_chunk("a", ""), _chunk("b", "")]),
     )
 
     assert [chunk_id for _score, chunk_id in index.search([1.0, 0.0], 5)] == ["a"]
@@ -143,6 +163,27 @@ def test_vector_index_skips_mismatched_dimensions():
 
 def test_vector_index_rejects_query_with_wrong_dimension():
     index = VectorIndex()
-    index.build_if_stale([_chunk("a", "x", [1.0, 0.0])])
+    index.build_if_stale(
+        [_chunk("a", "x", [1.0, 0.0])], _sig([_chunk("a", "")])
+    )
 
     assert index.search([1.0, 0.0, 0.0], 5) == []
+
+
+def test_indexes_fresh_reflects_build_and_invalidation():
+    user = "fresh-check-user"
+    invalidate_scope_indexes(user)
+    chunks = [_chunk("a", "苹果香蕉", [1.0, 0.0])]
+    signature = _sig(chunks)
+
+    assert indexes_fresh(user, signature) is False
+
+    indexes = get_scope_indexes(user)
+    indexes.vector.build_if_stale(chunks, signature)
+    indexes.bm25.build_if_stale(chunks, signature)
+    assert indexes_fresh(user, signature) is True
+    # 签名不同(id 集合变了)必须报告不新鲜
+    assert indexes_fresh(user, signature_from_ids(["z"])) is False
+
+    invalidate_scope_indexes(user)
+    assert indexes_fresh(user, signature) is False

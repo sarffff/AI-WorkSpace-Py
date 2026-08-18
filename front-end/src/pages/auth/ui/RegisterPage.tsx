@@ -16,6 +16,7 @@ import {
   Chrome,
   Sun,
   Moon,
+  KeyRound,
 } from "lucide-react";
 
 export const RegisterPage: React.FC = () => {
@@ -28,6 +29,7 @@ export const RegisterPage: React.FC = () => {
     username: "",
     password: "",
     name: "",
+    inviteCode: "",
   });
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -90,6 +92,7 @@ export const RegisterPage: React.FC = () => {
         username: formData.username,
         password: formData.password,
         name: formData.name || formData.username,
+        inviteCode: formData.inviteCode.trim() || undefined,
       });
 
       dispatch(setToken(response.access_token));
@@ -273,6 +276,30 @@ export const RegisterPage: React.FC = () => {
                   </div>
                 </div>
               )}
+            </div>
+
+            {/* 邀请码(可选):填了加入团队工作区共享知识库 */}
+            <div>
+              <label className="block text-xs font-semibold text-[#6e6b63] dark:text-[#a19f96] uppercase tracking-wider mb-2">
+                邀请码 <span className="normal-case tracking-normal font-normal">(可选)</span>
+              </label>
+              <div className="relative">
+                <KeyRound className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-[#918d83] dark:text-[#78756d]" />
+                <input
+                  type="text"
+                  value={formData.inviteCode}
+                  onChange={(e) =>
+                    setFormData({ ...formData, inviteCode: e.target.value })
+                  }
+                  placeholder="有团队的邀请码?填上即可加入共享知识库"
+                  maxLength={16}
+                  aria-label="工作区邀请码"
+                  className="w-full pl-10 pr-4 py-2.5 bg-[#fbf9f5] dark:bg-[#201f1c] border border-[#e3dfd5] dark:border-[#2e2d2a] rounded-xl text-[#1f1e1d] dark:text-[#edece8] placeholder-[#918d83] dark:placeholder-[#78756d] focus:outline-none focus:ring-2 focus:ring-[#da7756] focus:border-transparent transition-all text-sm uppercase"
+                />
+              </div>
+              <p className="mt-1 text-[11px] text-[#918d83]">
+                不填则创建你的个人空间;填了则以成员身份加入对应团队,共享其知识库
+              </p>
             </div>
 
             {/* 服务条款 */}

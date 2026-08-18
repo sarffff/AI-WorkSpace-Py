@@ -57,11 +57,20 @@ def tokenize(text: str) -> list[str]:
     return tokens
 
 
-def _signature(chunks: list[DocumentChunk], include_content: bool) -> str:
+def signature_from_ids(chunk_ids: list[str]) -> str:
+    """索引签名:对 chunk id 集合(按稳定顺序)做哈希。
+
+    以前是对全部 embedding/content 字符串做 sha256,每次检索都要把整个库的
+    大 Text 字段拉进内存再哈希一遍——检索成本随库规模线性增长,而这发生在
+    每一条查询上。换成 id 集合签名后,判失效只需一次只查 id 列的轻量查询。
+
+    正确性前提:chunk 行只增删、从不原地更新(入库时整体插入,删文档时
+    级联删除)。任何 id 集合的变化都会改变签名;若将来引入原地 re-embed,
+    必须换回内容签名或引入显式版本号。
+    """
     digest = hashlib.sha256()
-    for chunk in chunks:
-        digest.update(chunk.id.encode("utf-8"))
-        digest.update((chunk.content if include_content else chunk.embedding or "").encode("utf-8"))
+    for chunk_id in chunk_ids:
+        digest.update(chunk_id.encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -73,13 +82,19 @@ class VectorIndex:
         self._ids: list[str] = []
         self._matrix: Optional[np.ndarray] = None  # (n, d) float32, 已 L2 归一化
         self._faiss_index = None
+        # _built 区分"从没建过"和"建过但向量集为空"(后者 _matrix 就是 None),
+        # 否则空索引每次检索都会白白重建一遍
+        self._built = False
         self._signature = ""
         self._dimension = 0
 
-    def build_if_stale(self, chunks: list[DocumentChunk]) -> None:
+    def is_fresh(self, signature: str) -> bool:
         with self._lock:
-            signature = _signature(chunks, include_content=False)
-            if self._matrix is not None and signature == self._signature:
+            return self._built and signature == self._signature
+
+    def build_if_stale(self, chunks: list[DocumentChunk], signature: str) -> None:
+        with self._lock:
+            if self._built and signature == self._signature:
                 return
 
             ids: list[str] = []
@@ -117,6 +132,7 @@ class VectorIndex:
                 vectors.append(vector)
                 ids.append(chunk.id)
 
+            self._built = True
             self._signature = signature
             self._ids = ids
             self._dimension = dimension
@@ -182,6 +198,7 @@ class BM25Index:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._built = False
         self._signature = ""
         self._ids: list[str] = []
         self._term_freqs: list[Counter[str]] = []
@@ -189,12 +206,16 @@ class BM25Index:
         self._doc_freq: Counter[str] = Counter()
         self._average_length = 0.0
 
-    def build_if_stale(self, chunks: list[DocumentChunk]) -> None:
+    def is_fresh(self, signature: str) -> bool:
         with self._lock:
-            signature = _signature(chunks, include_content=True)
-            if self._ids and signature == self._signature:
+            return self._built and signature == self._signature
+
+    def build_if_stale(self, chunks: list[DocumentChunk], signature: str) -> None:
+        with self._lock:
+            if self._built and signature == self._signature:
                 return
 
+            self._built = True
             self._signature = signature
             self._ids = []
             self._term_freqs = []
@@ -283,17 +304,35 @@ class _UserIndexes:
         self.bm25 = BM25Index()
 
 
+# 桶键是知识库的作用域 id(现为 workspace_id)。
 _indexes: dict[str, _UserIndexes] = {}
 _indexes_lock = threading.Lock()
 
 
-def get_user_indexes(user_id: str) -> _UserIndexes:
-    """按用户隔离索引，避免跨用户检索结果混合。"""
+def get_scope_indexes(scope_id: str) -> _UserIndexes:
+    """按知识库作用域(工作区)隔离索引，避免跨工作区检索结果混合。"""
     with _indexes_lock:
-        return _indexes.setdefault(user_id, _UserIndexes())
+        return _indexes.setdefault(scope_id, _UserIndexes())
 
 
-def invalidate_user_indexes(user_id: str) -> None:
-    """文档增删后调用；下次检索时重建。"""
+def indexes_fresh(scope_id: str, signature: str) -> bool:
+    """该作用域的索引是否已经按这个签名构建完成。
+
+    检索方先做一次只查 id 列的轻量查询算签名,再调这里:新鲜就能跳过
+    embedding 大字段的拉取与重建。BM25 未启用时不参与判断。
+    """
     with _indexes_lock:
-        _indexes.pop(user_id, None)
+        bundle = _indexes.get(scope_id)
+    if bundle is None:
+        return False
+    if not bundle.vector.is_fresh(signature):
+        return False
+    if settings.RAG_HYBRID and not bundle.bm25.is_fresh(signature):
+        return False
+    return True
+
+
+def invalidate_scope_indexes(scope_id: str) -> None:
+    """文档增删后调用；下次检索时重建。scope_id 是工作区 id。"""
+    with _indexes_lock:
+        _indexes.pop(scope_id, None)

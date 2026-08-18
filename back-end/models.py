@@ -23,6 +23,26 @@ if TYPE_CHECKING:
     pass
 
 
+class Workspace(Base):
+    """知识库的工作区(组织)。
+
+    知识库的可见单位从"用户"改为"工作区":同一工作区的成员共享文档,
+    admin 负责上传与删除,member 只读。这是"个人工具"与"团队产品"的分界——
+    制度文档是组织资产,不该要求每个员工自己传一遍。
+    """
+
+    __tablename__ = "workspaces"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    name: Mapped[str] = mapped_column(String(100))
+    # 邀请码:注册时填了就加入该工作区成为 member。不区分大小写、去掉
+    # 易混淆字符(0/O、1/I),长度 8 位
+    invite_code: Mapped[str] = mapped_column(String(16), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -32,15 +52,23 @@ class User(Base):
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)  # 第三方登录时可为空
     avatar: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    
+
     # 第三方登录相关字段
     provider: Mapped[str | None] = mapped_column(String(50), nullable=True)  # local, github, google
     provider_id: Mapped[str | None] = mapped_column(String(255), nullable=True)  # 第三方平台的用户ID
-    
+
+    # 所属工作区与角色。workspace_id 为空表示还没初始化(旧用户/OAuth 新用户),
+    # 第一次访问工作区相关功能时由 workspace_service.resolve_for_user 自动补建。
+    # role 只有 admin(可管理文档/邀请码)与 member(只读知识库)两档。
+    workspace_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    role: Mapped[str] = mapped_column(String(20), default="admin")
+
     # 账号状态
     is_active: Mapped[bool] = mapped_column(default=True)
     is_verified: Mapped[bool] = mapped_column(default=False)
-    
+
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
@@ -140,10 +168,48 @@ class Document(Base):
     name: Mapped[str] = mapped_column(String(255))
     size: Mapped[int] = mapped_column(Integer)
     content: Mapped[str | None] = mapped_column(Text, nullable=True)  # 文档全文内容
+    # 知识库的作用域:工作区。同一工作区全员可见,检索/去重/缓存都按它过滤
+    workspace_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # 上传者,仅用于展示"这份文档是谁放的",不参与权限判断
     user_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     chunks: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="indexed")  # indexed, processing, failed
+    # 解析后正文的 sha256。去重键:同一内容传两遍会占两套 chunk,RRF 按不同
+    # chunk_id 融合不会合并,重复文档会挤掉 top_k 里的其他文档。
+    # 哈希算在解析后的文本而不是原始字节上——同一份内容换个文件名、或
+    # PDF 重新导出一次,应该被认出是同一篇文档。
+    # 注意:去重范围是(工作区, 哈希)——不同工作区各存一份是正常的
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class UserMemory(Base):
+    """跨会话的长期记忆:用户的事实与偏好。
+
+    与滚动摘要的分工:摘要活在单个会话内,压的是"这段对话说过什么";
+    这里存的是"关于这个用户,哪些信息值得在**所有**以后的对话里知道"
+    ——部门、角色、偏好、长期约束。抽取由辅助模型在每轮回答后异步完成,
+    注入发生在系统提示词之后、历史之前。
+    """
+
+    __tablename__ = "user_memories"
+    __table_args__ = (
+        Index("ix_user_memories_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    user_id: Mapped[str] = mapped_column(String(36))
+    # fact(已确认的事实) / preference(表达的偏好)。kind 只做展示分组,
+    # 注入时不加区分——对模型来说都是"关于用户的背景"。
+    kind: Mapped[str] = mapped_column(String(20), default="fact")
+    content: Mapped[str] = mapped_column(Text)
+    # 这条记忆来自哪个会话,便于用户追问"你为什么知道这个"时溯源
+    chat_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
 
 
 class DocumentChunk(Base):

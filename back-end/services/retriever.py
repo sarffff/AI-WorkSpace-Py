@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from config import settings
 from models import Document, DocumentChunk
@@ -25,8 +25,10 @@ from services.telemetry import SpanKind, tracer
 from services.retrieval_index import (
     BM25Index,
     VectorIndex,
-    get_user_indexes,
+    get_scope_indexes,
+    indexes_fresh,
     reciprocal_rank_fusion,
+    signature_from_ids,
 )
 
 logger = logging.getLogger("retriever")
@@ -113,17 +115,35 @@ class HybridRetriever:
         return self._model_adapter
 
     @staticmethod
-    def _load_rows(db: Session, user_id: str) -> list[tuple[DocumentChunk, Document]]:
-        return (
-            db.query(DocumentChunk, Document)
+    def _load_chunk_ids(db: Session, workspace_id: str) -> list[str]:
+        """只查 id 列的轻量查询,用于算索引签名判断是否需要重建。"""
+        rows = (
+            db.query(DocumentChunk.id)
             .join(Document, DocumentChunk.document_id == Document.id)
-            .filter(Document.user_id == user_id, Document.status == "indexed")
+            .filter(Document.workspace_id == workspace_id, Document.status == "indexed")
             .order_by(DocumentChunk.id.asc())
             .all()
         )
+        return [row[0] for row in rows]
+
+    @staticmethod
+    def _load_rows(
+        db: Session, workspace_id: str, *, with_embeddings: bool
+    ) -> list[tuple[DocumentChunk, Document]]:
+        query = (
+            db.query(DocumentChunk, Document)
+            .join(Document, DocumentChunk.document_id == Document.id)
+            .filter(Document.workspace_id == workspace_id, Document.status == "indexed")
+            .order_by(DocumentChunk.id.asc())
+        )
+        if not with_embeddings:
+            # embedding 是整张表最大的列(每块几 KB 的 JSON);索引新鲜时它
+            # 只对重建有用,defer 掉就能把热路径的传输量降一个数量级
+            query = query.options(defer(DocumentChunk.embedding))
+        return query.all()
 
     async def retrieve(
-        self, db: Session, user_id: str, query: str, top_k: int = 5
+        self, db: Session, workspace_id: str, query: str, top_k: int = 5
     ) -> list[RetrievedChunk]:
         """检索入口。埋点记下本次用的是哪套开关组合与命中情况。
 
@@ -139,7 +159,7 @@ class HybridRetriever:
             rerank=settings.RAG_RERANK,
             context_window=settings.RAG_CONTEXT_WINDOW,
         ) as span:
-            results = await self._retrieve(db, user_id, query, top_k)
+            results = await self._retrieve(db, workspace_id, query, top_k)
             span.set(
                 hits=len(results),
                 channels=sorted({c for r in results for c in r.channels}) or None,
@@ -151,18 +171,23 @@ class HybridRetriever:
             return results
 
     async def _retrieve(
-        self, db: Session, user_id: str, query: str, top_k: int = 5
+        self, db: Session, workspace_id: str, query: str, top_k: int = 5
     ) -> list[RetrievedChunk]:
-        rows = self._load_rows(db, user_id)
-        if not rows:
+        # 先用 id 集合签名判断索引是否新鲜:新鲜则跳过 embedding 大字段的
+        # 拉取与重建,热路径的检索成本不再随库规模线性增长
+        chunk_ids = self._load_chunk_ids(db, workspace_id)
+        if not chunk_ids:
             return []
+        signature = signature_from_ids(chunk_ids)
+        fresh = indexes_fresh(workspace_id, signature)
+        rows = self._load_rows(db, workspace_id, with_embeddings=not fresh)
 
         chunks = [chunk for chunk, _document in rows]
         by_id = {chunk.id: (chunk, document) for chunk, document in rows}
-        indexes = get_user_indexes(user_id)
-        indexes.vector.build_if_stale(chunks)
+        indexes = get_scope_indexes(workspace_id)
+        indexes.vector.build_if_stale(chunks, signature)
         if settings.RAG_HYBRID:
-            indexes.bm25.build_if_stale(chunks)
+            indexes.bm25.build_if_stale(chunks, signature)
 
         safe_top_k = max(1, min(top_k, 20))
         per_channel = max(safe_top_k, settings.RAG_CANDIDATES_PER_CHANNEL)
@@ -245,7 +270,7 @@ class HybridRetriever:
             completion = await self._get_model_adapter().complete(
                 messages=[{"role": "user", "content": prompt}],
                 tools=[],
-                model=settings.LLM_MODEL,
+                model=settings.utility_model,
                 temperature=0.3,
                 max_tokens=256,
                 purpose="query_rewrite",
@@ -296,7 +321,7 @@ class HybridRetriever:
             completion = await self._get_model_adapter().complete(
                 messages=[{"role": "user", "content": prompt}],
                 tools=[],
-                model=settings.LLM_MODEL,
+                model=settings.utility_model,
                 temperature=0.0,
                 max_tokens=256,
                 purpose="rerank",
@@ -341,7 +366,7 @@ class HybridRetriever:
             by_document.setdefault(document.id, {})[chunk.chunk_index] = chunk
 
         groups: dict[str, list[dict[str, Any]]] = {}
-        for chunk_id in selected:
+        for rank, chunk_id in enumerate(selected):
             chunk, document = by_id[chunk_id]
             available = by_document.get(document.id, {})
             low = max(min(available, default=chunk.chunk_index), chunk.chunk_index - window)
@@ -352,6 +377,10 @@ class HybridRetriever:
                     "anchor": chunk.chunk_index,
                     "low": low,
                     "high": high,
+                    # selected 的顺序就是最终排序(融合序,或重排后的序)。
+                    # 之前这里按 fusion 分数再排一次,等于把 rerank 的结果整个
+                    # 丢掉——重排只剩下的"改顺序"这一半作用。
+                    "rank": rank,
                     "fusion": fusion_scores.get(chunk_id, 0.0),
                     "dense": dense_scores.get(chunk_id),
                     "channels": set(channels.get(chunk_id, ())),
@@ -360,11 +389,16 @@ class HybridRetriever:
 
         merged: list[dict[str, Any]] = []
         for entries in groups.values():
-            entries.sort(key=lambda entry: entry["low"])
+            # 合并必须按区间起点做:selected 的顺序(融合/重排名次)与分块序号
+            # 无关,乱序处理区间会出两种错——漏合并,或者只更新了 high 忘了
+            # low,把并集左端的内容静默丢掉。
+            entries.sort(key=lambda entry: (entry["low"], entry["rank"]))
             for entry in entries:
                 if merged and merged[-1]["document"].id == entry["document"].id and entry["low"] <= merged[-1]["high"]:
                     previous = merged[-1]
+                    previous["low"] = min(previous["low"], entry["low"])
                     previous["high"] = max(previous["high"], entry["high"])
+                    previous["rank"] = min(previous["rank"], entry["rank"])
                     previous["channels"] |= entry["channels"]
                     if entry["fusion"] > previous["fusion"]:
                         previous["fusion"] = entry["fusion"]
@@ -374,7 +408,9 @@ class HybridRetriever:
                     continue
                 merged.append(entry)
 
-        merged.sort(key=lambda entry: -entry["fusion"])
+        # 输出顺序由各合并段的最小选中名次决定:不重排时等价于融合分数序
+        # (RRF 本身按名次排),重排后就是重排的顺序
+        merged.sort(key=lambda entry: entry["rank"])
 
         results: list[RetrievedChunk] = []
         for entry in merged:

@@ -14,7 +14,9 @@ from sqlalchemy.orm import Session
 from auth import get_current_user
 from database import SessionLocal, get_db
 from models import User
+from services import workspace_service
 from services.knowledge_service import KnowledgeService
+from services.workspace_service import WorkspaceError
 
 router = APIRouter(prefix="/knowledge", tags=["知识库"])
 knowledge_service = KnowledgeService()
@@ -50,8 +52,9 @@ async def get_documents(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """获取文档列表"""
-    return await knowledge_service.get_documents(db, current_user.id)
+    """获取文档列表(整个工作区共享)"""
+    workspace = workspace_service.resolve_for_user(db, current_user)
+    return await knowledge_service.get_documents(db, workspace.id)
 
 
 @router.post("/documents/upload")
@@ -77,9 +80,18 @@ async def upload_document(
     if len(content) > max_size:
         raise HTTPException(status_code=400, detail=f"文件大小不能超过 {max_size // 1024 // 1024}MB")
 
+    workspace = workspace_service.resolve_for_user(db, current_user)
     try:
-        doc = await knowledge_service.create_document(
-            db, file.filename, content, user_id=current_user.id
+        workspace_service.require_admin(current_user)
+    except WorkspaceError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    try:
+        doc, duplicate = await knowledge_service.create_document(
+            db,
+            file.filename,
+            content,
+            workspace_id=workspace.id,
+            uploader_id=current_user.id,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -87,8 +99,10 @@ async def upload_document(
         logger.exception("文档解析失败")
         raise HTTPException(status_code=500, detail="文档解析失败，请稍后重试") from e
 
-    # 向量化是整个流程里最慢的一环(N 次 embedding 调用),不该占着 HTTP 连接
-    background_tasks.add_task(_index_document_task, doc.id)
+    # 向量化是整个流程里最慢的一环(N 次 embedding 调用),不该占着 HTTP 连接。
+    # 重复上传直接返回已有文档,不再排一次索引任务。
+    if not duplicate:
+        background_tasks.add_task(_index_document_task, doc.id)
 
     return {
         "id": doc.id,
@@ -96,6 +110,7 @@ async def upload_document(
         "size": doc.size,
         "chunks": doc.chunks,
         "status": doc.status,
+        "duplicate": duplicate,
     }
 
 
@@ -105,8 +120,13 @@ async def delete_document(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """删除文档"""
-    deleted = await knowledge_service.delete_document(db, doc_id, current_user.id)
+    """删除文档(仅管理员)"""
+    workspace = workspace_service.resolve_for_user(db, current_user)
+    try:
+        workspace_service.require_admin(current_user)
+    except WorkspaceError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    deleted = await knowledge_service.delete_document(db, doc_id, workspace.id)
     if not deleted:
         raise HTTPException(status_code=404, detail="文档不存在")
     return {"success": True}
@@ -118,8 +138,9 @@ async def query_knowledge(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """RAG 检索"""
+    """RAG 检索(工作区共享知识库)"""
+    workspace = workspace_service.resolve_for_user(db, current_user)
     results = await knowledge_service.search(
-        db, request.query, current_user.id, request.top_k
+        db, request.query, workspace.id, request.top_k
     )
     return {"query": request.query, "results": results, "total": len(results)}

@@ -6,6 +6,8 @@ import type {
   CompletionResponse,
   StreamChunk,
   KnowledgeDocument,
+  UploadDocumentResponse,
+  WorkspaceInfo,
   LoginRequest,
   RegisterRequest,
   AuthResponse,
@@ -537,7 +539,7 @@ export class ApiClient {
    * 上传文档到知识库
    * POST /knowledge/documents/upload
    */
-  async uploadDocument(file: File): Promise<KnowledgeDocument> {
+  async uploadDocument(file: File): Promise<UploadDocumentResponse> {
     const formData = new FormData();
     formData.append("file", file);
 
@@ -586,7 +588,46 @@ export class ApiClient {
     );
 
     if (!response.ok) {
-      throw new Error(`Failed to delete document: ${response.statusText}`);
+      const error = await response.json().catch(() => ({}));
+      throw new Error(
+        error.detail || `Failed to delete document: ${response.statusText}`,
+      );
+    }
+
+    return response.json();
+  }
+
+  // ========== Workspace API ==========
+
+  /**
+   * 当前用户的工作区信息(名称/角色/成员/邀请码)
+   * GET /workspace
+   */
+  async getWorkspace(): Promise<WorkspaceInfo> {
+    const response = await this.authedFetch(`${this.baseUrl}/workspace`);
+
+    if (!response.ok) {
+      throw new Error(`Failed to load workspace: ${response.statusText}`);
+    }
+
+    return response.json();
+  }
+
+  /**
+   * 重置邀请码(仅管理员,旧码立即作废)
+   * POST /workspace/invite-code
+   */
+  async regenerateInviteCode(): Promise<{ inviteCode: string }> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/workspace/invite-code`,
+      { method: "POST" },
+    );
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(
+        error.detail || `Failed to regenerate invite code: ${response.statusText}`,
+      );
     }
 
     return response.json();

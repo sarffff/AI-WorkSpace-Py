@@ -367,7 +367,7 @@ def safe_document_name(raw: str) -> str:
 
 
 def _build_save_tool(
-    db: Session, user_id: str, knowledge: Any
+    db: Session, scope: Any, knowledge: Any
 ) -> ToolDefinition:
     async def save_to_knowledge_base(arguments: dict[str, Any]) -> str:
         name = arguments.get("name")
@@ -376,6 +376,11 @@ def _build_save_tool(
             return "保存失败：name 必须是非空字符串。"
         if not isinstance(content, str) or not content.strip():
             return "保存失败：content 必须是非空字符串。"
+
+        # 共享知识库里 member 没有写权限——返回可读提示而不是抛异常,
+        # 模型能把它转述给用户(比如"请让管理员代为上传")
+        if not getattr(scope, "is_admin", False):
+            return "保存失败：你是工作区的普通成员，只有管理员可以向知识库写入文档。"
 
         limit = max(1, settings.AGENT_WRITE_MAX_CHARS)
         if len(content) > limit:
@@ -393,7 +398,8 @@ def _build_save_tool(
 
         filename = f"{WRITE_NAME_PREFIX}{safe_document_name(name)}.md"
         document = await knowledge.upload_document(
-            db, filename, cleaned.encode("utf-8"), user_id
+            db, filename, cleaned.encode("utf-8"), scope.workspace_id,
+            uploader_id=scope.user_id,
         )
         return (
             f"已保存到知识库：{filename}（document_id: {document.id}，"
@@ -423,7 +429,7 @@ def _build_save_tool(
 # ========== 组装 ==========
 
 
-def build(db: Session, user_id: str, knowledge: Any) -> list[ToolDefinition]:
+def build(db: Session, scope: Any, knowledge: Any) -> list[ToolDefinition]:
     """按开关组装 workspace 工具。
 
     没开的工具**根本不注册**,而不是注册一个返回"该功能未启用"的版本:后者每轮
@@ -438,7 +444,7 @@ def build(db: Session, user_id: str, knowledge: Any) -> list[ToolDefinition]:
     if settings.TOOL_READ_ATTACHMENT_ENABLED:
         tools.append(_READ_ATTACHMENT)
     if settings.TOOL_WRITE_KNOWLEDGE_ENABLED:
-        tools.append(_build_save_tool(db, user_id, knowledge))
+        tools.append(_build_save_tool(db, scope, knowledge))
     return tools
 
 

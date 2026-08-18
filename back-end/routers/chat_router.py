@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import uuid
@@ -8,15 +9,37 @@ from sqlalchemy.orm import Session
 from sse_starlette.sse import EventSourceResponse
 
 from auth import get_current_user
-from database import get_db
+from config import settings
+from database import get_db, SessionLocal
 from models import Message, User
 from services.chat_service import ChatService
+from services.memory_service import memory_service
 from services import prompt_library
 from services.settings_service import is_model_allowed, load_preferences
 
 router = APIRouter(prefix="/chats", tags=["对话"])
 chat_service = ChatService()
 logger = logging.getLogger("chat_router")
+
+
+async def _extract_memory(user_id: str, chat_id: str, question: str, answer: str) -> None:
+    """长期记忆抽取:SSE 流已结束,这里自建会话后台跑,绝不拖慢对话。
+
+    请求作用域的 db 会话在响应结束后就关了,所以必须另开一个;失败只记
+    日志——记忆是增强,抽取挂掉不该让用户看到任何错误。
+    """
+    try:
+        with SessionLocal() as db:
+            await memory_service.extract(
+                chat_service.model_adapter,
+                db,
+                user_id=user_id,
+                chat_id=chat_id,
+                question=question,
+                answer=answer,
+            )
+    except Exception:
+        logger.warning("memory extraction failed", exc_info=True)
 
 
 class ChatRequest(BaseModel):
@@ -363,6 +386,14 @@ async def stream_completions(
                     options["model"],
                     assistant_message_id,
                 )
+                # 回答真正落库之后才抽记忆:抽到一半流断掉的情况,记忆来源
+                # (question/answer)都已经完整拿到,不会存进半截事实
+                if settings.MEMORY_ENABLED:
+                    asyncio.create_task(
+                        _extract_memory(
+                            current_user.id, chat_id, request.prompt, full_response
+                        )
+                    )
                 yield {
                     "data": json.dumps(
                         {

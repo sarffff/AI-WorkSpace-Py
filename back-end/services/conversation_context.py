@@ -169,7 +169,7 @@ class ConversationContextBuilder:
             completion = await self._model_adapter.complete(
                 messages=[{"role": "user", "content": "\n\n".join(sections)}],
                 tools=[],
-                model=settings.LLM_MODEL,
+                model=settings.utility_model,
                 temperature=0.2,
                 max_tokens=settings.HISTORY_SUMMARY_MAX_TOKENS,
                 purpose="summary",

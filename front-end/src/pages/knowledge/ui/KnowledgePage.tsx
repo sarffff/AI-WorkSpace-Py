@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { RetrievalDebugger } from "@/features/knowledge-debug/ui/RetrievalDebugger";
 import { apiClient } from "@/shared/api/client";
-import type { KnowledgeDocument } from "@/shared/types/api.types";
+import type { KnowledgeDocument, WorkspaceInfo } from "@/shared/types/api.types";
 import { PageHeader } from "@/shared/ui/PageHeader";
 import { toastMessageFrom, useToast } from "@/shared/ui/Toast";
 import {
@@ -14,6 +14,9 @@ import {
     X,
     FlaskConical,
     Layers,
+    Users,
+    KeyRound,
+    RefreshCw,
 } from "lucide-react";
 
 function formatSize(bytes: number): string {
@@ -41,6 +44,20 @@ export const KnowledgePage: React.FC = () => {
     const [dragOver, setDragOver] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const toast = useToast();
+    const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
+
+    // 知识库按工作区共享:admin 管文档,member 只读
+    const isAdmin = workspace?.role === "admin";
+
+    useEffect(() => {
+        apiClient
+            .getWorkspace()
+            .then(setWorkspace)
+            .catch((e) => {
+                toast.error(toastMessageFrom(e, "加载工作区信息失败"));
+            });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     const refreshDocuments = (showSpinner = true) => {
         if (showSpinner) setLoading(true);
@@ -79,10 +96,17 @@ export const KnowledgePage: React.FC = () => {
     };
 
     const uploadFile = async (file: File) => {
+        if (!isAdmin) {
+            toast.error("你是工作区成员，仅管理员可以上传文档");
+            return;
+        }
         setUploading(true);
         setErrorMsg(null);
         try {
-            await apiClient.uploadDocument(file);
+            const res = await apiClient.uploadDocument(file);
+            if (res.duplicate) {
+                toast.info("该文档已在知识库中，未重复索引");
+            }
             refreshDocuments();
         } catch (err) {
             setErrorMsg(err instanceof Error ? err.message : "上传失败");
@@ -106,6 +130,10 @@ export const KnowledgePage: React.FC = () => {
     };
 
     const handleDelete = async (docId: string) => {
+        if (!isAdmin) {
+            toast.error("你是工作区成员，仅管理员可以删除文档");
+            return;
+        }
         if (!window.confirm("确定删除该文档及其向量分块？")) return;
         setDeletingId(docId);
         setErrorMsg(null);
@@ -133,18 +161,25 @@ export const KnowledgePage: React.FC = () => {
                     title="知识库与 RAG"
                     description="文档进库、切块、混合检索。调试页不经过对话，直接看 dense / sparse 命中了什么。"
                     actions={
-                        <button
-                            onClick={handleUploadClick}
-                            disabled={uploading}
-                            className="btn-accent px-4 py-2.5 text-white text-xs font-medium rounded-xl flex items-center gap-2 disabled:opacity-60"
-                        >
-                            {uploading ? (
-                                <Loader2 className="w-4 h-4 animate-spin" />
-                            ) : (
-                                <Upload className="w-4 h-4" />
-                            )}
-                            {uploading ? "上传中..." : "上传文档"}
-                        </button>
+                        isAdmin ? (
+                            <button
+                                onClick={handleUploadClick}
+                                disabled={uploading}
+                                className="btn-accent px-4 py-2.5 text-white text-xs font-medium rounded-xl flex items-center gap-2 disabled:opacity-60"
+                            >
+                                {uploading ? (
+                                    <Loader2 className="w-4 h-4 animate-spin" />
+                                ) : (
+                                    <Upload className="w-4 h-4" />
+                                )}
+                                {uploading ? "上传中..." : "上传文档"}
+                            </button>
+                        ) : (
+                            <span className="px-3 py-2 rounded-xl bg-[#f3f0e6] dark:bg-[#201f1c] border border-[#e3dfd5] dark:border-[#2e2d2a] text-[11px] text-[#6e6b63] dark:text-[#a19f96] flex items-center gap-1.5">
+                                <Users className="w-3.5 h-3.5" />
+                                成员身份 · 知识库只读
+                            </span>
+                        )
                     }
                 />
                 <input
@@ -186,25 +221,37 @@ export const KnowledgePage: React.FC = () => {
                             </div>
                         )}
 
-                        <div
-                            className="drop-zone p-6 text-center anim-fade-up"
-                            data-active={dragOver}
-                            onDragOver={(e) => {
-                                e.preventDefault();
-                                setDragOver(true);
-                            }}
-                            onDragLeave={() => setDragOver(false)}
-                            onDrop={handleDrop}
-                            onClick={handleUploadClick}
-                        >
-                            <Upload className="w-5 h-5 text-[#da7756] mx-auto mb-2" />
-                            <div className="text-xs font-medium text-[#1f1e1d] dark:text-[#edece8]">
-                                拖入文档，或点击选择
+                        {isAdmin ? (
+                            <div
+                                className="drop-zone p-6 text-center anim-fade-up"
+                                data-active={dragOver}
+                                onDragOver={(e) => {
+                                    e.preventDefault();
+                                    setDragOver(true);
+                                }}
+                                onDragLeave={() => setDragOver(false)}
+                                onDrop={handleDrop}
+                                onClick={handleUploadClick}
+                            >
+                                <Upload className="w-5 h-5 text-[#da7756] mx-auto mb-2" />
+                                <div className="text-xs font-medium text-[#1f1e1d] dark:text-[#edece8]">
+                                    拖入文档，或点击选择
+                                </div>
+                                <div className="text-[11px] text-[#918d83] mt-1">
+                                    txt / md / pdf / 代码文件 · 上传后后台切块并向量化
+                                </div>
                             </div>
-                            <div className="text-[11px] text-[#918d83] mt-1">
-                                txt / md / pdf / 代码文件 · 上传后后台切块并向量化
+                        ) : (
+                            <div className="card-surface p-5 text-center anim-fade-up">
+                                <Users className="w-5 h-5 text-[#da7756] mx-auto mb-2" />
+                                <div className="text-xs font-medium text-[#1f1e1d] dark:text-[#edece8]">
+                                    共享知识库（{workspace?.name ?? "…"}）
+                                </div>
+                                <div className="text-[11px] text-[#918d83] mt-1">
+                                    文档由工作区管理员维护，全体成员可检索
+                                </div>
                             </div>
-                        </div>
+                        )}
 
                         <div className="grid grid-cols-3 gap-4 anim-fade-up stagger-1">
                             <StatCard
@@ -225,6 +272,24 @@ export const KnowledgePage: React.FC = () => {
                                 icon={<ShieldCheck className="w-4 h-4" />}
                             />
                         </div>
+
+                        <WorkspacePanel
+                            workspace={workspace}
+                            onRegenerate={async () => {
+                                try {
+                                    const { inviteCode } =
+                                        await apiClient.regenerateInviteCode();
+                                    setWorkspace(
+                                        (prev) => prev && { ...prev, inviteCode },
+                                    );
+                                    toast.success("邀请码已重置，旧码立即作废");
+                                } catch (e) {
+                                    toast.error(
+                                        toastMessageFrom(e, "重置邀请码失败"),
+                                    );
+                                }
+                            }}
+                        />
 
                         <div className="card-surface rounded-2xl overflow-hidden anim-fade-up stagger-2">
                             <div className="p-4 border-b border-[#e6e2d8] dark:border-[#282724] flex items-center justify-between">
@@ -287,18 +352,21 @@ export const KnowledgePage: React.FC = () => {
                                             >
                                                 {DOCUMENT_STATUS_LABELS[doc.status]}
                                             </span>
-                                            <button
-                                                onClick={() => handleDelete(doc.id)}
-                                                disabled={deletingId === doc.id}
-                                                title="删除文档"
-                                                className="p-1.5 rounded-lg text-[#6e6b63] dark:text-[#a19f96] hover:text-rose-600 hover:bg-rose-500/10 transition-colors disabled:opacity-50"
-                                            >
-                                                {deletingId === doc.id ? (
-                                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                                ) : (
-                                                    <Trash2 className="w-3.5 h-3.5" />
-                                                )}
-                                            </button>
+                                            {isAdmin && (
+                                                <button
+                                                    onClick={() => handleDelete(doc.id)}
+                                                    disabled={deletingId === doc.id}
+                                                    title="删除文档"
+                                                    aria-label={`删除文档 ${doc.name}`}
+                                                    className="p-1.5 rounded-lg text-[#6e6b63] dark:text-[#a19f96] hover:text-rose-600 hover:bg-rose-500/10 transition-colors disabled:opacity-50"
+                                                >
+                                                    {deletingId === doc.id ? (
+                                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                                    ) : (
+                                                        <Trash2 className="w-3.5 h-3.5" />
+                                                    )}
+                                                </button>
+                                            )}
                                         </div>
                                     </div>
                                 ))}
@@ -349,3 +417,99 @@ const StatCard: React.FC<{
         </div>
     </div>
 );
+
+const WorkspacePanel: React.FC<{
+    workspace: WorkspaceInfo | null;
+    onRegenerate: () => void;
+}> = ({ workspace, onRegenerate }) => {
+    const toast = useToast();
+    if (!workspace) return null;
+
+    const copyInviteCode = async () => {
+        if (!workspace.inviteCode) return;
+        try {
+            await navigator.clipboard.writeText(workspace.inviteCode);
+            toast.success("邀请码已复制");
+        } catch {
+            toast.error("复制失败");
+        }
+    };
+
+    return (
+        <div className="card-surface rounded-2xl p-5 anim-fade-up">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5 min-w-0">
+                    <div className="w-9 h-9 rounded-xl bg-[#da7756]/10 text-[#da7756] flex items-center justify-center shrink-0">
+                        <Users className="w-4 h-4" />
+                    </div>
+                    <div className="min-w-0">
+                        <div className="text-xs font-medium text-[#1f1e1d] dark:text-[#edece8] truncate">
+                            {workspace.name}
+                        </div>
+                        <div className="text-[10px] text-[#918d83]">
+                            {workspace.memberCount} 名成员共享此知识库 · 你是
+                            {workspace.role === "admin" ? "管理员" : "成员"}
+                        </div>
+                    </div>
+                </div>
+
+                {workspace.inviteCode && (
+                    <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 bg-[#f3f0e6] dark:bg-[#201f1c] border border-[#e3dfd5] dark:border-[#2e2d2a] rounded-xl px-3 py-1.5">
+                            <KeyRound className="w-3.5 h-3.5 text-[#da7756]" />
+                            <span
+                                className="text-xs font-semibold tracking-widest text-[#1f1e1d] dark:text-[#edece8]"
+                                style={{ fontFamily: "var(--font-mono)" }}
+                            >
+                                {workspace.inviteCode}
+                            </span>
+                            <button
+                                onClick={copyInviteCode}
+                                title="复制邀请码"
+                                aria-label="复制邀请码"
+                                className="p-1 rounded text-[#6e6b63] dark:text-[#a19f96] hover:text-[#da7756] transition-colors"
+                            >
+                                <svg
+                                    className="w-3.5 h-3.5"
+                                    viewBox="0 0 24 24"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="2"
+                                >
+                                    <rect x="9" y="9" width="13" height="13" rx="2" />
+                                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                                </svg>
+                            </button>
+                        </div>
+                        <button
+                            onClick={onRegenerate}
+                            title="重置邀请码（旧码立即作废）"
+                            aria-label="重置邀请码"
+                            className="p-2 rounded-xl text-[#6e6b63] dark:text-[#a19f96] hover:text-[#da7756] hover:bg-[#f3f0e6] dark:hover:bg-[#262522] transition-colors"
+                        >
+                            <RefreshCw className="w-3.5 h-3.5" />
+                        </button>
+                    </div>
+                )}
+            </div>
+
+            {workspace.members.length > 1 && (
+                <div className="flex flex-wrap gap-1.5 mt-3 pt-3 border-t border-[#e6e2d8]/60 dark:border-[#282724]/60">
+                    {workspace.members.map((m) => (
+                        <span
+                            key={m.id}
+                            className={`px-2 py-0.5 rounded-lg text-[10px] ${
+                                m.role === "admin"
+                                    ? "bg-[#da7756]/10 text-[#da7756]"
+                                    : "bg-[#f3f0e6] dark:bg-[#201f1c] text-[#6e6b63] dark:text-[#a19f96]"
+                            }`}
+                        >
+                            {m.name}
+                            {m.role === "admin" ? " · 管理员" : ""}
+                        </span>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+};
