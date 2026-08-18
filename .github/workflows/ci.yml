@@ -43,9 +43,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      - uses: pnpm/action-setup@v2
+        with:
+          version: 11.20.0
       - name: 安装依赖
-        run: npm install --no-audit --no-fund
+        run: pnpm install --frozen-lockfile
       - name: 类型检查
-        run: npx tsc --noEmit
+        run: pnpm tsc --noEmit
       - name: 构建
-        run: npx vite build
+        run: pnpm vite build
