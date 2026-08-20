@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from config import settings
+from config import Settings, settings
 from services import prompt_library
 from services.prompt_library import PromptError
 
@@ -91,6 +91,43 @@ def test_unknown_key_raises():
         prompt_library.get("no_such_prompt")
 
 
+def test_subagent_prompts_are_switchable():
+    """三个角色的版本必须能按配置切,否则 prompt_key 那套机制是空转的。
+
+    没有 setting 时 resolve_version 只剩 default_version 一个出口——新写一版
+    进去没有任何代码路径能到达它,eval 变体也扫不到。
+    """
+    for key in ("agent_researcher", "agent_analyst", "agent_critic"):
+        spec = prompt_library.SPECS[key]
+        assert spec.setting, f"{key} 不可切版本"
+        assert hasattr(settings, spec.setting), f"{spec.setting} 没有对应的配置项"
+
+
+def test_each_role_has_its_own_setting():
+    """共享一个开关就没法单独 A/B 某个角色,动一个会让另两个的结果一起失效。"""
+    settings_used = [
+        prompt_library.SPECS[key].setting
+        for key in ("agent_researcher", "agent_analyst", "agent_critic")
+    ]
+    assert len(set(settings_used)) == 3, settings_used
+
+
+def test_role_prompt_follows_its_setting(monkeypatch):
+    """改配置要真的换到另一版——这是 role_prompt() 唯一的切换入口。"""
+    from services import agent_roles, subagent
+
+    role = agent_roles.ROLES["critic"]
+    spec = prompt_library.SPECS[role.prompt_key]
+
+    # 指向一个不存在的版本：报错说明 setting 真的被读了（而不是静默用默认版）
+    monkeypatch.setattr(settings, spec.setting, "v-nope", raising=False)
+    with pytest.raises(PromptError):
+        subagent.role_prompt(role)
+
+    monkeypatch.setattr(settings, spec.setting, "", raising=False)
+    assert subagent.role_prompt(role) == prompt_library.get(role.prompt_key, "v1").body
+
+
 def test_version_resolution_order(monkeypatch):
     """显式传参 > settings > 契约默认值。"""
     spec = prompt_library.SPECS["chat_system_rag"]
@@ -100,6 +137,42 @@ def test_version_resolution_order(monkeypatch):
 
     monkeypatch.setattr(settings, spec.setting, "", raising=False)
     assert prompt_library.resolve_version("chat_system_rag") == spec.default_version
+
+
+def test_shipped_config_leaves_every_version_setting_empty():
+    """出厂配置必须让第三层可达。
+
+    这些配置项是**覆盖项**,默认版本的唯一事实来源是 SPECS.default_version。
+    在 config.py 里写死具体版本号会让 resolve_version 的第三层对所有带 setting
+    的 key 永远走不到（配置非空就总是赢）,于是同一个版本号在两个文件里各写一遍,
+    改一处不改另一处不会有任何报错。
+
+    读 model_fields 里的类默认值,不读 ``Settings()`` 也不读全局 ``settings``：
+    那两个都会把本机 .env 加载进来,而 .env 里填了什么是用户的选择,不是出厂默认。
+    这条差别本身就踩过一次——Settings() 在有 .env 的机器上根本测不出这个问题。
+    """
+    for key, spec in prompt_library.SPECS.items():
+        if not spec.setting:
+            continue
+        assert Settings.model_fields[spec.setting].default == "", (
+            f"{spec.setting} 在 config.py 里写死了版本号，"
+            f"prompts/{key} 的 default_version 会永远走不到"
+        )
+
+
+def test_default_version_is_reachable_without_any_env(monkeypatch):
+    """把所有版本配置清空（模拟一台没有 .env 的机器），每个 key 都应当解析到
+    自己契约里的默认版本。
+
+    必须 monkeypatch 全局 settings：resolve_version 读的是它，而本机 .env
+    可能已经覆盖过某几项。
+    """
+    for spec in prompt_library.SPECS.values():
+        if spec.setting:
+            monkeypatch.setattr(settings, spec.setting, "", raising=False)
+
+    for key, spec in prompt_library.SPECS.items():
+        assert prompt_library.resolve_version(key) == spec.default_version
 
 
 def test_ref_is_key_at_version():
@@ -112,6 +185,72 @@ def test_catalog_marks_exactly_one_active_version_per_key():
         active = [v for v in entry["versions"] if v["isActive"]]
         assert len(active) == 1, entry["key"]
         assert active[0]["version"] == entry["activeVersion"]
+
+
+def test_delegation_versions_declare_their_mode():
+    """启动校验靠 expects 判断"这一版是为哪种模式写的"，声明漏了就等于放行。"""
+    augment = prompt_library.get("chat_system_rag", "v5-augment")
+    supervisor = prompt_library.get("chat_system_rag", "v6-supervisor")
+
+    assert augment.expects_all("delegation")
+    assert "supervisor" not in augment.expects, "augment 版不能声明 supervisor"
+    assert supervisor.expects_all("delegation", "supervisor")
+
+
+def test_supervisor_version_does_not_promise_tools_it_lacks():
+    """supervisor 模式下检索类工具已被角色收走，正文不能再把它们列成自己的能力。
+
+    这正是旧 v5-supervisor 被弃用的原因：它照抄了 v4 的工具清单。
+    """
+    body = prompt_library.get("chat_system_rag", "v6-supervisor").body
+
+    assert "search_knowledge_base" not in body
+    assert "web_search" not in body
+    assert "delegate" in body
+
+
+def test_deprecated_supervisor_version_is_archived():
+    """名字与内容不符的那一版必须是 archived，否则还会被人配上去。"""
+    assert prompt_library.get("chat_system_rag", "v5-supervisor").status == "archived"
+
+
+def test_workspace_versions_declare_workspace_tools():
+    for version in ("v4-workspace", "v5-augment", "v6-supervisor"):
+        template = prompt_library.get("chat_system_rag", version)
+        assert "workspace-tools" in template.expects, version
+
+
+def test_unknown_expects_value_is_rejected():
+    """拼错的 expects 静默忽略，等于启动校验以为这一版没有前置条件。"""
+    with pytest.raises(PromptError):
+        prompt_library._parse(
+            "---\nstatus: candidate\nexpects: delegatoin\n---\n正文",
+            "chat_system_rag",
+            "vtest",
+        )
+
+
+def test_expects_defaults_to_empty_and_parses_list():
+    plain = prompt_library._parse(
+        "---\nstatus: active\n---\n正文", "chat_system_plain", "vtest"
+    )
+    assert plain.expects == ()
+
+    multi = prompt_library._parse(
+        "---\nstatus: candidate\nexpects: workspace-tools, delegation\n---\n正文",
+        "chat_system_rag",
+        "vtest",
+    )
+    assert multi.expects == ("workspace-tools", "delegation")
+    assert multi.expects_all("delegation", "workspace-tools")
+    assert not multi.expects_all("supervisor")
+
+
+def test_catalog_exposes_expects():
+    entry = next(e for e in prompt_library.catalog() if e["key"] == "chat_system_rag")
+    versions = {v["version"]: v for v in entry["versions"]}
+    assert "delegation" in versions["v5-augment"]["expects"]
+    assert versions["v2"]["expects"] == []
 
 
 def test_lean_version_is_actually_shorter():

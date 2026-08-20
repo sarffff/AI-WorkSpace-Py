@@ -14,7 +14,7 @@ from services.settings_service import (
     save_preferences,
 )
 from services.web_search import web_search_client
-from services import agent_roles, subagent
+from services import agent_roles, approval, subagent
 
 router = APIRouter(prefix="/settings", tags=["设置"])
 
@@ -64,6 +64,15 @@ async def get_settings(
                 else "off",
                 "roles": agent_roles.names() if subagent.enabled() else [],
                 "maxDelegations": app_settings.AGENT_MAX_DELEGATIONS,
+            },
+            # 审批与快照。前端据此决定要不要渲染审批卡片、要不要去查待审批列表——
+            # 关着的时候那两条路径完全不该出现,而不是渲染出来点了没反应。
+            "approval": {
+                "mode": app_settings.AGENT_APPROVAL_MODE
+                if approval.enabled()
+                else "off",
+                "tools": sorted(approval.gated_tools()),
+                "checkpoints": app_settings.AGENT_CHECKPOINT_ENABLED,
             },
         },
     }

@@ -14,6 +14,22 @@
   纯 agentic RAG 到底差多少。
 - ``rounds-3``         轮次上限从 6 砍到 3。如果指标不掉，说明 6 是白给的余量。
 - ``no-guardrail``     抗注入率里有多少是护栏的功劳、多少只是提示词在起作用。
+  它同时也是记忆注入防线（fence + 无指令权限声明）的对照组。
+- ``delegation-*``     委派值不值。这是系统里最贵的功能（每次委派多一个完整的
+  嵌套子代理循环），而它和 tool-history 一样，上线以来没有数字支持过。
+  两个变体分开是因为 augment 与 supervisor 问的不是同一个问题：前者问
+  「模型自己会不会在该委派的时候委派」，后者问「强制分工是否比单代理更好」。
+- ``no-repeat-guard``  重复调用检测的对照组。它是三个新开关里唯一会改变工具
+  调用序列的，所以必须能关掉才量得出它省了多少、有没有误伤。
+- ``no-stable-prefix`` 提示词缓存的对照组。它不改变模型收到的约束内容，只改变
+  那句约束放在系统提示词还是用户消息里，所以要看的是 ``cache_hit_ratio``
+  和成本，不是成功率。
+- ``no-structured-retry`` 结构化输出重试的对照组。
+
+注意子代理的工具调用也会计入 ``expect_tools`` / ``forbid_tools``（见
+``agent_runner`` 里对 ``agent_step`` 的处理）：任务集问的是「这一轮该不该查
+知识库」，而不是「该由谁去查」。谁去查属于委派策略，由 delegate 的出现次数
+与轮次成本体现。
 """
 from __future__ import annotations
 
@@ -43,6 +59,17 @@ _BASE: dict[str, Any] = {
     "AGENT_MAX_TOOL_ROUNDS": 6,
     "TOOL_RESULT_MAX_CHARS": 4000,
     "TOOL_RESULT_TOTAL_CHARS": 12000,
+    # 重复调用检测。必须显式写死:它直接改变工具调用序列(被拦下的那次不执行),
+    # 也就直接改变工具精度、轮次效率和成本。本地 .env 把它关掉的话,
+    # 每个变体都会静默带上另一套循环行为跑,而报告上看不出任何异常。
+    "AGENT_REPEAT_LIMIT": 3,
+    # ---- 提示词缓存 ----
+    # 它改变系统提示词的正文(prefetched 段进不进),因此改变输入 token 与
+    # 模型看到的约束。写死才能保证跨变体可比。
+    "PROMPT_CACHE_STABLE_PREFIX": True,
+    # ---- 结构化输出 ----
+    # 重试会多花一次辅助模型调用,进成本列。写死避免本地配置影响成本对比。
+    "STRUCTURED_OUTPUT_RETRIES": 1,
     # ---- 检索 ----
     "RAG_PREFETCH": True,
     "RAG_HYBRID": True,
@@ -58,6 +85,19 @@ _BASE: dict[str, Any] = {
     # ---- 护栏 ----
     "GUARDRAIL_ENABLED": True,
     "GUARDRAIL_BLOCK_SCORE": 0,
+    # ---- 跨会话长期记忆 ----
+    # 必须显式写死。injection-memory 那个任务靠预置记忆行来测注入防线,而本地
+    # .env 把 MEMORY_ENABLED 关掉的话:记忆压根不注入 → canary 不可能出现 →
+    # 抗注入率满分,同时第二轮的 must_include 会掉。也就是说漏掉这一条时,
+    # 报告会同时给出一个假的满分和一个原因不明的失败。
+    "MEMORY_ENABLED": True,
+    "MEMORY_INJECT_LIMIT": 20,
+    # ---- 多代理 ----
+    # 必须显式写 off。漏掉这一条时,本地 .env 开了委派的话每个变体都会静默带上它
+    # 跑——每次委派多一个完整的嵌套子代理循环,轮次、成本、工具调用全都变了,
+    # 而报告上看不出任何异常。这正是本文件开头那条"关键开关全部写全"要防的事。
+    "AGENT_DELEGATION_MODE": "off",
+    "AGENT_MAX_DELEGATIONS": 3,
     # ---- 提示词 ----
     "PROMPT_CHAT_SYSTEM_VERSION": "v4-workspace",
     # ---- 语义缓存：必须关 ----
@@ -86,7 +126,10 @@ AGENT_VARIANTS: dict[str, AgentVariant] = {
         name="prompt-v2",
         description=(
             "换回 v2 系统提示词：只讲了知识库那三个工具，新工具全靠 schema 的 "
-            "description 撑着。工具选择正确率与输入 token 一起看才有意义"
+            "description 撑着。工具选择正确率与输入 token 一起看才有意义。"
+            "注意它回答的是「四个工具都开着时 v4 值不值这笔固定 token」——"
+            "_BASE 把工具全打开了。产品默认是工具全关，那种配置下 v4 多讲的"
+            "三段策略指向的工具根本不存在，所以这组数字不能拿来定产品默认版本"
         ),
         overrides={**_BASE, "PROMPT_CHAT_SYSTEM_VERSION": "v2"},
     ),
@@ -115,7 +158,9 @@ AGENT_VARIANTS: dict[str, AgentVariant] = {
         name="no-guardrail",
         description=(
             "关掉提示注入护栏。和 baseline 对照才知道抗注入率里"
-            "有多少是护栏的功劳、多少只是提示词在起作用"
+            "有多少是护栏的功劳、多少只是提示词在起作用。"
+            "注意这一版同时也关掉了记忆块的定界与声明（build_system_block 会退回"
+            "一个静态表头），所以它顺带就是记忆注入防线的对照组"
         ),
         overrides={**_BASE, "GUARDRAIL_ENABLED": False},
     ),
@@ -126,6 +171,68 @@ AGENT_VARIANTS: dict[str, AgentVariant] = {
             "同时要盯住其它探针的成功率有没有因为误报而掉下来"
         ),
         overrides={**_BASE, "GUARDRAIL_BLOCK_SCORE": 5},
+    ),
+    # 委派是整个系统里最贵的功能——每次多一个完整的嵌套子代理循环，最坏情况
+    # AGENT_MAX_DELEGATIONS=3 就是三次。它上线以来没有任何数字支持过它，
+    # 和 no-tool-history 当初的处境一样。
+    #
+    # 提示词必须跟着模式换（v5-augment / v6-supervisor），否则 main.py 的启动
+    # 校验会直接拒绝——这里两个变体正好也验证了那套校验和 eval 配置是一致的。
+    "delegation-augment": AgentVariant(
+        name="delegation-augment",
+        description=(
+            "主代理保留全部工具 + delegate，自己判断什么时候派人。"
+            "要看的是：任务成功率有没有提升，以及为此多付了多少轮和多少 token。"
+            "成功率不动而成本上去，就说明这些任务本来不需要委派"
+        ),
+        overrides={
+            **_BASE,
+            "AGENT_DELEGATION_MODE": "augment",
+            "PROMPT_CHAT_SYSTEM_VERSION": "v5-augment",
+        },
+    ),
+    "delegation-supervisor": AgentVariant(
+        name="delegation-supervisor",
+        description=(
+            "专用工具从主代理手里收走，只能委派。分工最干净，代价是简单问题也要"
+            "多付一次子代理循环。和 delegation-augment 对照能看出"
+            "「强制委派」和「自主选择委派」差在哪"
+        ),
+        overrides={
+            **_BASE,
+            "AGENT_DELEGATION_MODE": "supervisor",
+            "PROMPT_CHAT_SYSTEM_VERSION": "v6-supervisor",
+        },
+    ),
+    "no-repeat-guard": AgentVariant(
+        name="no-repeat-guard",
+        description=(
+            "关掉重复调用检测,退回改动前的循环。这是它的对照组:"
+            "``repeatedCalls`` 应当上升(那笔浪费重新出现),``repeatedBlocked`` 归零。"
+            "要看的是任务成功率和轮次效率——如果成功率不动而轮次效率下降,"
+            "检测省下的就是纯浪费;如果成功率跟着掉,说明有任务真的需要重查,"
+            "那时该调高 AGENT_REPEAT_LIMIT 而不是关掉它"
+        ),
+        overrides={**_BASE, "AGENT_REPEAT_LIMIT": 0},
+    ),
+    "no-stable-prefix": AgentVariant(
+        name="no-stable-prefix",
+        description=(
+            "把「已预检索过」那句话放回系统提示词(改动前的行为)。"
+            "系统提示词于是随预检索命中与否在两种正文之间切,前缀缓存跟着作废。"
+            "对照的是 trace 里的 cache_hit_ratio 与成本列,不是任务成功率——"
+            "两版给模型的约束内容一样,只是位置不同"
+        ),
+        overrides={**_BASE, "PROMPT_CACHE_STABLE_PREFIX": False},
+    ),
+    "no-structured-retry": AgentVariant(
+        name="no-structured-retry",
+        description=(
+            "结构化输出校验失败不重试。只在开了多查询改写/重排,或者记忆抽取"
+            "真的返回过不合法 JSON 时才看得出差别——baseline 下大概率完全一致,"
+            "那本身就是有用的信息:说明这几处的输出一直是干净的,重试是白配的保险"
+        ),
+        overrides={**_BASE, "STRUCTURED_OUTPUT_RETRIES": 0},
     ),
 }
 

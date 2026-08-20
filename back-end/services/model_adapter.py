@@ -278,6 +278,29 @@ class OpenAICompatibleAdapter(ModelAdapter):
             return self._build_completion(content, standard_calls)
 
     @staticmethod
+    def _cached_tokens(usage: Any) -> int | None:
+        """读提供商回传的上下文缓存命中量。
+
+        字段是 ``usage.prompt_tokens_details.cached_tokens``(OpenAI 与智谱都用
+        这个形状)。三层都要防:整个 ``prompt_tokens_details`` 可能不存在(老端点)、
+        存在但为 None、或者是个 dict 而不是对象(某些兼容实现不做模型化)。
+
+        取不到时返回 None 而不是 0——"没有缓存信息"和"命中 0 个"是两件事,
+        前者不该被面板算进命中率的分母。
+        """
+        details = getattr(usage, "prompt_tokens_details", None) if usage else None
+        if details is None:
+            return None
+        cached = (
+            details.get("cached_tokens")
+            if isinstance(details, dict)
+            else getattr(details, "cached_tokens", None)
+        )
+        if not isinstance(cached, int) or isinstance(cached, bool) or cached < 0:
+            return None
+        return cached
+
+    @staticmethod
     def _record_usage(
         span: Any,
         usage: Any,
@@ -291,14 +314,23 @@ class OpenAICompatibleAdapter(ModelAdapter):
         if prompt_tokens is None and completion_tokens is None:
             prompt_tokens, completion_tokens = _estimate_usage(messages, output_text)
             source = TokenSource.ESTIMATED
+            # 估算路径下不报缓存命中:本地估算根本不知道提供商那边命中了什么,
+            # 填 0 会被面板读成"这次一点没命中"。
+            cached_tokens = None
         else:
             source = TokenSource.PROVIDER
+            cached_tokens = OpenAICompatibleAdapter._cached_tokens(usage)
         span.set_usage(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             source=source,
             model=model,
+            cached_tokens=cached_tokens,
         )
+        # 命中率进 attributes 而不是只留原始数:排查"缓存到底有没有生效"时看的是
+        # 比例,而 prompt_tokens 每轮都在变,两个绝对数摆在一起看不出趋势。
+        if cached_tokens is not None and prompt_tokens:
+            span.set(cache_hit_ratio=round(cached_tokens / prompt_tokens, 4))
 
     @staticmethod
     def _build_request(

@@ -186,6 +186,21 @@ export interface ServerCapabilities {
   toolHistory: boolean;
   /** 旧版后端不返回这一块 */
   delegation?: DelegationCapability;
+  /** 旧版后端不返回这一块 */
+  approval?: ApprovalCapability;
+}
+
+/**
+ * 人工审批的配置。``mode`` 为 "off" 时后端不会发出 approval_required，
+ * 界面上就不该出现审批卡片，也不该去查待审批列表。
+ */
+export interface ApprovalCapability {
+  /** off = 不审批；write = 写操作要人点同意；listed = 由服务端白名单决定 */
+  mode: "off" | "write" | "listed";
+  /** 实际受审批的工具名 */
+  tools: string[];
+  /** 快照是否开启。关着的话审批不可能生效（恢复要跨请求） */
+  checkpoints: boolean;
 }
 
 /**
@@ -265,6 +280,9 @@ export interface StreamChunk {
     | "cache_hit"
     | "agent_step"
     | "agent_state"
+    | "approval_required"
+    | "approval_resolved"
+    | "clarification"
     | "done"
     | "error";
   content?: string;
@@ -291,6 +309,27 @@ export interface StreamChunk {
   /** agent_state 携带：子代理做过的工具步骤数，以及是否因轮次用尽而截断 */
   steps?: number;
   truncated?: boolean;
+  /**
+   * approval_required / approval_resolved / agent_state 携带：执行记录 id。
+   * 审批要靠它调 POST /chats/runs/{runId}/resume——中断活在数据库里，
+   * 不活在那条已经断掉的 SSE 连接里，所以这个 id 是唯一的接续凭证。
+   */
+  runId?: string;
+  /**
+   * approval_required 携带：给人看的参数预览。
+   * 已在服务端过 mask_markup 并截断——这些值是模型写的，可能整段来自它刚抓的网页。
+   */
+  preview?: Record<string, unknown>;
+  /** approval_required 携带：批准之后会发生什么 */
+  reason?: string;
+  /** approval_resolved 携带：这次裁决是同意还是拒绝 */
+  approved?: boolean;
+  /** approval_required 携带：这份快照的 seq，调试用 */
+  checkpoint?: number | null;
+  /** clarification 携带：模型抛回给用户的问题 */
+  question?: string;
+  /** approval_required 携带：这一回合最终回答将要落在哪条 assistant 消息上 */
+  message_id?: string;
   /** SSE 的子代理状态会额外出现 started / completed / failed */
   status?:
     | "ok"
@@ -319,7 +358,6 @@ export interface StreamChunk {
   tokensSaved?: number;
   done?: boolean;
   error?: string;
-  message_id?: string;
 }
 
 /** 检索资料命中提示注入规则时的提示信息 */
@@ -352,14 +390,149 @@ export interface ToolStep {
   agentRole?: string | null;
   /** 子代理自己的工具轮次；``round`` 始终是外层主代理轮次 */
   agentRound?: number;
-  /** 流式期间 tool_start 先到、tool_result 才带回状态，所以会短暂为空 */
-  status?: "ok" | "invalid_arguments" | "unavailable" | "error";
+  /**
+   * 流式期间 tool_start 先到、tool_result 才带回状态，所以会短暂为空。
+   * ``repeated`` = 同参数调用被拦下；``rejected`` = 人工审批被拒，工具没执行。
+   */
+  status?:
+    | "ok"
+    | "invalid_arguments"
+    | "unavailable"
+    | "error"
+    | "repeated"
+    | "rejected";
+  /** 归属的执行记录 id。用来把一条轨迹关联回"这次执行被打断过吗" */
+  runId?: string | null;
   input?: Record<string, unknown>;
   citations?: Citation[];
   /** 结果原文长度。只有落库的轨迹有 */
   resultChars?: number;
   /** 结果摘要，长度受后端 TOOL_HISTORY_STEP_CHARS 约束。只有落库的轨迹有 */
   resultPreview?: string;
+  createdAt?: string | null;
+}
+
+// ========== Agent 线上指标 ==========
+
+/**
+ * 委派 / 审批 / 子代理的线上指标。
+ *
+ * 与离线评估（eval/reports）的分工：这里是**真实流量**上发生的事，样本是用户
+ * 真的问过的问题；那边是固定数据集上的可复现对比。前者回答"线上现在什么情况"，
+ * 后者回答"改这一版有没有变好"。两者都需要，但不能互相替代。
+ */
+export interface AgentMetrics {
+  rangeDays: number;
+  /**
+   * 快照开关。关着的时候 agent_runs 根本不写行，所有数字都是 0——
+   * 界面必须显示"未开启"而不是画一个全零面板，那两件事看起来一样、含义完全不同。
+   */
+  enabled: boolean;
+  delegationMode: string;
+  approvalMode: string;
+  totals: AgentMetricsTotals;
+  byRole: AgentRoleMetrics[];
+  /** 空数组表示埋点关闭（成本与延迟来自 trace_spans） */
+  comparison: DelegationComparison[];
+}
+
+export interface AgentMetricsTotals {
+  runs: number;
+  delegatedRuns: number;
+  delegations: number;
+  /** null = 窗口内没有任何执行。不能显示成 0%，那会被读成"从来不委派" */
+  delegationRate: number | null;
+  interrupts: number;
+  interruptedRuns: number;
+  failedRuns: number;
+  waitingApproval: number;
+  avgRounds: number | null;
+}
+
+export interface AgentRoleMetrics {
+  role: string | null;
+  runs: number;
+  failed: number;
+  failureRate: number | null;
+  avgRounds: number | null;
+}
+
+/**
+ * 委派 vs 未委派的对比。这是整个面板真正要看的东西——
+ * 单看委派率什么都说明不了，得知道它多花了几倍的钱、慢了几倍。
+ */
+export interface DelegationComparison {
+  delegated: boolean;
+  currency: string | null;
+  runs: number;
+  avgRounds: number | null;
+  cost: number | null;
+  avgCost: number | null;
+  promptTokens: number;
+  completionTokens: number;
+  /** 每次回答的平均总耗时（根 span），不是每个 span 的平均 */
+  avgTurnMs: number | null;
+}
+
+// ========== 人工审批与可恢复执行 ==========
+
+/**
+ * 一个卡在审批上的执行。
+ *
+ * 刷新页面之后 SSE 里的 approval_required 已经不存在了，这是唯一能把审批卡片
+ * 找回来的地方——中断活在数据库里，不活在那条连接里。
+ */
+export interface PendingApproval {
+  runId: string;
+  chatId: string;
+  messageId?: string | null;
+  round: number;
+  /** 这次执行被打断过几次。1 以上说明同一回合里有多个写操作 */
+  interrupts: number;
+  updatedAt?: string | null;
+  /** 等待批准的工具名 */
+  tool?: string | null;
+  /** 批准之后会发生什么 */
+  reason: string;
+  /** 参数预览，已在服务端脱敏截断 */
+  preview: Record<string, unknown>;
+}
+
+/** 一次执行的详情。子代理是它的 children */
+export interface AgentRunDetail {
+  runId: string;
+  chatId: string;
+  messageId?: string | null;
+  agentRole?: string | null;
+  status: "running" | "waiting_approval" | "done" | "failed" | "abandoned";
+  rounds: number;
+  delegations: number;
+  interrupts: number;
+  model?: string | null;
+  promptRef?: string | null;
+  traceId?: string | null;
+  errorType?: string | null;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  children: AgentRunChild[];
+  checkpoints: AgentCheckpointInfo[];
+}
+
+export interface AgentRunChild {
+  runId: string;
+  agentRole?: string | null;
+  status: string;
+  rounds: number;
+  errorType?: string | null;
+}
+
+/** 快照目录项。只有元信息——正文是整段 messages，调试接口没理由再吐一遍 */
+export interface AgentCheckpointInfo {
+  seq: number;
+  phase: "pre_tools" | "waiting_approval" | "post_tools";
+  round: number;
+  bytes: number;
+  interrupt?: Record<string, unknown> | null;
   createdAt?: string | null;
 }
 

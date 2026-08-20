@@ -15,6 +15,12 @@ jobs:
       # 必须显式给一个(仅用于测试,不签发任何真实 token)
       JWT_SECRET_KEY: ci-only-secret-key-not-for-production-0123456789
       WORKING_DIR: back-end
+      # 测试需要的最小配置
+      DATABASE_URL: sqlite:///:memory:
+      LLM_API_KEY: test-key
+      LLM_BASE_URL: https://example.invalid/v4/
+      RERANK_API_KEY: test-key
+      RERANK_BASE_URL: https://example.invalid/v4/
     defaults:
       run:
         working-directory: back-end
@@ -30,7 +36,7 @@ jobs:
       - name: 提示词契约校验(模板缺失/占位符漂移直接失败)
         run: python -c "from services import prompt_library; prompt_library.validate()"
       - name: 运行测试
-        run: python -m pytest
+        run: python -m pytest -v --tb=short
 
   frontend:
     name: 前端构建 (tsc + vite)
@@ -42,12 +48,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "20"
       - uses: pnpm/action-setup@v2
         with:
-          version: 9.x
+          version: 9
       - name: 安装依赖
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --ignore-scripts
       - name: 类型检查
         run: pnpm tsc --noEmit
       - name: 构建

@@ -1,6 +1,8 @@
 """BM25 稀疏索引、向量索引与 RRF 融合。"""
 from __future__ import annotations
 
+import pytest
+
 from config import settings
 from models import DocumentChunk
 from services.embedding_service import EmbeddingService
@@ -187,3 +189,100 @@ def test_indexes_fresh_reflects_build_and_invalidation():
 
     invalidate_scope_indexes(user)
     assert indexes_fresh(user, signature) is False
+
+
+# ========== 带权 RRF ==========
+
+
+def test_weights_default_is_bit_identical():
+    """不传 weights 必须和加权之前**逐位相同**。
+
+    这一条不是洁癖:所有既有的评估基线都是用旧实现跑出来的,分数差一个浮点位
+    就没法再和新数字比,而"重构顺手改了融合分数"这种事不会有任何报错。
+    """
+    rankings = [["a", "b", "c"], ["c", "b", "d"]]
+
+    assert reciprocal_rank_fusion(rankings) == reciprocal_rank_fusion(
+        rankings, weights=[1.0, 1.0]
+    )
+
+
+def test_weight_lowers_a_channels_contribution():
+    rankings = [["a", "b"], ["c", "d"]]
+    base = dict(reciprocal_rank_fusion(rankings))
+    weighted = dict(reciprocal_rank_fusion(rankings, weights=[1.0, 0.2]))
+
+    assert weighted["c"] < base["c"]
+    assert weighted["a"] == base["a"]  # 第一路不该被动
+
+
+def test_missing_weights_are_padded_with_one():
+    """多查询改写会让通道数变成动态的(每个改写变体各贡献两路),
+    调用方很难预先算准个数——按 1.0 补齐比抛错好。"""
+    rankings = [["a"], ["b"], ["c"]]
+
+    assert reciprocal_rank_fusion(rankings, weights=[1.0]) == reciprocal_rank_fusion(
+        rankings
+    )
+
+
+def test_zero_weight_channel_still_registers_the_id():
+    """权重为 0 时分数是 0,但 id 仍然进结果集——它在别的通道里可能有分。"""
+    fused = dict(reciprocal_rank_fusion([["a"], ["b"]], weights=[0.0, 1.0]))
+
+    assert fused["a"] == 0.0
+    assert fused["b"] > 0.0
+
+
+# ========== HNSW ==========
+
+
+def _hnsw_available() -> bool:
+    try:
+        import faiss  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(not _hnsw_available(), reason="faiss 未安装,走 numpy 精确路径")
+def test_hnsw_index_returns_cosine_scaled_scores(monkeypatch):
+    """必须用 METRIC_INNER_PRODUCT:向量已经 L2 归一化,内积就是余弦相似度。
+    量纲和 IndexFlatIP 那条路一致,RAG_MIN_SCORE 这个阈值才能在两条路下含义相同
+    ——量纲不一致的 bug 不会报错,只会让阈值静默变成另一个意思。"""
+    monkeypatch.setattr(settings, "VECTOR_ANN", "hnsw")
+    index = VectorIndex()
+    index.build_if_stale(
+        [
+            _chunk("a", "x", [1.0, 0.0]),
+            _chunk("b", "y", [0.0, 1.0]),
+        ],
+        "sig-hnsw",
+    )
+
+    results = index.search([1.0, 0.0], top_k=2)
+
+    assert results
+    assert results[0][1] == "a"
+    assert 0.99 <= results[0][0] <= 1.01
+
+
+@pytest.mark.skipif(not _hnsw_available(), reason="faiss 未安装")
+def test_exact_and_hnsw_agree_on_a_tiny_corpus(monkeypatch):
+    """小库上 HNSW 不该有召回损失。有的话就是参数太激进,
+    而不是"HNSW 不好用"——那时该调 VECTOR_HNSW_EF_SEARCH。"""
+    chunks = [
+        _chunk(f"c{i}", "x", [1.0, i / 10.0]) for i in range(8)
+    ]
+
+    monkeypatch.setattr(settings, "VECTOR_ANN", "exact")
+    exact = VectorIndex()
+    exact.build_if_stale(chunks, "sig-e")
+    exact_ids = [chunk_id for _score, chunk_id in exact.search([1.0, 0.0], top_k=3)]
+
+    monkeypatch.setattr(settings, "VECTOR_ANN", "hnsw")
+    approx = VectorIndex()
+    approx.build_if_stale(chunks, "sig-h")
+    approx_ids = [chunk_id for _score, chunk_id in approx.search([1.0, 0.0], top_k=3)]
+
+    assert set(approx_ids) == set(exact_ids)

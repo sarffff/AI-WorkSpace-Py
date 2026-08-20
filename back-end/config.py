@@ -70,6 +70,13 @@ class Settings(BaseSettings):
     TOOL_RESULT_MAX_CHARS: int = 4000
     # 一次回答中所有工具结果的总字符预算,防止多轮累积撑爆上下文窗口
     TOOL_RESULT_TOTAL_CHARS: int = 12000
+    # 同一个 (工具, 参数) 在一次回答里最多执行几次,第 N 次起不再执行,改为回灌
+    # 一句纠正说明。轮次上限和字符预算都管不到这件事:重复调用每次都是合法调用、
+    # 都在预算内,只是拿回来的东西一模一样。0 表示关闭检测(退回改动前的行为)。
+    #
+    # 为什么算总次数而不是"连续三次":A、B、A、B、A 这种在两个相同查询之间来回
+    # 摆的情况是同一种病,而只看连续完全抓不到它。
+    AGENT_REPEAT_LIMIT: int = 3
 
     # ========== 多代理协作（委派） ==========
     # off        : 单代理,与此前逐位相同(默认)
@@ -85,6 +92,32 @@ class Settings(BaseSettings):
     # 一次回答里最多委派几次。没有这个上限时主代理可以每一轮都派一次人,
     # 而每一次都是一个完整的嵌套循环——AGENT_MAX_TOOL_ROUNDS 管不到它。
     AGENT_MAX_DELEGATIONS: int = 3
+
+    # ========== 状态快照与中断恢复 ==========
+    # 关掉即退回"一个回合的状态只活在 SSE 生成器的局部变量里":连接一断就没了,
+    # 也就没有人工审批(它要跨请求)、没有重放、没有 agent_runs 记录。
+    #
+    # 打开的代价是实打实的:每轮工具执行前写一份快照,而快照就是整个 messages
+    # 列表。六轮下来几十 KB,所以有 AGENT_CHECKPOINT_KEEP 兜着。
+    AGENT_CHECKPOINT_ENABLED: bool = False
+    # 每个 run 保留最近几份快照,0 表示不清理。留多份是为了重放("回到第 3 轮
+    # 再跑一次"),只留最新一份的话恢复就只有"继续"一个方向。
+    AGENT_CHECKPOINT_KEEP: int = 8
+    # 等待审批的执行多久算废弃(小时)。超时的 run 不会自动执行也不会自动拒绝,
+    # 只是从"待审批"列表里消失——自动裁决比一直挂着更危险。
+    AGENT_APPROVAL_TIMEOUT_HOURS: int = 24
+
+    # ========== 人工审批 ==========
+    # off    : 不审批(默认)。破坏性操作仍受确认令牌约束(见 workspace_tools)
+    # write  : 写操作要人点一下同意(save_to_knowledge_base / delete_knowledge_document)
+    # listed : 完全由 AGENT_APPROVAL_TOOLS 决定,一个都不隐含
+    #
+    # 依赖 AGENT_CHECKPOINT_ENABLED:审批要等用户在**另一个请求**里点同意,
+    # 没有快照就没有东西可恢复。两个都开才生效。
+    AGENT_APPROVAL_MODE: str = "off"
+    # listed 模式下的工具名,逗号分隔。给 web_search 加审批能立刻看出
+    # "每一步都要点同意"的体验代价——这件事讲道理讲不清,试一次就清楚了。
+    AGENT_APPROVAL_TOOLS: str = ""
 
     # ========== 工具轨迹（跨回合记忆） ==========
     # 回合内工具结果是靠 messages 回灌的,回合结束那个列表就没了,落库的只有
@@ -129,6 +162,29 @@ class Settings(BaseSettings):
     WEB_SEARCH_SNIPPET_CHARS: int = 300
     WEB_SEARCH_TIMEOUT_SECONDS: float = 10.0
 
+    # ========== 工具调用外围约束 ==========
+    # 单个工具在一次回答里连续失败（参数错误或通道故障）多少次后，从本轮 schema
+    # 里移除，之后模型再调它只会得到一句"已熔断"。0 表示关闭。
+    #
+    # 连续而不是累计：偶尔一次参数写错很常见，熔断针对的是"同一个工具反复失败"——
+    # 那才是幻觉或通道故障的信号，继续让它试只会把剩下的轮次烧光。而它的处置是
+    # **移除 schema** 而不是拒绝执行：模型根本看不到这个工具，就不会再发起调用，
+    # 比"每轮都试一次、每次都拿回一句拒绝"更省轮次，也更好观测。
+    TOOL_CIRCUIT_BREAKER_FAILURES: int = 2
+    # 删除知识库文档。破坏性写操作，默认关闭；打开后还要求用户在对话里明确说过
+    # 要删（确认令牌，见 workspace_tools._ToolApprovals），缺一不执行。
+    TOOL_DELETE_KNOWLEDGE_ENABLED: bool = False
+    # 澄清工具：模型拿不准用户意图或关键参数缺失时，把问题抛回给用户，而不是
+    # 硬猜一个参数去调工具。代价是每个澄清问题要等用户回话，回合在此终止。
+    TOOL_ASK_USER_ENABLED: bool = False
+    # 网页抓取：把模型给出的 URL 抓成纯文本再过护栏。和 web_search 的区别是
+    # 抓正文而不是看摘要，SSRF 面也因此更大，默认关闭。
+    TOOL_WEB_FETCH_ENABLED: bool = False
+    # 单个页面允许读取的字节上限（超出即判失败）与注入上下文的字符上限
+    WEB_FETCH_MAX_BYTES: int = 200 * 1024
+    WEB_FETCH_MAX_CHARS: int = 8000
+    WEB_FETCH_TIMEOUT_SECONDS: float = 10.0
+
     # ========== 视觉 ==========
     # 能接收 image_url 内容块的模型白名单(逗号分隔)。留空即关闭多模态,
     # 图片仍以 Markdown 链接留在提示词里(也就是模型看不见)。
@@ -139,12 +195,65 @@ class Settings(BaseSettings):
     # 一轮最多带几张。图片按面积折算 token,一张高清图能顶几千字
     VISION_MAX_IMAGES: int = 4
 
+    # ========== 摄取层清洗 ==========
+    # 脏输入不是"质量差一点",它会让召回通道整条失效:GBK 文档被 errors="replace"
+    # 变成一串 U+FFFD 之后,retrieval_index.tokenize() 两个正则都匹配不到,BM25
+    # 建索引时直接跳过整块——稀疏通道彻底看不见这篇文档,而状态还是 indexed。
+    # 关掉即退回改动前的行为(硬 utf-8 解码 + PyPDF2 纯文本抽取),作为对照组。
+    INGEST_CLEAN: bool = True
+    # 非 utf-8 文档的解码先验(逗号分隔,按顺序严格试)。
+    #
+    # 为什么需要先验而不是纯靠嗅探:同一串中文字节在 GB18030 / EUC-KR / Shift-JIS
+    # 下**都能严格解通**,从字节本身分辨不了,任何检测器都不行——实测一段 GBK 短句
+    # 会被 charset-normalizer 判成 EUC-KR,解出来是一串谚文。而猜错编码时解出的文本
+    # 没有任何替换符,INGEST_MIN_TEXT_RATIO 那道自检也抓不到它。
+    #
+    # gb18030 是 GBK / GB2312 的超集,一条就够。代价说清楚:一份真正的韩文文档会被
+    # 当成中文解错。对这个项目(中文语料、中文用户)这是正确的取舍,但它是取舍。
+    INGEST_ENCODING_HINTS: str = "gb18030"
+    # 用 pdfplumber 的字号与坐标恢复标题层级、剔页眉页脚、修词内空格。
+    # 这是让 chunking 那四件事对 PDF 重新生效的唯一途径:PyPDF2 只给字符串,
+    # 没有字号,标题层级怎么正则都推不出来。关掉则走 PyPDF2 纯文本路径。
+    INGEST_PDF_STRUCTURE: bool = True
+    # 可读字符占比低于此值即判 failed。默认 0.6 而不是更高:中英混排文档里
+    # 偶发的几个替换符不该让整篇文档进不了库,而真正的编码错误会低到接近 0。
+    INGEST_MIN_TEXT_RATIO: float = 0.6
+    # 页眉页脚的判据是"在至少这么多页的相同边缘区域重复出现"。
+    # 按位置单独判会把首页正文第一行也剔掉,所以必须要有跨页重复这个条件。
+    INGEST_HEADER_FOOTER_MIN_PAGES: int = 3
+    # 索引完成后随机抽一块做一次自检索,命中不了自己就记一条 warning。
+    # 这是把"索引成功"的判据从"没抛异常"换成"真的检索得到"——静默失败的那几种
+    # (空文本、乱码、维度不匹配)全都不抛异常。代价是每篇文档多一次 embedding 调用。
+    INGEST_SELF_CHECK: bool = True
+    # 评估语料的降级方式:none | pdf_like | gbk_bytes | scanned(见 eval/corpus_degrade.py)。
+    # 只影响离线评估,线上永远是 none。
+    #
+    # 它存在的理由是一个盲区:eval/corpus/ 下 6 篇是自造的干净 utf-8 Markdown,
+    # 于是这套评估**量不出任何清洗改动的价值**——清洗代码根本没有输入可清。
+    # 降级把干净语料变成"真实上传"的样子,再和清洗开关配对跑,差值就是清洗值多少。
+    EVAL_CORPUS_DEGRADE: str = "none"
+
     # ========== 分块配置 ==========
     # token 计数器: heuristic(零依赖估算) | tiktoken(精确,需额外安装且首次会下载词表)
     TOKEN_COUNTER: str = "heuristic"
     CHUNK_MAX_TOKENS: int = 320
     # 仅在单个超长块被硬切时生效;跨段落上下文由检索阶段的邻域扩展补全
     CHUNK_OVERLAP_TOKENS: int = 40
+    # 分块策略: structural | semantic
+    #   structural — 按 Markdown 结构(标题层级、代码围栏、段落)切,默认,零成本。
+    #   semantic   — 按句切开后算相邻句向量的余弦距离,在距离突变处断开。
+    #                好处是话题真正转折的地方才断,而不是恰好写了个空行的地方;
+    #                代价是入库时每篇文档多一批 embedding 调用。
+    #
+    # 为什么不做 late chunking:那需要 token 级 hidden states 再按块池化,而
+    # /embeddings 每条输入只返回一个池化后的向量,hosted API 拿不到 token 级输出。
+    CHUNK_STRATEGY: str = "structural"
+    # 相邻句距离取这个分位数作断点阈值。95 表示只在最"跳"的那 5% 处断开。
+    # 用分位数而不是绝对阈值:余弦距离的绝对值随 embedding 模型变,换个模型
+    # 绝对阈值就得重调,而分位数是自适应的。
+    CHUNK_SEMANTIC_PERCENTILE: float = 95.0
+    # 语义分块的最小句数。太短的文档没有可统计的距离分布,直接走 structural
+    CHUNK_SEMANTIC_MIN_SENTENCES: int = 6
 
     # ========== 检索管线 ==========
     # 稠密向量 + BM25 双路召回后用 RRF 融合。关闭则退化为纯向量检索,便于对照
@@ -160,6 +269,72 @@ class Settings(BaseSettings):
     RAG_RERANK: bool = False
     RAG_RERANK_CANDIDATES: int = 20
     RAG_RERANK_SNIPPET_CHARS: int = 500
+    # 重排方式: off | llm | api
+    #   llm — 现有的 LLM listwise:把候选编号列给通用模型让它排序。留着当对照组,
+    #         能量出"专用 cross-encoder 比让通用模型排序好多少"。
+    #   api — 专用 rerank 接口(智谱 /rerank)。query 与 document 拼在一起过一遍
+    #         模型输出标量相关度,这是它比稠密检索准的原因:稠密是 bi-encoder,
+    #         两侧各自独立编码,编码时从未见过对方。
+    # 留空则按 RAG_RERANK 布尔量决定(True → llm),保持现有变体与测试不变。
+    RAG_RERANK_MODE: str = ""
+    RERANK_MODEL: str = "rerank"
+    # 留空回退 LLM_BASE_URL / LLM_API_KEY —— 智谱的 rerank 和对话共用凭证
+    RERANK_BASE_URL: str = ""
+    RERANK_API_KEY: str = ""
+    RERANK_TIMEOUT_SECONDS: float = 10.0
+
+    # HyDE(Hypothetical Document Embeddings):先让辅助模型编一段假答案,拿它去
+    # 检索。反直觉但有效——用户的问题和文档的措辞常常不在同一个语域("报销要几天"
+    # vs "费用审批时限"),而一段假答案的措辞天然更接近文档。
+    #
+    # 关键实现约束:假答案**只喂稠密通道**,BM25 继续用原始 query。两路都换等于
+    # 亲手废掉稀疏通道:假答案里的专有名词、编号、错别字全是模型编的,拿它做字面
+    # 匹配只会命中一堆无关内容。
+    RAG_HYDE: bool = False
+    RAG_HYDE_MAX_TOKENS: int = 200
+    # 查询路由:让辅助模型判断这个查询偏字面还是偏语义,据此调整两路的 RRF 权重。
+    # eval 数据集的 probe 标注(lexical / paraphrase / table_lookup ...)天生就是
+    # 这个分类器的标注集,所以它的准确率是可测的,不用凭感觉。
+    RAG_QUERY_ROUTE: bool = False
+    # RRF 的默认通道权重。路由关闭时两路都是 1.0,与改动前逐位相同。
+    RAG_RRF_DENSE_WEIGHT: float = 1.0
+    RAG_RRF_SPARSE_WEIGHT: float = 1.0
+    # 路由判定为偏字面/偏语义时,弱侧通道的权重降到多少
+    RAG_ROUTE_WEAK_WEIGHT: float = 0.4
+
+    # ========== 向量存储 ==========
+    # memory | qdrant
+    #
+    # memory 是进程内 FAISS/numpy 索引:按工作区隔离、按签名失效、每次进程重启
+    # 从 MySQL 重建。它的限制很具体——**多 worker 部署时每个 worker 各建一份**,
+    # 于是一次上传之后哪个 worker 能检索到取决于请求打到了谁身上。
+    #
+    # qdrant 把向量搬成持久态:多 worker 共享、重启不丢、带 payload 过滤的 ANN。
+    # 默认仍是 memory,切换是显式动作——它需要一个跑着的服务
+    # (docker-compose.qdrant.yml),而"配置默认值悄悄要求一个外部依赖"是很坏的默认。
+    VECTOR_STORE: str = "memory"
+    # exact | hnsw。只作用于 memory 后端。
+    #
+    # exact 是暴力扫描(IndexFlatIP / numpy 矩阵乘),召回率恒为 100%。
+    # hnsw 是近似最近邻,拿召回率换延迟——**在当前语料规模下它只会更差**:
+    # 几千个向量的暴力扫描本来就是毫秒级,而 HNSW 引入了图构建开销和召回损失。
+    # 它存在的意义是让"ANN 的代价"变成一个能量出来的数(recall@5 与 avgRetrievalMs
+    # 一起看),而不是一句"到了大规模就该上 ANN"的口号。
+    VECTOR_ANN: str = "exact"
+    # HNSW 参数。M 是每个节点的出边数,ef_construction 是建图时的候选池大小,
+    # ef_search 是查询时的候选池大小——三者都是"更大=更准更慢"。
+    # 它们同时作用于 memory/hnsw 与 qdrant 两个后端,概念是同一套。
+    VECTOR_HNSW_M: int = 16
+    VECTOR_HNSW_EF_CONSTRUCT: int = 100
+    VECTOR_HNSW_EF_SEARCH: int = 64
+
+    QDRANT_URL: str = "http://localhost:6333"
+    QDRANT_API_KEY: str = ""
+    # 单 collection,workspace_id 存在 payload 里并建索引,查询时按它过滤。
+    # 不做 collection-per-workspace:那会随用户数线性增长,而 Qdrant 的每个
+    # collection 都有固定的内存与文件开销。
+    QDRANT_COLLECTION: str = "ai_workspace_chunks"
+    QDRANT_TIMEOUT_SECONDS: float = 5.0
 
     # ========== 对话历史 ==========
     # 历史消息的 token 预算(不含系统提示词、当前问题与预留的输出空间)
@@ -204,8 +379,54 @@ class Settings(BaseSettings):
     # 实际正文在 back-end/prompts/<key>/<version>.md,这里只选用哪一版。
     # 之所以做成配置项:提示词是改动最频繁的那部分"代码",而"换一版提示词"
     # 必须能像换检索开关一样被 eval/variants.py 扫,否则只能靠感觉调词。
-    PROMPT_CHAT_SYSTEM_VERSION: str = "v2"
-    PROMPT_EVAL_ANSWER_VERSION: str = "v1"
+    #
+    # **默认值一律留空,它们是覆盖项而不是默认项。** 每一版的默认版本写在
+    # prompt_library.SPECS 的 default_version 里——那儿紧挨着该 key 的占位符契约
+    # 和用途说明,是唯一的事实来源。
+    #
+    # 这里曾经写死过具体版本号(比如 "v2"),后果是 resolve_version 那条
+    # "显式传入 > settings > 契约默认值"的三层顺序里,第三层对**所有**带 setting
+    # 的 key 都永远走不到:配置项非空,它就总是赢。于是 default_version 成了死字段,
+    # 而同一个版本号在两个文件里各写一遍,改一处不改另一处不会有任何报错。
+    #
+    # 留空之后 .env 里写 PROMPT_CHAT_SYSTEM_VERSION= 也等于"用契约默认值",
+    # 这个语义正是想要的。
+    PROMPT_CHAT_SYSTEM_VERSION: str = ""
+    PROMPT_EVAL_ANSWER_VERSION: str = ""
+    # 子代理提示词的版本。三个角色各自一项——共享一个开关就没法单独 A/B 某个
+    # 角色,动一个会让另两个的结果一起失效。
+    #
+    # 没有这三项之前,``role_prompt()`` 唯一的出口是 SPECS 里的 default_version,
+    # 也就是说新版本只能靠改源码才能生效,eval 变体扫不到它——``prompt_key``
+    # 那套版本化机制是空转的。
+    PROMPT_AGENT_RESEARCHER_VERSION: str = ""
+    PROMPT_AGENT_ANALYST_VERSION: str = ""
+    PROMPT_AGENT_CRITIC_VERSION: str = ""
+
+    # ========== 提示词缓存（provider 侧上下文缓存） ==========
+    # 智谱等 OpenAI 兼容端点的上下文缓存是**隐式**的:没有 cache_control 断点、
+    # 没有请求参数,提供商自己识别与之前请求相同的前缀并复用那部分计算,命中的
+    # token 按标准价打折计费(智谱文档写的是约 50%)。因此工程上能做的只有一件事:
+    # **让前缀真的逐字一致**。
+    #
+    # 开启后系统提示词按 prefetched=False 渲染,"已预检索过、不要重复检索"这句话
+    # 改从用户消息里给(预检索没命中时那句提示本来就走这条路,见 chat_service)。
+    # 关掉即回到改动前的行为——那时 messages[0] 会随预检索命中与否在两种正文之间
+    # 来回切,而它是整个前缀的第一条消息,一变就是整段缓存作废。
+    #
+    # 留成开关而不是直接删掉模板里的 [[if prefetched]]:那一版条件段是"要不要在
+    # 系统提示词里讲预检索"的对照组,和 TOOL_HISTORY_ENABLED / RAG_PREFETCH 一样,
+    # 旧行为必须仍然跑得起来才能量出这个改动值多少。
+    PROMPT_CACHE_STABLE_PREFIX: bool = True
+
+    # ========== 结构化输出 ==========
+    # 模型输出解析/校验失败时的重试次数。重试会把 Pydantic 的报错原文回灌给模型
+    # 让它自己改——和工具参数校验失败时回灌 INVALID_ARGUMENTS 是同一个套路。
+    # 0 表示不重试(解析失败即按各调用方的降级路径处理)。
+    #
+    # 默认只给 1 次:这些都是辅助任务(改写/重排/记忆抽取),失败的代价是"这次
+    # 增强没生效",而不是回答出错。重试三次的钱花在主回答上更划算。
+    STRUCTURED_OUTPUT_RETRIES: int = 1
 
     # ========== 时区 ==========
     # 应用写入 naive DATETIME 列时使用的时区偏移(小时)。必须与数据库服务器的

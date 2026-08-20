@@ -32,6 +32,13 @@
    的工具轨迹被回灌之后才答得上来——这正是第一步做的事，而此前没有任何数字
    量过它。数据集的形状因此必须是 ``turns``。
 
+6. **长期记忆靠预置，不靠真实抽取。** 抽取挂在 ``chat_router`` 的异步触发上，
+   这套评估直接驱动 ``chat_service``，那条路不会跑；而即便接进来，"这句话该不该
+   记成记忆"由辅助模型决定，注入防线的对照组每次形状都会不同。所以任务可以声明
+   ``seed_memories`` 直接写行，量的是"记忆已经在库里了，模型会不会照它说的做"。
+   代价要说清楚：抽取侧那层防线（把针对助手行为的要求排除在 preference 之外）
+   不在这套评估的覆盖范围内，它只有单元测试。
+
 4. **温度固定 0.0。** 产品默认 0.7，但那会让同一个变体跑两次得到不同的工具序列，
    变体之间的差异被方差盖掉。代价要说清楚：这里量的是贪心决策路径，
    不是平均行为；线上真实表现会比这更抖。
@@ -47,6 +54,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import inspect
@@ -63,9 +71,10 @@ from eval.runner import (
     ensure_corpus,
     ensure_eval_user,
 )
-from models import Document, MessageToolStep, TraceSpan
+from models import Document, MessageToolStep, TraceSpan, UserMemory
 from services import prompt_library
 from services.chat_service import ChatService
+from services.clock import naive_now
 from services.knowledge_service import KnowledgeService
 from services.model_adapter import OpenAICompatibleAdapter
 from services.retrieval_index import invalidate_scope_indexes
@@ -115,6 +124,14 @@ class AgentTask:
     # 搜索通道行为：ok / empty / fail，见 agent_stubs
     stub_mode: str = "ok"
     title: str = ""
+    # 跑这个任务之前预先写进 user_memories 的行，每项 {kind, content}。
+    #
+    # 为什么要预置而不是让真实抽取产生：抽取是 chat_router 里的异步触发，
+    # 这套评估直接驱动 chat_service，那条路根本不会跑。就算把它接进来，
+    # 抽取要不要把某句话记成记忆本身由辅助模型决定——注入防线的对照组会
+    # 因此每次形状都不一样。预置把变量固定成一条：**这行记忆已经在库里了，
+    # 模型会不会照它说的做。** 这正好是 fence + 声明这层防线负责的事。
+    seed_memories: list[dict[str, str]] = field(default_factory=list)
 
 
 def load_tasks(limit: int | None = None, path: str | None = None) -> list[AgentTask]:
@@ -150,6 +167,13 @@ def load_tasks(limit: int | None = None, path: str | None = None) -> list[AgentT
                     use_rag=bool(raw.get("use_rag", True)),
                     stub_mode=raw.get("stub_mode", "ok"),
                     title=raw.get("title", ""),
+                    seed_memories=[
+                        {
+                            "kind": str(item.get("kind") or "fact"),
+                            "content": str(item["content"]),
+                        }
+                        for item in (raw.get("seed_memories") or [])
+                    ],
                 )
             )
     return tasks[:limit] if limit else tasks
@@ -169,6 +193,10 @@ class TurnOutcome:
     order_ok: bool | None
     round_efficiency: float | None
     repeated_calls: int
+    # 被 RepeatGuard 拦下、没有真正执行的次数。与 repeated_calls 分开看:
+    # 后者量的是"模型重复了几次"(检测关掉时那笔浪费的基线),这里量的是
+    # "拦住了几次"。两个数一起才说得清检测有没有生效、以及它拦的是不是同一批。
+    repeated_blocked: int
     keyword_coverage: float
     avoid_hits: int
     guardrail_hits: int
@@ -216,6 +244,13 @@ def preflight() -> list[str]:
         )
     if "trace_spans" not in tables:
         problems.append("缺少 trace_spans 表，token 与成本列会全部为 0。")
+    if "user_memories" not in tables:
+        # 注入路径(chat_service 里 MEMORY_ENABLED 那段)没有 try/except，
+        # 缺表会让**每一轮**都抛，不只是 injection_memory 这一个任务。
+        problems.append(
+            "缺少 user_memories 表——先执行 alembic upgrade head。"
+            "记忆注入没有兜底，缺表会让每一轮都直接失败。"
+        )
     if not os.path.isdir(CORPUS_DIR):
         problems.append(f"语料目录不存在：{CORPUS_DIR}")
     if not settings.LLM_API_KEY:
@@ -275,8 +310,13 @@ def _evidence(db: Any, chat_id: str) -> tuple[str, int]:
             if row.round_index == PREFETCH_ROUND
             else f"第 {row.round_index} 轮"
         )
+        # 带上执行者。不标的话委派模式下裁判看到的是一串扁平的工具调用，
+        # 分不清"researcher 查到了这个"和"主代理自己查到了这个"——而这正是
+        # 判断委派有没有起作用要看的第一件事。单代理模式下 agent_role 为空，
+        # 渲染结果与此前逐字相同。
+        who = f" [{row.agent_role} 子代理]" if row.agent_role else ""
         blocks.append(
-            f"[{where}] {row.tool_name}({row.arguments or '{}'}) → {row.status}\n"
+            f"[{where}]{who} {row.tool_name}({row.arguments or '{}'}) → {row.status}\n"
             f"{row.result_content or '（无内容）'}"
         )
     return "\n\n".join(blocks), len(rows)
@@ -336,9 +376,30 @@ async def _drive_turn(
                         "input": event.get("input") or {},
                     }
                 )
+        elif kind == "agent_step" and event.get("phase") == "tool_start":
+            # 子代理的工具调用。不记的话委派模式下的指标会谎报:supervisor 模式里
+            # researcher 真的检索了,但 expect_tools=["search_knowledge_base"] 会
+            # 算成 recall=0——那是"指标看不到",不是"模型没做"。
+            #
+            # 对现有变体是空操作:它们的 AGENT_DELEGATION_MODE 是 off,不会有
+            # agent_step 事件。所以这条不会改动任何已跑出来的基线数字。
+            #
+            # 记成普通调用而不是单独一列,是因为任务集问的是"这一轮该不该查知识库",
+            # 而不是"该由谁去查"。谁去查属于委派策略,由 delegate 自己的出现次数
+            # 和轮次成本体现。
+            calls.append(
+                {
+                    "tool": event.get("tool", ""),
+                    "round": int(event.get("round") or 0),
+                    "input": event.get("input") or {},
+                    "agent": str(event.get("agent") or ""),
+                }
+            )
         elif kind == "tool_result":
             if int(event.get("round") or 0) != PREFETCH_ROUND:
                 statuses.append(str(event.get("status") or ""))
+        elif kind == "agent_step" and event.get("phase") == "tool_result":
+            statuses.append(str(event.get("status") or ""))
         elif kind == "guardrail":
             guardrail_hits += 1
         elif kind == "error":
@@ -391,6 +452,7 @@ async def _drive_turn(
         guardrail_hits=guardrail_hits,
         unavailable_calls=sum(1 for status in statuses if status == "unavailable"),
         invalid_calls=sum(1 for status in statuses if status == "invalid_arguments"),
+        repeated_blocked=sum(1 for status in statuses if status == "repeated"),
         errors=errors,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
@@ -398,6 +460,45 @@ async def _drive_turn(
         currency=currency,
         latency_ms=latency_ms,
     )
+
+
+def _purge_memories(db: Any) -> int:
+    """清掉伪用户名下所有长期记忆，返回删除条数。
+
+    记忆是**按用户**存的，不按会话——所以它跨任务、跨变体存活，和
+    ``_sweep_written_documents`` 处理的是同一个问题：评估的每次运行都必须从
+    同一个已知状态出发。一次中断的运行留下的一行记忆，会被后面每个任务、
+    每个变体读到，而报告上看不出任何异常。
+
+    因此这里在**播种之前也要清一遍**，不能只在结束时清。
+    """
+    rows = db.query(UserMemory).filter(UserMemory.user_id == EVAL_USER_ID).all()
+    for row in rows:
+        db.delete(row)
+    if rows:
+        db.commit()
+    return len(rows)
+
+
+def _seed_memories(db: Any, items: list[dict[str, str]], chat_id: str) -> None:
+    """把任务声明的记忆行写进库。
+
+    ``created_at`` 逐条递增：注入是按 created_at 倒序取的（"新说的压过旧说的"），
+    全部写成同一时刻的话顺序就由数据库返回顺序决定，模型看到的块次序会在不同
+    机器上不一样。差 1 秒足够定序，也不会撞上 MEMORY_INJECT_LIMIT。
+    """
+    base = naive_now()
+    for offset, item in enumerate(items):
+        db.add(
+            UserMemory(
+                user_id=EVAL_USER_ID,
+                kind=item["kind"],
+                content=item["content"],
+                chat_id=chat_id,
+                created_at=base + timedelta(seconds=offset),
+            )
+        )
+    db.commit()
 
 
 def _sweep_written_documents(db: Any) -> list[str]:
@@ -441,6 +542,15 @@ async def run_task(
     try:
         ensure_eval_user(db)
         chat = await service.create_chat(db, user_id=EVAL_USER_ID, title=f"eval:{task.id}")
+        # 每个任务都先清空记忆,不只是声明了 seed_memories 的那些:留下的行会被
+        # 后面每个任务读到,而绝大多数任务并不预期库里有记忆。
+        stale = _purge_memories(db)
+        if stale:
+            logger.warning(
+                "%s: 清掉了 %s 条残留记忆——上一次运行中断过", task.id, stale
+            )
+        if task.seed_memories:
+            _seed_memories(db, task.seed_memories, chat.id)
         outcomes: list[TurnOutcome] = []
         with agent_stubs.stub_web_search(task.stub_mode) as stub:
             for spec in task.turns:
@@ -487,6 +597,12 @@ async def run_task(
             evidence_steps=evidence_steps,
         )
     finally:
+        # 记忆先清:它挂在用户身上,不会随对话一起删。放在 finally 里是因为
+        # 任务中途抛异常时留下的行会污染后面所有任务。
+        try:
+            _purge_memories(db)
+        except Exception as exc:
+            logger.warning("memory cleanup failed for %s: %s", task.id, type(exc).__name__)
         if chat is not None:
             try:
                 await service.delete_chat(db, chat.id)
@@ -546,6 +662,7 @@ def summarize(variant: AgentVariant, results: list[TaskResult]) -> dict[str, Any
         "roundEfficiency": metrics.mean(efficiency_values),
         "avgRounds": metrics.mean([float(out.rounds) for _spec, out in pairs]),
         "repeatedCalls": sum(out.repeated_calls for _spec, out in pairs),
+        "repeatedBlocked": sum(out.repeated_blocked for _spec, out in pairs),
         "keywordCoverage": metrics.mean(keyword_values),
         # 硬要求：任何一次都算违规，所以报总数而不是比率
         "forbiddenCalls": sum(out.forbidden_hits for _spec, out in pairs),
@@ -653,6 +770,7 @@ def _turn_detail(spec: TurnSpec, outcome: TurnOutcome) -> dict[str, Any]:
         "orderOk": outcome.order_ok,
         "roundEfficiency": outcome.round_efficiency,
         "repeatedCalls": outcome.repeated_calls,
+        "repeatedBlocked": outcome.repeated_blocked,
         "keywordCoverage": outcome.keyword_coverage,
         "avoidHits": outcome.avoid_hits,
         "guardrailHits": outcome.guardrail_hits,
@@ -695,6 +813,9 @@ async def run(
                 # 命中不了的查询会以 stubMisses 出现，靠这一列去调数据集
                 "stubQueries": result.stub_queries,
                 "stubMisses": result.stub_misses,
+                # 预置的记忆原样留下：这个任务失败时第一件要确认的事就是
+                # "模型当时到底看到了什么"，而它不在对话里、也不在工具轨迹里
+                "seedMemories": result.task.seed_memories,
                 "turns": [
                     _turn_detail(spec, outcome)
                     for spec, outcome in zip(result.task.turns, result.turns)

@@ -2,16 +2,19 @@
 
 一次检索的完整链路：
 
-    查询改写(可选) -> 稠密召回 + BM25 召回 -> RRF 融合 -> 重排(可选) -> 邻域扩展
+    查询路由(可选) -> HyDE(可选) -> 查询改写(可选)
+      -> 稠密召回 + BM25 召回 -> 带权 RRF 融合 -> 重排(可选) -> 邻域扩展
 
 每一环都能单独关掉，方便对照观察各自的贡献。默认只开"免费"的部分：混合召回、
-RRF、邻域扩展；改写和重排各多一次模型调用，默认关闭，按需在配置里打开。
+RRF、邻域扩展；路由、HyDE、改写、重排各多一次模型调用，默认关闭，按需在配置里打开。
+
+**两条通道拿到的查询可以不一样，这是有意的。** HyDE 的假答案只喂稠密通道，
+BM25 永远用原始 query：假答案里的专有名词与编号全是模型编的，拿它做字面匹配
+只会命中一堆无关内容，等于亲手废掉稀疏通道。
 """
 from __future__ import annotations
 
-import json
 import logging
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,8 +22,11 @@ from sqlalchemy.orm import Session, defer
 
 from config import settings
 from models import Document, DocumentChunk
+from services import structured
+from services import vector_store
 from services.embedding_service import EmbeddingService
 from services.guardrails import ScanReport, guard, mask_markup
+from services.rerank import RerankError, rerank_client
 from services.telemetry import SpanKind, tracer
 from services.retrieval_index import (
     BM25Index,
@@ -33,7 +39,22 @@ from services.retrieval_index import (
 
 logger = logging.getLogger("retriever")
 
-_JSON_ARRAY_RE = re.compile(r"\[.*?\]", re.DOTALL)
+# 通道标签。带权 RRF 要靠它把权重对上通道，字符串写错不会报错、只会静默错配，
+# 所以集中在这里定义一次。
+_DENSE = "dense"
+_SPARSE = "sparse"
+
+
+def rerank_mode() -> str:
+    """当前生效的重排方式。
+
+    ``RAG_RERANK_MODE`` 留空时回落到布尔量 ``RAG_RERANK``，于是既有的 ``rerank``
+    变体和 ``test_retriever.py`` 都不用改一个字——旧开关仍然是有效入口。
+    """
+    mode = (settings.RAG_RERANK_MODE or "").strip().lower()
+    if mode in ("off", "llm", "api"):
+        return mode
+    return "llm" if settings.RAG_RERANK else "off"
 
 
 @dataclass(slots=True)
@@ -85,20 +106,6 @@ def format_context(chunks: list[RetrievedChunk]) -> str:
         )
     guard.record(report, kind="retrieval")
     return guard.fence("\n".join(parts), label="参考资料")
-
-
-def _parse_json_array(text: str) -> list[Any]:
-    """从模型输出里抠出第一个 JSON 数组。模型爱加解释性文字，直接 loads 会炸。"""
-    if not text:
-        return []
-    match = _JSON_ARRAY_RE.search(text)
-    if not match:
-        return []
-    try:
-        value = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return []
-    return value if isinstance(value, list) else []
 
 
 class HybridRetriever:
@@ -156,10 +163,12 @@ class HybridRetriever:
             top_k=top_k,
             hybrid=settings.RAG_HYBRID,
             multi_query=settings.RAG_MULTI_QUERY,
-            rerank=settings.RAG_RERANK,
+            rerank=rerank_mode(),
+            hyde=settings.RAG_HYDE,
+            query_route=settings.RAG_QUERY_ROUTE,
             context_window=settings.RAG_CONTEXT_WINDOW,
         ) as span:
-            results = await self._retrieve(db, workspace_id, query, top_k)
+            results = await self._retrieve(db, workspace_id, query, top_k, span)
             span.set(
                 hits=len(results),
                 channels=sorted({c for r in results for c in r.channels}) or None,
@@ -171,7 +180,12 @@ class HybridRetriever:
             return results
 
     async def _retrieve(
-        self, db: Session, workspace_id: str, query: str, top_k: int = 5
+        self,
+        db: Session,
+        workspace_id: str,
+        query: str,
+        top_k: int = 5,
+        span: Any = None,
     ) -> list[RetrievedChunk]:
         # 先用 id 集合签名判断索引是否新鲜:新鲜则跳过 embedding 大字段的
         # 拉取与重建,热路径的检索成本不再随库规模线性增长
@@ -180,43 +194,72 @@ class HybridRetriever:
             return []
         signature = signature_from_ids(chunk_ids)
         fresh = indexes_fresh(workspace_id, signature)
-        rows = self._load_rows(db, workspace_id, with_embeddings=not fresh)
+        # Qdrant 后端下稠密通道不再需要 embedding 列——向量在 Qdrant 里,MySQL 这份
+        # 只是给回填脚本用的。BM25 只要 content,所以整个热路径都不必碰那个大字段。
+        store = vector_store.get_store()
+        on_qdrant = vector_store.uses_qdrant()
+        rows = self._load_rows(
+            db, workspace_id, with_embeddings=not fresh and not on_qdrant
+        )
 
         chunks = [chunk for chunk, _document in rows]
         by_id = {chunk.id: (chunk, document) for chunk, document in rows}
         indexes = get_scope_indexes(workspace_id)
-        indexes.vector.build_if_stale(chunks, signature)
+        if not on_qdrant:
+            indexes.vector.build_if_stale(chunks, signature)
         if settings.RAG_HYBRID:
             indexes.bm25.build_if_stale(chunks, signature)
 
         safe_top_k = max(1, min(top_k, 20))
         per_channel = max(safe_top_k, settings.RAG_CANDIDATES_PER_CHANNEL)
+
+        route = await self._route_query(query)
+        if span is not None and route is not None:
+            # 记进 span 才能事后和 eval 的 probe 标注对一遍——那是这个分类器
+            # 现成的标注集,不必凭感觉判断路由准不准
+            span.set(route_intent=route.intent)
+        dense_weight = route.dense_weight if route else settings.RAG_RRF_DENSE_WEIGHT
+        sparse_weight = route.sparse_weight if route else settings.RAG_RRF_SPARSE_WEIGHT
+
+        # 稠密通道用的查询可以和字面通道不一样:HyDE 只作用于前者
+        dense_seed = await self._hyde_query(query)
+        if span is not None and dense_seed != query:
+            span.set(hyde_applied=True)
+
         queries = await self._expand_queries(query)
+        dense_queries = (
+            [dense_seed, *queries[1:]] if dense_seed != query else list(queries)
+        )
 
         rankings: list[list[str]] = []
+        weights: list[float] = []
         dense_scores: dict[str, float] = {}
         channels: dict[str, set[str]] = {}
 
-        for text in queries:
-            dense = await self._dense_search(text, indexes.vector, per_channel)
+        for position, text in enumerate(queries):
+            dense = await self._dense_search(
+                dense_queries[position], store, workspace_id, per_channel
+            )
             if dense:
                 rankings.append([chunk_id for _score, chunk_id in dense])
+                weights.append(dense_weight)
                 for score, chunk_id in dense:
                     dense_scores[chunk_id] = max(dense_scores.get(chunk_id, -1.0), score)
-                    channels.setdefault(chunk_id, set()).add("dense")
+                    channels.setdefault(chunk_id, set()).add(_DENSE)
             if settings.RAG_HYBRID:
                 sparse = self._sparse_search(text, indexes.bm25, per_channel)
                 if sparse:
                     rankings.append([chunk_id for _score, chunk_id in sparse])
+                    weights.append(sparse_weight)
                     for _score, chunk_id in sparse:
-                        channels.setdefault(chunk_id, set()).add("sparse")
+                        channels.setdefault(chunk_id, set()).add(_SPARSE)
 
         if not rankings:
             return []
 
         fused = [
             (chunk_id, score)
-            for chunk_id, score in reciprocal_rank_fusion(rankings)
+            for chunk_id, score in reciprocal_rank_fusion(rankings, weights=weights)
             if chunk_id in by_id
         ]
         if not fused:
@@ -227,8 +270,66 @@ class HybridRetriever:
         selected = ordered_ids[:safe_top_k]
         return self._expand(selected, fusion_scores, dense_scores, channels, by_id)
 
+    async def _route_query(self, query: str) -> structured.QueryRoute | None:
+        """判断查询偏字面还是偏语义。失败返回 None（调用方用默认权重）。"""
+        if not settings.RAG_QUERY_ROUTE:
+            return None
+        prompt = (
+            "判断下面这个检索问题该偏重哪种召回方式，只输出 JSON 对象。\n"
+            "- lexical：包含精确的编号、错误码、API 名、专有名词，字面匹配更重要\n"
+            "- semantic：改述式提问，措辞和文档大概率不同，语义相似更重要\n"
+            "- mixed：两者都有\n"
+            '格式：{"intent": "lexical"}，不要任何解释。\n\n'
+            f"问题：{query}"
+        )
+        result, _report = await structured.request_structured(
+            self._get_model_adapter(),
+            schema=structured.QueryRoute,
+            prompt=prompt,
+            model=settings.utility_model,
+            purpose="query_route",
+            array=False,
+            temperature=0.0,
+            max_tokens=32,
+        )
+        return result
+
+    async def _hyde_query(self, query: str) -> str:
+        """让模型编一段假答案当稠密检索的输入。失败就用原查询。
+
+        为什么这招有用：用户的问题和文档的措辞常常不在同一个语域——"报销要几天"
+        对应的文档写的是"费用审批时限"。稠密检索比的是问题向量和文档向量，而一段
+        假答案的措辞天然更接近文档，等于把查询先搬到文档所在的那片向量空间。
+
+        假答案的**事实正确性完全无关**：它不进上下文、不给用户看，只用来向量化。
+        """
+        if not settings.RAG_HYDE:
+            return query
+        prompt = (
+            "为下面这个问题写一段听起来像是从公司内部文档里摘出来的答案，"
+            "两三句话，用文档式的书面措辞和术语。不确定的细节可以编，"
+            "这段文字只用于检索、不会展示给任何人。\n"
+            '只输出 JSON：{"answer": "..."}，不要任何解释。\n\n'
+            f"问题：{query}"
+        )
+        result, _report = await structured.request_structured(
+            self._get_model_adapter(),
+            schema=structured.HypotheticalAnswer,
+            prompt=prompt,
+            model=settings.utility_model,
+            purpose="hyde",
+            array=False,
+            temperature=0.3,
+            max_tokens=settings.RAG_HYDE_MAX_TOKENS,
+        )
+        if result is None:
+            return query
+        # 原查询拼在前面而不是整个替换掉：假答案可能整段跑偏，留着原查询
+        # 至少保证向量里还有用户真正问的那件事
+        return f"{query}\n{result.answer}"
+
     async def _dense_search(
-        self, query: str, index: VectorIndex, limit: int
+        self, query: str, store: Any, workspace_id: str, limit: int
     ) -> list[tuple[float, str]]:
         try:
             vector = await self._embedding.embed_query(query)
@@ -237,12 +338,17 @@ class HybridRetriever:
             return []
         if not vector:
             return []
+        try:
+            hits = await store.search(workspace_id, vector, limit)
+        except Exception as exc:
+            # 向量库故障不该让整次检索失败:BM25 那一路还在,退化成纯稀疏检索
+            # 仍然能答对不少问题,比抛 500 好
+            logger.warning("vector store search failed: %s", type(exc).__name__)
+            return []
         # 相关度下限只作用于稠密通道：余弦相似度有绝对含义，BM25 分数没有。
-        return [
-            (score, chunk_id)
-            for score, chunk_id in index.search(vector, top_k=limit)
-            if score >= settings.RAG_MIN_SCORE
-        ]
+        # 两个后端的分数都是余弦相似度（Qdrant 侧用 Distance.COSINE），
+        # 所以这个阈值在两边含义相同。
+        return [(score, chunk_id) for score, chunk_id in hits if score >= settings.RAG_MIN_SCORE]
 
     @staticmethod
     def _sparse_search(
@@ -266,24 +372,21 @@ class HybridRetriever:
             '只输出 JSON 字符串数组，例如 ["查询1", "查询2"]，不要任何解释。\n\n'
             f"问题：{query}"
         )
-        try:
-            completion = await self._get_model_adapter().complete(
-                messages=[{"role": "user", "content": prompt}],
-                tools=[],
-                model=settings.utility_model,
-                temperature=0.3,
-                max_tokens=256,
-                purpose="query_rewrite",
-            )
-        except Exception as exc:
-            logger.warning("query rewrite failed: %s", type(exc).__name__)
+        result, _report = await structured.request_structured(
+            self._get_model_adapter(),
+            schema=structured.QueryVariants,
+            prompt=prompt,
+            model=settings.utility_model,
+            purpose="query_rewrite",
+            array=True,
+            temperature=0.3,
+            max_tokens=256,
+        )
+        if result is None:
+            # 改写是增强不是依赖:失败就用原查询单路召回
             return [query]
 
-        variants = [
-            item.strip()
-            for item in _parse_json_array(completion.content)
-            if isinstance(item, str) and item.strip() and item.strip() != query
-        ]
+        variants = [item for item in result.items if item != query]
         return [query, *variants[:count]]
 
     async def _maybe_rerank(
@@ -292,58 +395,96 @@ class HybridRetriever:
         ordered_ids: list[str],
         by_id: dict[str, tuple[DocumentChunk, Document]],
     ) -> list[str]:
-        """LLM listwise 重排。
+        """重排。按 ``RAG_RERANK_MODE`` 分派到 cross-encoder 或 LLM listwise。
 
-        RRF 只看排名，无法判断"字面命中但语义无关"。让模型直接读候选片段做一次
-        重排，代价是一次额外调用。生产上更常用专门的 cross-encoder rerank 服务，
-        这里用 LLM 顶上，好处是不引入新依赖。
+        RRF 只看排名，无法判断"字面命中但语义无关"，所以精排这一步有真实价值。
+        两种实现的区别是学习上的重点：
+
+        - ``api`` 走专用 cross-encoder：query 与 document 拼在一起过一遍模型，
+          输出标量相关度。它比稠密检索准的原因就在这里——稠密是 bi-encoder，
+          两侧各自独立编码，编码时从未见过对方。代价是没法预先索引，只能精排。
+        - ``llm`` 让通用模型输出一个编号顺序。留着当对照组，用来量前者好多少。
         """
-        if not settings.RAG_RERANK or len(ordered_ids) < 2:
+        mode = rerank_mode()
+        if mode == "off" or len(ordered_ids) < 2:
             return ordered_ids
 
         limit = max(2, settings.RAG_RERANK_CANDIDATES)
         candidates = ordered_ids[:limit]
         tail = ordered_ids[limit:]
+        snippets = [
+            (by_id[chunk_id][0].content or "")[: settings.RAG_RERANK_SNIPPET_CHARS]
+            for chunk_id in candidates
+        ]
 
-        passages = []
-        for position, chunk_id in enumerate(candidates, start=1):
-            chunk, _document = by_id[chunk_id]
-            snippet = (chunk.content or "")[: settings.RAG_RERANK_SNIPPET_CHARS]
-            passages.append(f"[{position}] {snippet}")
+        if mode == "api":
+            reranked = await self._rerank_via_api(query, candidates, snippets)
+        else:
+            reranked = await self._rerank_via_llm(query, candidates, snippets)
 
+        if not reranked:
+            # 重排失败就用融合序。这一步只改顺序不改召回集合,退回去是安全的
+            return ordered_ids
+        # 模型漏掉的候选保持原相对顺序追加在后面，避免重排把召回变成筛除
+        seen = set(reranked)
+        rest = [chunk_id for chunk_id in candidates if chunk_id not in seen]
+        return reranked + rest + tail
+
+    async def _rerank_via_api(
+        self, query: str, candidates: list[str], snippets: list[str]
+    ) -> list[str]:
+        """专用 rerank 接口。未配置或请求失败都退回融合序。"""
+        if not rerank_client.configured:
+            # 不静默退回 llm：那会让报告里的 rerank=api 与实际跑的东西不一致，
+            # 而"api 和 llm 差多少"正是这个变体要量的
+            logger.warning("rerank mode=api but the endpoint is not configured")
+            return []
+        try:
+            scored = await rerank_client.rerank(query, snippets)
+        except RerankError:
+            return []
+        return [candidates[index] for index, _score in scored]
+
+    async def _rerank_via_llm(
+        self, query: str, candidates: list[str], snippets: list[str]
+    ) -> list[str]:
+        """LLM listwise 重排。生产上更常用专门的 cross-encoder（见 mode=api），
+        这里保留作对照组，好处是不引入新依赖也不需要额外配置。"""
+        passages = [
+            f"[{position}] {snippet}"
+            for position, snippet in enumerate(snippets, start=1)
+        ]
         prompt = (
             "下面是候选参考片段。请按与问题的相关程度从高到低排序，"
             "完全不相关的片段直接省略。只输出片段编号组成的 JSON 数组，"
             "例如 [3, 1, 5]，不要任何解释。\n\n"
             f"问题：{query}\n\n" + "\n\n".join(passages)
         )
-        try:
-            completion = await self._get_model_adapter().complete(
-                messages=[{"role": "user", "content": prompt}],
-                tools=[],
-                model=settings.utility_model,
-                temperature=0.0,
-                max_tokens=256,
-                purpose="rerank",
-            )
-        except Exception as exc:
-            logger.warning("rerank failed: %s", type(exc).__name__)
-            return ordered_ids
+        result, _report = await structured.request_structured(
+            self._get_model_adapter(),
+            schema=structured.RerankOrder,
+            prompt=prompt,
+            model=settings.utility_model,
+            purpose="rerank",
+            array=True,
+            temperature=0.0,
+            max_tokens=256,
+        )
+        if result is None:
+            return []
 
         seen: set[str] = set()
         reranked: list[str] = []
-        for value in _parse_json_array(completion.content):
-            if not isinstance(value, int) or not 1 <= value <= len(candidates):
+        for value in result.items:
+            # 上界在这里查而不是在契约里:能给到几号取决于本次的候选个数,
+            # 那是调用方才有的信息。越界编号是模型编的,丢掉就行。
+            if value > len(candidates):
                 continue
             chunk_id = candidates[value - 1]
             if chunk_id not in seen:
                 seen.add(chunk_id)
                 reranked.append(chunk_id)
-        if not reranked:
-            return ordered_ids
-        # 模型漏掉的候选保持原相对顺序追加在后面，避免重排把召回变成筛除
-        rest = [chunk_id for chunk_id in candidates if chunk_id not in seen]
-        return reranked + rest + tail
+        return reranked
 
     @staticmethod
     def _expand(

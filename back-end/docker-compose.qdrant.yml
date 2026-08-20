@@ -1,0 +1,36 @@
+# Qdrant —— 只在 VECTOR_STORE=qdrant 时需要
+#
+# 放在 back-end/ 下而不是仓库根：这是后端的一个可选依赖，不是整个项目的部署编排。
+#
+#   docker compose -f docker-compose.qdrant.yml up -d
+#   python scripts/backfill_qdrant.py     # 向量已经在 MySQL 里，一次性回填
+#
+# 不跑这个服务也能用：VECTOR_STORE 默认 memory，走进程内 FAISS/numpy 索引。
+# 配了 qdrant 但服务连不上时会打一条警告并降级回 memory，不会 500——
+# 和「web_search 没配就不注册工具」「faiss 缺失就走 numpy」是同一套约定。
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: ai-workspace-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # REST，QDRANT_URL 指这个
+      - "6334:6334"   # gRPC
+    volumes:
+      # 具名卷而不是绑定挂载：向量在这里是**持久态**，容器重建不该丢。
+      # 这正是搬到 Qdrant 换来的东西之一，用临时存储等于把它扔掉。
+      - qdrant_storage:/qdrant/storage
+    environment:
+      # 本地开发不设 key。暴露到公网时必须设，并同步 QDRANT_API_KEY——
+      # Qdrant 默认无鉴权，一个开着 6333 的实例等于把整个知识库向量公开。
+      QDRANT__SERVICE__API_KEY: ""
+    healthcheck:
+      # 用 /readyz 而不是 /healthz：后者在集合还没加载完时就已经返回 200，
+      # 于是回填脚本可能在它真正能接收写入之前就开始 upsert。
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  qdrant_storage:

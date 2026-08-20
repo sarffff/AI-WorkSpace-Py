@@ -28,9 +28,10 @@ from typing import Any
 from config import settings
 from database import SessionLocal
 from eval import metrics
+from eval.corpus_degrade import degrade_corpus_file
 from eval.judge import AnswerJudge, JudgeVerdict
 from eval.variants import Variant
-from models import Document
+from models import Document, User
 from services.knowledge_service import KnowledgeService
 from services.model_adapter import OpenAICompatibleAdapter
 from services.pricing import estimate_cost
@@ -59,7 +60,6 @@ def ensure_eval_user(session: Any) -> None:
     在库里留一个口令固定的账号，比外键报错糟得多。``is_active=False`` 是第二道。
     """
     from auth import get_password_hash
-    from models import User
 
     from services import workspace_service
 
@@ -145,13 +145,24 @@ def load_cases(
 
 
 def _chunking_fingerprint() -> str:
-    """分块结果只由这几个设置决定；它们不变就不必重新索引。"""
+    """分块结果只由这几个设置决定；它们不变就不必重新索引。
+
+    ``corpus_degrade`` 也在里面：降级方式换了，语料内容就换了，而它不是
+    "分块配置"却同样决定了库里躺着什么。不并进指纹的话第二个脏语料变体会命中
+    上一个变体留下的索引——测的是上一次的配置，正是文档名带指纹这个设计要防的
+    那类静默错误。
+    """
     payload = json.dumps(
         {
             "chunk_max": settings.CHUNK_MAX_TOKENS,
             "chunk_overlap": settings.CHUNK_OVERLAP_TOKENS,
             "counter": settings.TOKEN_COUNTER,
             "embedding": settings.EMBEDDING_MODEL,
+            "degrade": settings.EVAL_CORPUS_DEGRADE,
+            # 清洗开关也进指纹:dirty-pdf-like 和 dirty-pdf-like+clean 用的是
+            # 同一份脏语料,但清洗后落库的正文完全不同
+            "clean": settings.INGEST_CLEAN,
+            "pdf_structure": settings.INGEST_PDF_STRUCTURE,
         },
         sort_keys=True,
     )
@@ -159,13 +170,18 @@ def _chunking_fingerprint() -> str:
 
 
 async def ensure_corpus(knowledge: KnowledgeService) -> tuple[int, bool]:
-    """确保评估语料已按当前分块配置索引好。
+    """确保评估语料已按当前分块配置与降级方式索引好。
 
-    文档名里带上分块指纹，于是「换了分块配置」自动表现为「另一批文档」：
-    旧的删掉、新的重建，不会出现「测的是上一个配置留下的索引」这种静默错误。
-    返回 (分块总数, 是否重建过)。
+    文档名里带上指纹，于是「换了分块配置」或「换了降级方式」自动表现为
+    「另一批文档」：旧的删掉、新的重建，不会出现「测的是上一个配置留下的索引」
+    这种静默错误。返回 (分块总数, 是否重建过)。
+
+    金标准按 ``expected_documents`` 里的**原始文件名**标注，所以降级换掉的后缀
+    要在文档名里保留原名 + 新后缀（``hr-handbook.md.txt#指纹``），由
+    ``_document_label`` 还原回去。
     """
     fingerprint = _chunking_fingerprint()
+    degrade = settings.EVAL_CORPUS_DEGRADE
     session = SessionLocal()
     try:
         ensure_eval_user(session)
@@ -191,14 +207,30 @@ async def ensure_corpus(knowledge: KnowledgeService) -> tuple[int, bool]:
         invalidate_scope_indexes(eval_user.workspace_id)
 
         total_chunks = 0
+        rejected: list[str] = []
         for name in files:
-            with open(os.path.join(CORPUS_DIR, name), "rb") as handle:
-                content = handle.read()
+            with open(os.path.join(CORPUS_DIR, name), "r", encoding="utf-8") as handle:
+                source = handle.read()
+            payload, suffix = degrade_corpus_file(source, degrade)
+            upload_name = name if suffix == ".md" else f"{name}{suffix}"
             document = await knowledge.upload_document(
-                session, f"{name}#{fingerprint}", content,
+                session, f"{upload_name}#{fingerprint}", payload,
                 eval_user.workspace_id, uploader_id=EVAL_USER_ID,
             )
             total_chunks += document.chunks
+            # 入库自检把文档判成 failed 时必须说出来。不说的话表现是召回率
+            # 集体归零,看起来像检索坏了——而实际上是语料根本没进库,
+            # 这恰恰是 dirty-* 变体**预期**的结果之一(scanned 就该全军覆没)。
+            if document.status != "indexed":
+                rejected.append(f"{upload_name}({document.status})")
+        if rejected:
+            logger.warning(
+                "[degrade=%s] 入库自检拒收 %s/%s 篇: %s",
+                degrade,
+                len(rejected),
+                len(files),
+                ", ".join(rejected),
+            )
         return total_chunks, True
     finally:
         session.close()
@@ -210,8 +242,19 @@ def _eval_workspace_id(session: Any) -> str:
 
 
 def _document_label(name: str) -> str:
-    """去掉分块指纹后缀，还原成金标准里标注的文件名。"""
-    return name.split("#", 1)[0]
+    """去掉指纹与降级后缀，还原成金标准里标注的文件名。
+
+    降级会改后缀（``hr-handbook.md`` → ``hr-handbook.md.txt``），因为
+    ``chunking._looks_like_markdown`` 会看扩展名——不改的话"PDF 没有标题层级"
+    这个损伤会被扩展名兜回来，测出来的差值是假的。而金标准按原始文件名标注，
+    所以这里必须把后缀摘掉，否则**所有** ``expected_documents`` 都对不上，
+    召回率集体归零，看起来像检索坏了。
+    """
+    base = name.split("#", 1)[0]
+    for suffix in (".txt", ".pdf"):
+        if base.endswith(suffix) and base.count(".") > 1:
+            return base[: -len(suffix)]
+    return base
 
 
 def _span_totals(trace: Any) -> tuple[int, int, float | None, str | None]:
@@ -223,7 +266,9 @@ def _span_totals(trace: Any) -> tuple[int, int, float | None, str | None]:
 
     by_currency: dict[str, float] = {}
     for span in trace.spans:
-        cost = estimate_cost(span.model, span.prompt_tokens, span.completion_tokens)
+        cost = estimate_cost(
+            span.model, span.prompt_tokens, span.completion_tokens, span.cached_tokens
+        )
         if cost is None:
             continue
         by_currency[cost.currency] = by_currency.get(cost.currency, 0.0) + float(

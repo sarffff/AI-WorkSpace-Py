@@ -25,6 +25,9 @@ import type {
   MessageFeedback,
   FeedbackSummary,
   ToolStep,
+  AgentMetrics,
+  PendingApproval,
+  AgentRunDetail,
 } from "../types/api.types";
 
 /**
@@ -378,42 +381,41 @@ export class ApiClient {
   }
 
   /**
-   * 流式对话 (SSE)
-   * POST /chats/completions/stream
-   * @returns AsyncGenerator yielding StreamChunk objects
+   * 发起一个 SSE 请求并在 401 时刷新 token 重试一次。
+   *
+   * 普通对话与审批恢复共用它：两者都是"POST 一个 JSON、读回一串 data: 行"，
+   * 解析逻辑抄第二遍的话，以后往流里加字段就得改两处，漏一处的症状是
+   * 恢复之后轨迹少了几步——而且只在用过审批的会话里出现，很难对上原因。
    */
-  async *streamMessage(
-    request: ChatRequest,
+  private async openStream(
+    path: string,
+    body: unknown,
     signal?: AbortSignal,
-  ): AsyncGenerator<StreamChunk, void, undefined> {
-    // 流式请求需要先确保 token 有效,如果 401 则先刷新
+  ): Promise<Response> {
     let headers = this.getHeaders();
+    const send = () =>
+      fetch(`${this.baseUrl}${path}`, {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal,
+      });
 
-    let response = await fetch(`${this.baseUrl}/chats/completions/stream`, {
-      method: "POST",
-      headers: { ...headers, "Content-Type": "application/json" },
-      body: JSON.stringify(request),
-      signal,
-    });
-
-    // 如果 401 且有 refresh token,尝试刷新后重试
+    let response = await send();
     if (response.status === 401 && this.refreshToken) {
       const newToken = await this.tryRefreshToken();
       if (newToken) {
         headers = { ...headers, Authorization: `Bearer ${newToken}` };
-        response = await fetch(`${this.baseUrl}/chats/completions/stream`, {
-          method: "POST",
-          headers: { ...headers, "Content-Type": "application/json" },
-          body: JSON.stringify(request),
-          signal,
-        });
+        response = await send();
       }
     }
+    return response;
+  }
 
-    if (!response.ok) {
-      throw new Error(`Failed to stream message: ${response.statusText}`);
-    }
-
+  /** 把一条 SSE 响应逐块解析成 StreamChunk */
+  private async *readStream(
+    response: Response,
+  ): AsyncGenerator<StreamChunk, void, undefined> {
     const reader = response.body?.getReader();
     if (!reader) {
       throw new Error("Response body is null");
@@ -456,6 +458,86 @@ export class ApiClient {
     } finally {
       reader.releaseLock();
     }
+  }
+
+  /**
+   * 流式对话 (SSE)
+   * POST /chats/completions/stream
+   */
+  async *streamMessage(
+    request: ChatRequest,
+    signal?: AbortSignal,
+  ): AsyncGenerator<StreamChunk, void, undefined> {
+    const response = await this.openStream(
+      "/chats/completions/stream",
+      request,
+      signal,
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to stream message: ${response.statusText}`);
+    }
+    yield* this.readStream(response);
+  }
+
+  /**
+   * 裁决一次工具审批，并把这一回合接着跑完。
+   * POST /chats/runs/{runId}/resume
+   *
+   * 响应是 SSE，和普通对话同一套事件——区别只在它是从数据库里的快照接上的，
+   * 所以前端可以用同一个渲染循环处理。
+   *
+   * 409 表示这次执行已经不在等待审批（多开了一个标签页、或者刚才点过一次）。
+   * 这种情况不该当成错误弹给用户，调用方据此把卡片收掉即可。
+   */
+  async *resumeRun(
+    runId: string,
+    approved: boolean,
+    note = "",
+    signal?: AbortSignal,
+  ): AsyncGenerator<StreamChunk, void, undefined> {
+    const response = await this.openStream(
+      `/chats/runs/${runId}/resume`,
+      { approved, note },
+      signal,
+    );
+    if (response.status === 409) {
+      throw new Error("STALE_APPROVAL");
+    }
+    if (!response.ok) {
+      throw new Error(`Failed to resume run: ${response.statusText}`);
+    }
+    yield* this.readStream(response);
+  }
+
+  /**
+   * 当前用户所有等待审批的执行
+   * GET /chats/runs/pending
+   *
+   * 刷新页面之后 SSE 里的 approval_required 已经不存在了，这是唯一能把审批
+   * 卡片找回来的入口。
+   */
+  async getPendingApprovals(): Promise<PendingApproval[]> {
+    const response = await this.authedFetch(`${this.baseUrl}/chats/runs/pending`, {
+      method: "GET",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to fetch pending approvals: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 一次执行的详情（含子代理与检查点列表）
+   * GET /chats/runs/{runId}
+   */
+  async getAgentRun(runId: string): Promise<AgentRunDetail> {
+    const response = await this.authedFetch(`${this.baseUrl}/chats/runs/${runId}`, {
+      method: "GET",
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to fetch run: ${response.statusText}`);
+    }
+    return response.json();
   }
 
   /**
@@ -843,6 +925,26 @@ export class ApiClient {
     );
     if (!response.ok) {
       throw new Error(`Failed to fetch usage: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 委派 / 审批 / 子代理的线上指标
+   * GET /metrics/agents
+   *
+   * 与 getUsage 分开而不是塞进同一个接口：用量回答"钱花在哪个环节"，
+   * 这个回答"委派值不值"。两者的分桶维度完全不同（一个按 span，一个按执行），
+   * 合并只能得到一个谁都不好用的响应。
+   */
+  async getAgentMetrics(days?: number): Promise<AgentMetrics> {
+    const query = days ? `?days=${days}` : "";
+    const response = await this.authedFetch(
+      `${this.baseUrl}/metrics/agents${query}`,
+      { method: "GET" },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch agent metrics: ${response.statusText}`);
     }
     return response.json();
   }

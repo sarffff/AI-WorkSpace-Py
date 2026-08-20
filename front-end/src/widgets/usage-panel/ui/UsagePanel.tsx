@@ -3,13 +3,14 @@ import { apiClient } from "@/shared/api/client";
 import type {
   FeedbackSummary,
   TraceDetail,
-  TraceSpanNode,
   TraceSummary,
-  UsageGroup,
   UsageSummary,
 } from "@/shared/types/api.types";
 import { Activity, ChevronRight, Coins, Loader2, Timer } from "lucide-react";
 import { fmtCost, fmtInt, fmtMs, spanLabel } from "@/shared/lib/format";
+import { Metric } from "../components/Metric";
+import { GroupTable } from "../components/GroupTable";
+import { SpanRow } from "../components/SpanRow";
 
 const RANGES = [1, 7, 30] as const;
 
@@ -288,93 +289,3 @@ export const UsagePanel: React.FC = () => {
   );
 };
 
-const Metric: React.FC<{ label: string; value: string; warn?: boolean }> = ({
-  label,
-  value,
-  warn,
-}) => (
-  <div className="rounded-xl bg-[#faf9f5] dark:bg-[#191817] px-3 py-2.5">
-    <div className="text-[10px] text-[#918d83] mb-0.5">{label}</div>
-    <div
-      className={`text-sm font-semibold ${
-        warn ? "text-red-500" : "text-[#1f1e1d] dark:text-[#edece8]"
-      }`}
-    >
-      {value}
-    </div>
-  </div>
-);
-
-const GroupTable: React.FC<{
-  title: string;
-  rows: UsageGroup[];
-  labelOf: (row: UsageGroup) => string;
-}> = ({ title, rows, labelOf }) => {
-  if (!rows.length) return null;
-  return (
-    <div className="space-y-1.5">
-      <h4 className="text-[11px] font-semibold text-[#6e6b63] dark:text-[#a19f96]">
-        {title}
-      </h4>
-      <div className="space-y-0.5">
-        {rows.map((row, index) => (
-          <div
-            key={`${labelOf(row)}-${row.currency ?? ""}-${index}`}
-            className="flex items-center gap-3 px-3 py-1.5 rounded-lg bg-[#faf9f5] dark:bg-[#191817] text-[11px]"
-          >
-            <span className="flex-1 truncate text-[#1f1e1d] dark:text-[#edece8]">
-              {labelOf(row)}
-            </span>
-            <span className="text-[#6e6b63] dark:text-[#a19f96]">{row.calls} 次</span>
-            <span className="text-[#6e6b63] dark:text-[#a19f96]">
-              {fmtInt(row.promptTokens + row.completionTokens)} tok
-            </span>
-            <span className="text-[#6e6b63] dark:text-[#a19f96]">
-              均 {fmtMs(row.avgMs)}
-            </span>
-            <span className="w-20 text-right text-[#6e6b63] dark:text-[#a19f96]">
-              {fmtCost(row.cost, row.currency)}
-            </span>
-            {row.failures > 0 && (
-              <span className="text-red-500">{row.failures} 失败</span>
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-};
-
-const SpanRow: React.FC<{ node: TraceSpanNode; depth: number }> = ({
-  node,
-  depth,
-}) => (
-  <>
-    <div
-      className="flex items-center gap-2 text-[11px] py-0.5"
-      style={{ paddingLeft: depth * 14 }}
-    >
-      <span
-        className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-          node.status === "ok"
-            ? "bg-[#da7756]"
-            : node.status === "cancelled"
-              ? "bg-[#918d83]"
-              : "bg-red-500"
-        }`}
-      />
-      <span className="text-[#1f1e1d] dark:text-[#edece8]">{spanLabel(node.name)}</span>
-      <span className="text-[#918d83]">{fmtMs(node.durationMs)}</span>
-      {node.promptTokens !== null && (
-        <span className="text-[#918d83]">
-          {fmtInt((node.promptTokens ?? 0) + (node.completionTokens ?? 0))} tok
-          {node.tokenSource === "estimated" && "（估算）"}
-        </span>
-      )}
-      {node.errorType && <span className="text-red-500">{node.errorType}</span>}
-    </div>
-    {node.children.map((child) => (
-      <SpanRow key={child.id} node={child} depth={depth + 1} />
-    ))}
-  </>
-);

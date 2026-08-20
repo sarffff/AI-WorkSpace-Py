@@ -16,8 +16,19 @@ openai>=1.55.0
 httpx>=0.27.0
 email-validator>=2.2.0
 PyPDF2>=3.0.0
+# PDF 结构恢复。PyPDF2 的 extract_text() 只给字符串,没有字号和坐标,而标题层级、
+# 页眉页脚定位、词内空格判定全都要靠它们——没有结构的 PDF 会让 chunking 的
+# 「标题路径」与「章节边界优先」两条彻底失效(见 services/ingest_clean.py)
+pdfplumber>=0.11.0
+# 编码嗅探。GBK 文档按 utf-8 硬解成一串 U+FFFD 之后 BM25 会整块跳过,
+# 文档状态却还是 indexed——这是最贵的一种静默失败
+charset-normalizer>=3.3.0
 numpy>=1.26.0
 faiss-cpu>=1.7.4
+# 向量库。只在 VECTOR_STORE=qdrant 时用到(见 docker-compose.qdrant.yml);
+# 默认的 memory 后端不碰它。进程内索引的限制是多 worker 各建一份、重启即全丢,
+# 那两条都不会报错——搬到 Qdrant 换来的是持久态与多 worker 共享
+qdrant-client>=1.12.0
 slowapi>=0.1.9
 
 # 测试依赖

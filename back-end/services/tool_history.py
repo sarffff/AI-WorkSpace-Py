@@ -42,6 +42,12 @@ _STATUS_LABEL = {
     "invalid_arguments": "参数错误",
     "unavailable": "工具不可用",
     "error": "执行失败",
+    # 回灌时也要标出来:模型看到"这一步被拦了"才知道那条路已经走过,
+    # 标成"成功"会让它以为拿到过结果,下个回合接着用同样的参数调。
+    "repeated": "重复调用已拦截",
+    # 下个回合也要知道这件事被人拒绝过。标成失败会让模型以为是通道问题,
+    # 于是重试同一个操作——而它上一回合已经被明确否决了。
+    "rejected": "用户已拒绝",
 }
 
 # 每步最多列几条引用。全列出来的话，光 document_id 就能吃掉大半个预算
@@ -208,6 +214,7 @@ def record(
     arguments: Any = None,
     citations: list[dict[str, Any]] | None = None,
     agent_role: str | None = None,
+    run_id: str | None = None,
 ) -> None:
     """记一步工具执行。
 
@@ -232,6 +239,7 @@ def record(
                 tool_call_id=str(tool_call_id)[:80] if tool_call_id else None,
                 arguments=_dump(arguments),
                 agent_role=agent_role[:40] if agent_role else None,
+                run_id=run_id[:36] if run_id else None,
                 status=status,
                 result_content=body[:store_limit] if store_limit else None,
                 # 截断前的真实长度。摘要里要靠它告诉模型"原文还有多少"
@@ -332,6 +340,8 @@ def serialize(step: MessageToolStep) -> dict[str, Any]:
         "tool": step.tool_name,
         # None 表示主代理自己调的。前端据此把子代理的步骤缩进到 delegate 那一步下面
         "agentRole": step.agent_role,
+        # 归属的执行记录。前端拿它去查"这次执行有没有被审批打断过"
+        "runId": step.run_id,
         "status": step.status,
         "input": _load(step.arguments) or {},
         "citations": _load(step.citations) or [],

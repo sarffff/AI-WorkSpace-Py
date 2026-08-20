@@ -146,6 +146,10 @@ class MessageToolStep(Base):
     # 不区分的话"这次回答查了 8 次知识库"既可能是主代理反复检索，也可能是一次
     # 委派里 researcher 查了 6 次——这两种情况的改进方向正好相反。
     agent_role: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # 归属的 agent_runs.id。有了它，"这一步是哪次执行做的"是一次 join 而不是
+    # 按 (agent_role, 时间) 推断——同一回合里委派两个 researcher 时后者会错。
+    # NULL = 这一步产生于 agent_runs 存在之前，或埋点关闭时
+    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
 
     # ToolStatus 的三档（ok / invalid_arguments / unavailable），预检索失败记 error
     status: Mapped[str] = mapped_column(String(20), default="ok")
@@ -157,6 +161,99 @@ class MessageToolStep(Base):
     result_chars: Mapped[int] = mapped_column(Integer, default=0)
     # 命中的引用（document_id / document_name / chunk_index），JSON 数组
     citations: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class AgentRun(Base):
+    """一次 Agent 执行的一等记录：主代理一行，每个子代理各一行。
+
+    为什么不继续往 ``message_tool_steps`` 加列：那张表的粒度是"一步工具调用"，
+    而这里要回答的问题的粒度是"一次执行"——这次回答起了几个子代理、哪个最慢、
+    researcher 失败之后主代理有没有重试、委派在总成本里占多少。用 ``agent_role``
+    加排序去推断这些，在一次回答里委派两个同角色子代理时就会失效。
+
+    ``parent_run_id`` 自引用而不设外键：删对话时按 chat_id 显式清理（与
+    ``message_tool_steps`` 同一套取舍），外键的级联顺序反而会挡住删除。
+
+    ``status`` 里 ``waiting_approval`` 是唯一一个"没有任何进程在跑它、但它还活着"
+    的状态。那正是可恢复执行的意义：一次执行的生命周期不再等于一个 HTTP 请求的
+    生命周期。
+    """
+
+    __tablename__ = "agent_runs"
+    __table_args__ = (
+        Index("ix_agent_runs_chat_started", "chat_id", "started_at"),
+        Index("ix_agent_runs_user_status", "user_id", "status"),
+        Index("ix_agent_runs_parent", "parent_run_id"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    chat_id: Mapped[str] = mapped_column(String(36))
+    user_id: Mapped[str] = mapped_column(String(36))
+    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    parent_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    # NULL = 主代理（与 message_tool_steps.agent_role 同一套约定）
+    agent_role: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # running / waiting_approval / done / failed / abandoned
+    status: Mapped[str] = mapped_column(String(24), default="running", index=True)
+    # 走到第几轮。中断恢复后接着涨，不重置
+    rounds: Mapped[int] = mapped_column(Integer, default=0)
+    # 这次执行里委派了几次（子代理 run 恒为 0，它们不能再委派）
+    delegations: Mapped[int] = mapped_column(Integer, default=0)
+    # 被人工审批打断过几次。审批一次也没有和审批三次是完全不同的体验，
+    # 这个数是"人被打扰了多少次"的唯一记录
+    interrupts: Mapped[int] = mapped_column(Integer, default=0)
+
+    model: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # 提示词版本引用（key@version），与 trace_spans.attributes 里的同一个值
+    prompt_ref: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # 关联到埋点树，成本与耗时从那边聚合，不在这里重复存
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    error_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
+
+    started_at: Mapped[datetime] = mapped_column(DateTime)
+    updated_at: Mapped[datetime] = mapped_column(DateTime)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class AgentCheckpoint(Base):
+    """一个 run 在某个安全点上的状态快照。
+
+    一个 run 有多个快照，靠 ``seq`` 排序，最大的那个是当前状态。保留历史而不是
+    原地覆盖，是为了"回到第 3 轮再跑一次"——这是评估复现与事后调试要的能力，
+    而只留最新快照的话，恢复就只有一个方向。
+
+    ``state`` 是 ``agent_state.TurnState`` 的 JSON。它**确实包含对话消息正文**，
+    与 ``message_tool_steps.result_content`` 同一性质（对话数据），
+    和 ``trace_spans.attributes`` 只存元数据的约定不冲突——那是埋点。
+
+    体积是这张表的主要代价：一份快照就是整个 messages 列表，一次回答几轮下来
+    可能有几十 KB。所以要有保留策略（见 ``checkpoint_store.prune``），
+    否则它会比 messages 表本身还大。
+    """
+
+    __tablename__ = "agent_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("run_id", "seq", name="uq_agent_checkpoints_run_seq"),
+        Index("ix_agent_checkpoints_run_seq", "run_id", "seq"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    seq: Mapped[int] = mapped_column(Integer, default=0)
+
+    # pre_tools / waiting_approval / post_tools
+    phase: Mapped[str] = mapped_column(String(24), default="pre_tools")
+    round_index: Mapped[int] = mapped_column(Integer, default=0)
+    state: Mapped[str] = mapped_column(Text)
+    # 中断请求的 JSON，仅 waiting_approval 的快照有
+    interrupt: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime)
 
@@ -182,6 +279,12 @@ class Document(Base):
     # PDF 重新导出一次,应该被认出是同一篇文档。
     # 注意:去重范围是(工作区, 哈希)——不同工作区各存一份是正常的
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # 解析后端(text/utf-8、text/gb18030、pdfplumber、pypdf2……)与解析告警。
+    # 这条链路上最常见的失败全都不抛异常:扫描件抽出空文本、GBK 解成一串替换符、
+    # 没识别出标题层级。改动前它们一律落成 indexed,界面上和正常文档毫无区别,
+    # 只是永远检索不到。这两列就是"为什么这篇文档不对"的唯一记录。
+    parse_backend: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    parse_warnings: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON 数组
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
@@ -275,6 +378,10 @@ class TraceSpan(Base):
     model: Mapped[str | None] = mapped_column(String(100), nullable=True)
     prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # prompt_tokens 中被提供商上下文缓存命中的部分。是 prompt_tokens 的子集，
+    # 不是额外的量——聚合时不能和它相加。NULL 表示这次调用没有缓存信息
+    # （提供商没回传，或 token 数是本地估算的），与"命中 0 个"含义不同。
+    cached_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # provider(提供商回传) 或 estimated(本地估算)，聚合成本时必须能区分
     token_source: Mapped[str | None] = mapped_column(String(16), nullable=True)
 

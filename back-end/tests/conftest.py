@@ -37,6 +37,7 @@ class ScriptedAdapter(ModelAdapter):
     - ``text_protocol``: 走 GLM 的 ``<function=call>`` 文本工具协议
     - ``protocol_error``: 直接返回协议错误
     - ``raise``: 流式阶段抛异常
+    - ``raise_after_text``: 先流出 ``text`` 再抛异常（模拟回答说到一半断流）
     """
 
     def __init__(self, rounds: list[dict[str, Any]]) -> None:
@@ -89,6 +90,12 @@ class ScriptedAdapter(ModelAdapter):
 
         if spec.get("raise"):
             raise RuntimeError("simulated stream failure")
+
+        if spec.get("raise_after_text"):
+            text = spec.get("text", "")
+            if text:
+                yield StreamChunk(text=text)
+            raise RuntimeError("simulated stream failure after text")
 
         if spec.get("protocol_error"):
             yield StreamChunk(

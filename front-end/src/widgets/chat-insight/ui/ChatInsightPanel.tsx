@@ -24,6 +24,7 @@ export interface InsightEvent {
     | "cache_hit"
     | "agent_step"
     | "agent_state"
+    | "approval"
     | "done";
   label: string;
   status?: string;
@@ -122,6 +123,9 @@ export const ChatInsightPanel: React.FC<Props> = ({
                             : "bg-violet-500 animate-pulse"
                       }`}
                     />
+                  )}
+                  {evt.type === "approval" && (
+                    <ShieldAlert className="w-3 h-3 text-amber-500 shrink-0" />
                   )}
                   {evt.type === "done" && (
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
