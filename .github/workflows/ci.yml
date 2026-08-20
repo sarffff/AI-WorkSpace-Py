@@ -30,7 +30,7 @@ jobs:
       - name: 提示词契约校验(模板缺失/占位符漂移直接失败)
         run: python -c "from services import prompt_library; prompt_library.validate()"
       - name: 运行测试
-        run: pytest
+        run: python -m pytest
 
   frontend:
     name: 前端构建 (tsc + vite)
@@ -45,7 +45,7 @@ jobs:
           node-version: "20"
       - uses: pnpm/action-setup@v2
         with:
-          version: 11.20.0
+          version: 9
       - name: 安装依赖
         run: pnpm install --frozen-lockfile
       - name: 类型检查
