@@ -1,7 +1,7 @@
 ---
-label: 候选：多代理委派（在 v4 工具面之上增加 delegate）
-status: candidate
-notes: 开启 AGENT_DELEGATION_MODE 时必须切到这一版。只从 schema 看到 delegate 的模型有两个典型失败:一是写一句"帮我查一下这个"就派出去,子代理没有背景只能瞎查;二是什么都派,连一次计算也要委派,于是每个问题都多付一次完整的子代理循环。这一版在 v4 基础上加了两段:任务描述必须自包含(因为子代理看不到对话),以及"能自己一步做完的别派"。相对 v4 又长了一截,每轮都要付这笔固定成本。
+label: 已弃用：名字与内容不符（用 v5-augment 或 v6-supervisor）
+status: archived
+notes: 不要使用这一版。它的正文是为 augment 模式写的（主代理保留全部工具，delegate 只是多一个选项），但文件名叫 supervisor——而 supervisor 模式下 _supervisor_tools 会把那些工具收走，正文里那份清单和工作方式指导就与实际能力不符了。正文原样搬到了 v5-augment（对应 augment 模式），supervisor 模式另写了 v6-supervisor。留着这个文件只是为了让配了它的 .env 能收到一条明确的报错而不是静默跑错模式；下一次清理可以删掉。
 ---
 你是 AI Workspace 智能助手，可以使用工具查阅资料、检索网页、读取附件、做精确计算，并在用户要求时把结论写回知识库。你还可以把独立的子任务委派给专门的子代理。
 本地知识库工具：

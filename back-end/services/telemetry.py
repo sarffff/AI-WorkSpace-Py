@@ -68,6 +68,11 @@ class Span:
     model: str | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    # prompt_tokens 里被提供商上下文缓存命中的那部分(``prompt_tokens_details
+    # .cached_tokens``)。它是 prompt_tokens 的**子集**,不是额外的量——算成本时
+    # 必须先减掉再按打折价单独计，否则会把缓存命中算成两份输入。
+    # None 表示"这次调用没有缓存信息"(提供商没回传或本地估算),不是"命中 0 个"。
+    cached_tokens: int | None = None
     token_source: str | None = None
     attributes: dict[str, Any] = field(default_factory=dict)
 
@@ -84,9 +89,11 @@ class Span:
         completion_tokens: int | None,
         source: TokenSource = TokenSource.PROVIDER,
         model: str | None = None,
+        cached_tokens: int | None = None,
     ) -> None:
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
+        self.cached_tokens = cached_tokens
         self.token_source = source.value
         if model:
             self.model = model
@@ -236,7 +243,12 @@ def _persist(trace: Trace) -> None:
     try:
         rows = []
         for span in trace.spans:
-            cost = estimate_cost(span.model, span.prompt_tokens, span.completion_tokens)
+            cost = estimate_cost(
+                span.model,
+                span.prompt_tokens,
+                span.completion_tokens,
+                span.cached_tokens,
+            )
             rows.append(
                 TraceSpan(
                     id=span.span_id,
@@ -254,6 +266,7 @@ def _persist(trace: Trace) -> None:
                     model=span.model,
                     prompt_tokens=span.prompt_tokens,
                     completion_tokens=span.completion_tokens,
+                    cached_tokens=span.cached_tokens,
                     token_source=span.token_source,
                     cost=cost.amount if cost else None,
                     currency=cost.currency if cost else None,
@@ -272,6 +285,16 @@ tracer = Tracer()
 def current_span() -> Span | NoopSpan:
     """拿到当前活跃 span，用于在不新建 span 的情况下补充属性。"""
     return _current_span.get() or NoopSpan()
+
+
+def current_trace_id() -> str | None:
+    """当前 trace 的 id，埋点关闭时为 None。
+
+    ``agent_runs`` 用它把一次执行接到埋点树上：成本与耗时都在 ``trace_spans``
+    那边，这里只存一个外键，不重复存一份数字——两份数字迟早会不一致。
+    """
+    trace = _current_trace.get()
+    return trace.trace_id if trace is not None else None
 
 
 def set_span_defaults(**attributes: Any) -> None:

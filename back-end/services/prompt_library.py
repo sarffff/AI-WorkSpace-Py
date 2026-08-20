@@ -46,6 +46,22 @@ PROMPT_DIR = os.path.join(
 # active: 当前默认；candidate: 已就绪、等着被 A/B；archived: 只作对照，不要启用
 STATUSES = ("active", "candidate", "archived")
 
+# 模板可以在 frontmatter 里用 ``expects:`` 声明它是为哪种运行时配置写的，
+# 逗号分隔。启动时据此校验「配置和提示词是否匹配」——此前这件事只写在 notes
+# 里（"开启委派时必须切到这一版"），而注释拦不住任何人。
+#
+# 为什么是模板自己声明，而不是在 main.py 里列一张版本名表：加新版本时那张表
+# 一定会漏掉，而漏掉的表现是"配置错了但程序照跑"，正是这个机制要消灭的东西。
+EXPECTATIONS = (
+    # 讲了 workspace 那几个工具（calculate / web_search / read_attachment /
+    # save_to_knowledge_base）的策略，不只是让模型从 schema 里看到名字
+    "workspace-tools",
+    # 讲了 delegate 怎么用：任务描述必须自包含、什么时候不该委派
+    "delegation",
+    # 为 supervisor 模式写的：主代理的专用工具已被角色收走，只能委派
+    "supervisor",
+)
+
 
 class PromptError(RuntimeError):
     """模板缺失、占位符不匹配、条件段没闭合——一律在加载或渲染时立刻抛出。"""
@@ -78,6 +94,16 @@ SPECS: dict[str, PromptSpec] = {
     "chat_system_rag": PromptSpec(
         key="chat_system_rag",
         purpose="开启知识库时的对话系统提示词（工具说明 + 注入防线）",
+        # 为什么默认仍是 v2 而不是更全的 v4-workspace：产品默认把四个 workspace
+        # 工具全部关掉（见 config.py 那段注释），此时 v4 多出来的三段策略讲的是
+        # 网页可信度分层、写操作确认、图片直接可见——全是当下不存在的工具，而它
+        # 的固定成本每轮都要付。
+        #
+        # 所以「v2 还是 v4」不是一个能单独回答的问题，它取决于开了哪些工具：
+        # 工具全关时 v2 正确，工具打开时应当跟着切到 v4（main.py 会就此给出警告）。
+        # eval 的 prompt-v2 变体量的是后一种情形——它的 _BASE 把四个工具全打开了,
+        # 所以那组数字回答的是"开了工具之后 v4 值不值这笔 token",
+        # 不是"产品默认该用哪一版"。
         default_version="v2",
         setting="PROMPT_CHAT_SYSTEM_VERSION",
         flags=("prefetched",),
@@ -96,24 +122,50 @@ SPECS: dict[str, PromptSpec] = {
         default_version="v1",
         required=("recent_turns", "question"),
     ),
+    # 这两个原来是源码里的多行字符串。搬出来的理由和其它提示词一样：它们同样
+    # 发给模型、同样影响结果、同样该被 review 和 A/B。记忆抽取尤其重要——
+    # 它的排除段是注入防线的一部分（见 memory_service 模块文档）。
+    "history_summary": PromptSpec(
+        key="history_summary",
+        purpose="把滑出 token 预算的早期对话压成滚动摘要",
+        default_version="v1",
+        required=("previous", "transcript"),
+        flags=("has_previous",),
+    ),
+    "memory_extract": PromptSpec(
+        key="memory_extract",
+        purpose="从一轮对话里抽取值得跨会话记住的用户事实与偏好",
+        default_version="v1",
+        required=("question", "answer"),
+    ),
     # 子代理各自一个 key,而不是共用一个带 [[if role]] 分支的模板:三个角色的
     # 约束几乎不重叠(researcher 要讲出处分层,analyst 要讲"缺输入就停",
     # critic 要讲"没依据别提"),塞进一版会变成一个谁都不好改的大文件,
     # 而且改 researcher 那段会让 critic 的评估结果一起失效。
+    # 三个角色各自一个 setting，而不是共享一个 PROMPT_AGENT_VERSION：理由和
+    # 上面"为什么是三个 key 而不是一个带 [[if role]] 分支的模板"一样——共享的话
+    # 没法单独 A/B researcher，动一个会让另两个的结果一起失效。
+    #
+    # 不开 request_overridable：子代理的版本由谁定应当和主代理解耦，而单次请求
+    # 只带一个 prompt_version 字段，语义上指的是对话系统提示词。要按请求覆盖
+    # 子代理版本得先想清楚那个字段怎么扩展，现在没有这个需求。
     "agent_researcher": PromptSpec(
         key="agent_researcher",
         purpose="researcher 子代理：查资料并如实汇报出处",
         default_version="v1",
+        setting="PROMPT_AGENT_RESEARCHER_VERSION",
     ),
     "agent_analyst": PromptSpec(
         key="agent_analyst",
         purpose="analyst 子代理：精确计算与读取附件",
         default_version="v1",
+        setting="PROMPT_AGENT_ANALYST_VERSION",
     ),
     "agent_critic": PromptSpec(
         key="agent_critic",
         purpose="critic 子代理：只依据给定材料审查草稿",
         default_version="v1",
+        setting="PROMPT_AGENT_CRITIC_VERSION",
     ),
 }
 
@@ -197,11 +249,16 @@ class PromptTemplate:
     body: str
     placeholders: tuple[str, ...]
     flags: tuple[str, ...]
+    # frontmatter 的 ``expects:``。这一版是为哪种运行时配置写的，供启动校验用。
+    expects: tuple[str, ...] = ()
 
     @property
     def ref(self) -> str:
         """写进埋点的版本标识。一条 trace 必须能回答「这是哪一版提示词跑出来的」。"""
         return f"{self.key}@{self.version}"
+
+    def expects_all(self, *names: str) -> bool:
+        return all(name in self.expects for name in names)
 
     def render(self, *, flags: dict[str, bool] | None = None, **values: Any) -> str:
         where = f"prompts/{self.key}/{self.version}.md"
@@ -242,6 +299,17 @@ def _parse(raw: str, key: str, version: str) -> PromptTemplate:
     if status not in STATUSES:
         raise PromptError(f"{where}: status 只能是 {STATUSES} 之一，收到 {status!r}")
 
+    # 拼错的 expects 必须在这里炸：静默忽略的话，启动校验会以为这一版"没有声明
+    # 任何前置条件"从而放行，而那正是错配能溜过去的方式。
+    expects = tuple(
+        item.strip() for item in meta.get("expects", "").split(",") if item.strip()
+    )
+    unknown_expects = sorted(set(expects) - set(EXPECTATIONS))
+    if unknown_expects:
+        raise PromptError(
+            f"{where}: 未知的 expects 取值 {unknown_expects}，可用 {list(EXPECTATIONS)}"
+        )
+
     spec = SPECS[key]
     placeholders = _placeholder_names(body)
     flags = _flag_names(body)
@@ -269,6 +337,7 @@ def _parse(raw: str, key: str, version: str) -> PromptTemplate:
         body=body,
         placeholders=placeholders,
         flags=flags,
+        expects=expects,
     )
 
 
@@ -402,6 +471,8 @@ def catalog() -> list[dict[str, Any]]:
                         "body": template.body,
                         "chars": len(template.body),
                         "isActive": template.version == active,
+                        # 提示词实验台上要能看出"这一版需要什么配置才成立"
+                        "expects": list(template.expects),
                     }
                     for template in versions(key)
                 ],

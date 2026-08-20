@@ -6,6 +6,9 @@ import { PageHeader } from "@/shared/ui/PageHeader";
 import { setSelectedModel } from "@/entities/chat/model/chatSlice";
 import { useNavigate } from "react-router-dom";
 import { Server, Cpu, X, Loader2, Save, Check, Database, ArrowRight, Wrench, Paperclip, Globe, BookPlus, History } from "lucide-react";
+import { CapCell } from "../components/CapCell";
+import { ConfigRow } from "../components/ConfigRow";
+import { StatusCard } from "../components/StatusCard";
 
 export const SettingsPage: React.FC = () => {
     const dispatch = useDispatch();
@@ -331,76 +334,3 @@ export const SettingsPage: React.FC = () => {
         </div>
     );
 };
-
-const CapCell: React.FC<{
-    icon: React.ReactNode;
-    label: string;
-    on: boolean;
-}> = ({ icon, label, on }) => (
-    <div
-        className={`flex items-center gap-2.5 px-3.5 py-3 rounded-xl border ${
-            on
-                ? "border-[#da7756]/25 bg-[#da7756]/8"
-                : "border-[#e3dfd5] dark:border-[#2e2d2a] bg-[#f3f0e6]/50 dark:bg-[#201f1c]/50"
-        }`}
-    >
-        <span className={on ? "text-[#da7756]" : "text-[#918d83]"}>{icon}</span>
-        <span className="text-xs font-medium text-[#1f1e1d] dark:text-[#edece8]">
-            {label}
-        </span>
-        <span
-            className={`ml-auto text-[10px] font-semibold ${
-                on
-                    ? "text-emerald-600 dark:text-emerald-400"
-                    : "text-[#918d83]"
-            }`}
-        >
-            {on ? "可用" : "未注册"}
-        </span>
-    </div>
-);
-
-const ConfigRow: React.FC<{ label: string; value: string; badge?: "ok" }> = ({
-    label,
-    value,
-    badge,
-}) => (
-    <div>
-        <div className="text-[10px] font-semibold tracking-wide text-[#6e6b63] dark:text-[#a19f96] mb-1">
-            {label}
-        </div>
-        <div className="flex items-center gap-2">
-            <code className="text-xs text-[#1f1e1d] dark:text-[#edece8] font-mono break-all">
-                {value}
-            </code>
-            {badge === "ok" && (
-                <span className="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-[10px] font-semibold">
-                    已启用
-                </span>
-            )}
-        </div>
-    </div>
-);
-
-const StatusCard: React.FC<{
-    icon: React.ReactNode;
-    title: string;
-    value: string;
-    ok?: boolean;
-}> = ({ icon, title, value, ok }) => (
-    <div className="card-surface card-lift p-5 rounded-2xl space-y-1.5 relative z-10">
-        <div
-            className={`flex items-center gap-2 text-xs font-semibold tracking-wide ${
-                ok
-                    ? "text-emerald-600 dark:text-emerald-400"
-                    : "text-[#6e6b63] dark:text-[#a19f96]"
-            }`}
-        >
-            {icon}
-            {title}
-        </div>
-        <div className="text-lg font-bold text-[#1f1e1d] dark:text-[#edece8]">
-            {value}
-        </div>
-    </div>
-);

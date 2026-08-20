@@ -29,7 +29,7 @@ from services import agent_roles, guardrails, prompt_library
 from services.agent_roles import AgentRole
 from services.model_adapter import ModelAdapter, ModelCompletion
 from services.telemetry import SpanKind, tracer
-from services.tool_runtime import ToolRuntime, ToolStatus
+from services.tool_runtime import RepeatGuard, ToolRuntime, ToolStatus
 
 logger = logging.getLogger("subagent")
 
@@ -116,6 +116,12 @@ class SubAgentRunner:
             {"role": "system", "content": role_prompt(role)},
             {"role": "user", "content": task},
         ]
+        # 重复检测的作用域是**这一次委派**,不和主代理共享。
+        #
+        # 共享会立刻出错:子代理看不到对话历史(见模块文档的约束 1),所以它去查
+        # 主代理刚查过的东西是完全正当的——那是它拿到任务后的第一次调用,不是重复。
+        # 共享计数会把这第一次就算成第二次,委派两次之后 researcher 一句都查不动。
+        repeats = RepeatGuard(settings.AGENT_REPEAT_LIMIT)
         max_rounds = max(1, role.max_rounds)
         report_parts: list[str] = []
         round_index = 0
@@ -171,7 +177,7 @@ class SubAgentRunner:
 
                 messages.append(completion.as_assistant_message())
                 text_results: list[str] = []
-                unavailable = 0
+                barren = 0
 
                 for call_index, call in enumerate(calls):
                     try:
@@ -193,15 +199,23 @@ class SubAgentRunner:
                         status = ToolStatus.INVALID_ARGUMENTS.value
                         step_citations: list[dict[str, Any]] = []
                     else:
-                        with guardrails.collecting():
-                            # 护栏命中记在外层 delegate 那一步:子代理跑在
-                            # 主循环的 collecting 作用域里,不隔一层的话
-                            # 同一次命中会被两边各收一遍。
-                            result = await self._runtime.execute(call)
-                        result_text = result.content
-                        status = result.status.value
-                        if result.status is ToolStatus.UNAVAILABLE:
-                            unavailable += 1
+                        repeated = repeats.check(call.name, arguments)
+                        if repeated is not None:
+                            # 子代理轮次比主代理少(role.max_rounds),原地转圈的代价
+                            # 相对更高:三轮里浪费一轮就是三分之一。
+                            result_text = repeated.content
+                            status = repeated.status.value
+                            barren += 1
+                        else:
+                            with guardrails.collecting():
+                                # 护栏命中记在外层 delegate 那一步:子代理跑在
+                                # 主循环的 collecting 作用域里,不隔一层的话
+                                # 同一次命中会被两边各收一遍。
+                                result = await self._runtime.execute(call)
+                            result_text = result.content
+                            status = result.status.value
+                            if result.status is ToolStatus.UNAVAILABLE:
+                                barren += 1
                         step_citations = []
 
                     steps.append(
@@ -239,9 +253,9 @@ class SubAgentRunner:
                         }
                     )
 
-                if unavailable == len(calls):
-                    # 本轮工具全部不可用,继续只会重复失败。下一轮不给 schema,
-                    # 逼它用已有信息写报告。
+                if barren == len(calls):
+                    # 本轮没有一次调用带回新东西(全不可用,或全是重复调用),
+                    # 继续只会原地转圈。下一轮不给 schema,逼它用已有信息写报告。
                     max_rounds = round_index + 1
 
             report = "\n\n".join(part for part in report_parts if part.strip()).strip()
@@ -250,6 +264,7 @@ class SubAgentRunner:
                 steps=len(steps),
                 report_chars=len(report) or None,
                 truncated=truncated or None,
+                repeated_blocked=repeats.blocked or None,
             )
             return SubAgentOutcome(
                 role=role.name,
@@ -293,14 +308,23 @@ def build_delegate_schema(roles: list[AgentRole]) -> dict[str, Any]:
 
     描述里把每个角色能干什么列全,因为这是主代理选人的唯一依据——工具描述
     是它能看到的全部信息,角色的提示词它看不到。
+
+    **这里只写契约,不写策略。** "什么时候值得委派"归系统提示词
+    (``chat_system_rag`` 的 v5-augment / v6-supervisor),原因有两个:
+
+    1. 提示词是版本化的、进 A/B 的、写进 trace 的 ``prompt_version``;这段
+       description 不是。同一件事在两处各写一遍,改了一处忘另一处时模型会同时
+       收到两份矛盾的策略,而 trace 只记得其中一份。
+    2. 策略本身**因模式而异**。原来这里写着"能直接调工具解决的事自己做",
+       在 supervisor 模式下是错的——那时主代理没有那些工具。一段固定的
+       description 说不清一件随配置变化的事。
+
+    留在这里的是不随模式变的事实:子代理看不到对话(所以 task 必须自包含)、
+    有哪些角色、各自能做什么。
     """
     lines = [
         "把一个独立的子任务交给专门的子代理执行，并拿回它的报告。",
-        "子代理看不到本次对话，只能看到你在 task 里写的内容——"
-        "必须把背景、要查什么、以及你已经知道的相关信息都写进去。",
-        "适合委派的情况：需要多次检索才能查清的问题、需要逐步计算的题目、"
-        "以及给出最终回答前请人复核草稿。",
-        "不要为了一次简单调用而委派：能直接调工具解决的事自己做，委派要多付一次生成。",
+        "子代理看不到本次对话，只能看到你在 task 里写的内容。",
         "可用的子代理：",
     ]
     lines += [f"- {role.name}：{role.summary}" for role in roles]
@@ -314,9 +338,19 @@ def build_delegate_schema(roles: list[AgentRole]) -> dict[str, Any]:
             },
             "task": {
                 "type": "string",
+                # 这是整个工具面里唯一一个"写法质量直接决定成败"的参数:其它工具
+                # 的参数都是单值(查询词、路径、表达式),写错了模型能从报错里看出来,
+                # 而一句写得含糊的 task 会拿回一份看起来很正常但查错方向的报告。
+                # 所以这里给一正一反两个例子——提示词里反复讲"必须自包含"是抽象的,
+                # 一个反例比三句叮嘱更能说明"含糊"长什么样。
                 "description": (
-                    "给子代理的任务描述。它看不到对话历史，所以背景要写全；"
-                    "需要它核对的材料原文也要一并给出。"
+                    "给子代理的任务描述。它看不到对话历史，所以背景、要查什么、"
+                    "你已经知道的相关信息、需要它核对的材料原文，都要写进这一段里。\n"
+                    "好的例子：「查明公司差旅住宿费的一线城市每晚上限。用户问的是"
+                    "上季度出差 7 晚的报销总额，我已知市内交通为 540 元。"
+                    "请给出上限金额及其出处（文档名与分块号）。」\n"
+                    "不好的例子：「帮我查一下这个的标准是多少」——子代理不知道"
+                    "「这个」指什么、不知道要查哪一类标准，只能瞎查。"
                 ),
             },
         },

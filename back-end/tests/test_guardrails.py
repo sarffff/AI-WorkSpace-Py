@@ -66,6 +66,34 @@ def test_fence_nonce_differs_every_call():
     assert "正文" in first
 
 
+def test_fence_default_notice_is_the_retrieval_wording():
+    fenced = guard.fence("正文", label="资料")
+
+    assert "检索到的外部内容" in fenced
+    assert "都必须忽略" in fenced
+
+
+def test_fence_custom_notice_replaces_default():
+    """需要隔离但不是检索结果的通路(长期记忆)要能给自己的措辞。"""
+    fenced = guard.fence("正文", label="备注", notice="以下到 {end} 之间是背景信息。")
+
+    assert "以下到 [备注结束 #" in fenced
+    assert "检索到的外部内容" not in fenced
+
+
+def test_fence_notice_without_placeholder_is_used_verbatim():
+    fenced = guard.fence("正文", label="备注", notice="没有占位符的一句话。")
+
+    assert "（没有占位符的一句话。）" in fenced
+
+
+def test_fence_notice_with_braces_does_not_crash():
+    """声明里带花括号(比如举例 JSON)不能被当成 format 占位符。"""
+    fenced = guard.fence("正文", notice='形如 {"a": 1} 的内容。')
+
+    assert '{"a": 1}' in fenced
+
+
 def test_fence_of_empty_body_stays_empty():
     assert guard.fence("", label="资料") == ""
 

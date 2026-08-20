@@ -11,6 +11,8 @@ from models import Document, DocumentChunk
 from services.embedding_service import EmbeddingService
 from services.model_adapter import ModelCompletion
 from services.retrieval_index import invalidate_scope_indexes
+from services import vector_store
+from services.rerank import RerankError, rerank_client
 from services.retriever import HybridRetriever, format_context
 from conftest import run
 
@@ -82,14 +84,25 @@ def _corpus() -> list[tuple[DocumentChunk, Document]]:
 
 @pytest.fixture(autouse=True)
 def _isolate_indexes(monkeypatch):
-    """索引按用户缓存在进程内，每个用例前后都清掉，避免相互污染。"""
+    """索引按用户缓存在进程内，每个用例前后都清掉，避免相互污染。
+
+    新开关也一并钉住：本地 .env 里开了 HyDE 或 VECTOR_STORE=qdrant 时，这批用例
+    会去调模型或连向量库，跑出来的失败和被测代码毫无关系。
+    """
     invalidate_scope_indexes(USER)
     monkeypatch.setattr(settings, "RAG_CONTEXT_WINDOW", 0)
     monkeypatch.setattr(settings, "RAG_MULTI_QUERY", False)
     monkeypatch.setattr(settings, "RAG_RERANK", False)
+    monkeypatch.setattr(settings, "RAG_RERANK_MODE", "")
     monkeypatch.setattr(settings, "RAG_HYBRID", True)
+    monkeypatch.setattr(settings, "RAG_HYDE", False)
+    monkeypatch.setattr(settings, "RAG_QUERY_ROUTE", False)
+    monkeypatch.setattr(settings, "VECTOR_STORE", "memory")
+    monkeypatch.setattr(settings, "VECTOR_ANN", "exact")
+    vector_store.reset_for_tests()
     yield
     invalidate_scope_indexes(USER)
+    vector_store.reset_for_tests()
 
 
 def test_empty_corpus_returns_nothing():
@@ -283,3 +296,156 @@ def test_results_from_multiple_documents_are_not_merged(monkeypatch):
 
     names = {chunk.document_name for chunk in results}
     assert names == {"notes.md", "other.md"}
+
+
+# ========== HyDE / 查询路由 / 三种重排 ==========
+#
+# 这一组的重点是"哪一路拿到了什么查询"。它极容易写对一半:HyDE 明明只该作用于
+# 稠密通道,一不小心两路都换掉——而那样不会报错,只会让 BM25 去匹配一段模型编出来
+# 的文字,lexical 类查询静默失准。
+
+
+def test_hyde_only_feeds_the_dense_channel(monkeypatch):
+    """假答案里的编号和专有名词全是编的,拿它做字面匹配等于亲手废掉稀疏通道。"""
+    monkeypatch.setattr(settings, "RAG_HYDE", True)
+    embedding = FakeEmbedding({}, default=[1.0, 0.0])
+    adapter = StaticAdapter(['{"answer": "预算审批由财务在三个工作日内完成。"}'])
+    retriever = StubRetriever(_corpus(), embedding=embedding, model_adapter=adapter)
+
+    sparse_queries: list[str] = []
+    original = HybridRetriever._sparse_search
+
+    def _spy(query, index, limit):
+        sparse_queries.append(query)
+        return original(query, index, limit)
+
+    monkeypatch.setattr(HybridRetriever, "_sparse_search", staticmethod(_spy))
+
+    run(retriever.retrieve(None, USER, "预算怎么批", top_k=3))
+
+    # 稠密通道拿到的是"原查询 + 假答案"
+    assert any("三个工作日" in query for query in embedding.queries)
+    # 字面通道必须只拿到原查询
+    assert sparse_queries == ["预算怎么批"]
+
+
+def test_hyde_failure_falls_back_to_the_plain_query(monkeypatch):
+    """HyDE 是增强不是依赖:模型输出不合契约就用原查询,不该让检索失败。"""
+    monkeypatch.setattr(settings, "RAG_HYDE", True)
+    monkeypatch.setattr(settings, "STRUCTURED_OUTPUT_RETRIES", 0)
+    embedding = FakeEmbedding({}, default=[1.0, 0.0])
+    retriever = StubRetriever(
+        _corpus(), embedding=embedding, model_adapter=StaticAdapter(["没有 JSON"])
+    )
+
+    results = run(retriever.retrieve(None, USER, "预算怎么批", top_k=3))
+
+    assert results
+    assert embedding.queries == ["预算怎么批"]
+
+
+def test_query_route_shifts_rrf_weights(monkeypatch):
+    """路由判成 lexical 时稠密通道该被压低。断言的是排序结果而不是内部权重变量——
+    权重传错通道(dense 的权重给了 sparse)不会报错,只有顺序会变。"""
+    monkeypatch.setattr(settings, "RAG_QUERY_ROUTE", True)
+    monkeypatch.setattr(settings, "RAG_ROUTE_WEAK_WEIGHT", 0.01)
+    # a1 是"员工餐补",字面上带 budget 的是 a0
+    embedding = FakeEmbedding({}, default=[0.0, 1.0])  # 稠密偏向 a1
+    retriever = StubRetriever(
+        _corpus(),
+        embedding=embedding,
+        model_adapter=StaticAdapter(['{"intent": "lexical"}']),
+    )
+
+    results = run(retriever.retrieve(None, USER, "budget", top_k=3))
+
+    # 稠密权重被压到 0.01,BM25 命中的 a0 应当排到最前
+    assert results[0].chunk_index == 0
+
+
+def test_route_failure_keeps_default_weights(monkeypatch):
+    monkeypatch.setattr(settings, "RAG_QUERY_ROUTE", True)
+    monkeypatch.setattr(settings, "STRUCTURED_OUTPUT_RETRIES", 0)
+    retriever = StubRetriever(
+        _corpus(),
+        embedding=FakeEmbedding({}, default=[1.0, 0.0]),
+        model_adapter=StaticAdapter(["垃圾输出"]),
+    )
+
+    assert run(retriever.retrieve(None, USER, "预算", top_k=3))
+
+
+def test_rerank_api_reorders_by_relevance_score(monkeypatch):
+    monkeypatch.setattr(settings, "RAG_RERANK_MODE", "api")
+    monkeypatch.setattr(settings, "RERANK_API_KEY", "k")
+    monkeypatch.setattr(settings, "RERANK_BASE_URL", "https://example.invalid/v4/")
+
+    async def _fake_rerank(query, documents, top_n=None):
+        # 把最后一条顶到最前
+        return [(len(documents) - 1, 0.99), (0, 0.10)]
+
+    monkeypatch.setattr(rerank_client, "rerank", _fake_rerank)
+    retriever = StubRetriever(_corpus(), embedding=FakeEmbedding({}, default=[1.0, 0.0]))
+
+    results = run(retriever.retrieve(None, USER, "预算", top_k=3))
+
+    assert results[0].chunk_index == 2
+
+
+def test_rerank_api_unconfigured_falls_back_to_fusion_order(monkeypatch):
+    """不静默退回 llm:那会让"api 比 llm 好多少"这个对比测的是同一个东西。"""
+    monkeypatch.setattr(settings, "RAG_RERANK_MODE", "api")
+    monkeypatch.setattr(settings, "RERANK_API_KEY", "")
+    monkeypatch.setattr(settings, "LLM_API_KEY", "")
+    embedding = FakeEmbedding({}, default=[1.0, 0.0])
+    adapter = StaticAdapter([])
+    retriever = StubRetriever(_corpus(), embedding=embedding, model_adapter=adapter)
+
+    results = run(retriever.retrieve(None, USER, "预算", top_k=3))
+
+    assert results
+    assert adapter.prompts == []  # 没有偷偷去调 LLM 重排
+
+
+def test_rerank_api_error_falls_back_to_fusion_order(monkeypatch):
+    monkeypatch.setattr(settings, "RAG_RERANK_MODE", "api")
+    monkeypatch.setattr(settings, "RERANK_API_KEY", "k")
+
+    async def _boom(query, documents, top_n=None):
+        raise RerankError("down")
+
+    monkeypatch.setattr(rerank_client, "rerank", _boom)
+    retriever = StubRetriever(_corpus(), embedding=FakeEmbedding({}, default=[1.0, 0.0]))
+
+    results = run(retriever.retrieve(None, USER, "预算", top_k=3))
+
+    assert [r.chunk_index for r in results] == [0, 2]
+
+
+def test_rerank_mode_off_skips_both_paths(monkeypatch):
+    monkeypatch.setattr(settings, "RAG_RERANK_MODE", "off")
+    monkeypatch.setattr(settings, "RAG_RERANK", True)  # 显式 off 优先于布尔量
+    adapter = StaticAdapter([])
+    retriever = StubRetriever(
+        _corpus(), embedding=FakeEmbedding({}, default=[1.0, 0.0]), model_adapter=adapter
+    )
+
+    run(retriever.retrieve(None, USER, "预算", top_k=3))
+
+    assert adapter.prompts == []
+
+
+def test_vector_store_failure_degrades_to_sparse_only(monkeypatch):
+    """向量库故障不该让整次检索失败:BM25 那一路还在,退化成纯稀疏检索
+    仍然能答对不少问题,比抛 500 好。"""
+
+    async def _boom(scope_id, vector, top_k):
+        raise RuntimeError("qdrant down")
+
+    monkeypatch.setattr(vector_store.MemoryVectorStore, "search", _boom)
+    retriever = StubRetriever(_corpus(), embedding=FakeEmbedding({}, default=[1.0, 0.0]))
+
+    results = run(retriever.retrieve(None, USER, "预算 budget", top_k=3))
+
+    assert results  # 稀疏通道兜住了
+    assert all(r.dense_score is None for r in results)

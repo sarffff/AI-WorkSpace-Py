@@ -39,6 +39,19 @@ _BASE = {
     # 走的是单轮 RAG 问答（见模块顶部说明），把它写进变体只会得到一个
     # 「怎么改都没差别」的假结论。要对比那个，得先有一套 Agent 端到端评估。
     "PROMPT_EVAL_ANSWER_VERSION": "v1",
+    # 语料降级与清洗:baseline 是"干净语料 + 清洗开着"。
+    # 两个都写全,否则 dirty-* 变体跑完不恢复,后面所有变体测的都是脏语料。
+    "EVAL_CORPUS_DEGRADE": "none",
+    "INGEST_CLEAN": True,
+    "INGEST_PDF_STRUCTURE": True,
+    # 检索侧的新开关也全写上。RAG_RERANK_MODE 留空表示"按 RAG_RERANK 布尔量决定",
+    # 于是既有的 rerank 变体不用改一个字。
+    "RAG_RERANK_MODE": "",
+    "RAG_HYDE": False,
+    "RAG_QUERY_ROUTE": False,
+    "CHUNK_STRATEGY": "structural",
+    "VECTOR_STORE": "memory",
+    "VECTOR_ANN": "exact",
 }
 
 VARIANTS: dict[str, Variant] = {
@@ -111,6 +124,146 @@ VARIANTS: dict[str, Variant] = {
             "如果召回也变了，那是哪里串了配置，不是提示词的功劳"
         ),
         overrides={**_BASE, "PROMPT_EVAL_ANSWER_VERSION": "v2-strict"},
+    ),
+    # ===== 检索质量 =====
+    "rerank-api": Variant(
+        name="rerank-api",
+        description=(
+            "专用 cross-encoder 重排（智谱 /rerank）。和 rerank（LLM listwise）"
+            "配对读，差值就是「专用重排比让通用模型排序好多少」。"
+            "nDCG 应当明显高于 rerank，而召回集合不变——重排只改顺序"
+        ),
+        overrides={**_BASE, "RAG_RERANK_MODE": "api"},
+    ),
+    "rerank-api+multi-query": Variant(
+        name="rerank-api+multi-query",
+        description=(
+            "改写扩召回 + cross-encoder 精排。这是「先把召回做宽再把精度做窄」的"
+            "标准组合，也是这套管线成本最高的配置"
+        ),
+        overrides={**_BASE, "RAG_RERANK_MODE": "api", "RAG_MULTI_QUERY": True},
+    ),
+    "hyde": Variant(
+        name="hyde",
+        description=(
+            "HyDE：先编一段假答案，只拿它喂稠密通道（BM25 仍用原始 query）。"
+            "预期提升集中在 paraphrase 探针上——问题与文档不在同一语域正是它治的病。"
+            "反过来 lexical 探针不该掉，掉了说明假答案污染到了字面通道"
+        ),
+        overrides={**_BASE, "RAG_HYDE": True},
+    ),
+    "query-route": Variant(
+        name="query-route",
+        description=(
+            "查询路由：判断偏字面还是偏语义，据此调 RRF 两路权重。"
+            "trace 里的 route_intent 可以直接和数据集的 probe 标注对一遍，"
+            "所以这个分类器的准确率是可测的，不用凭感觉"
+        ),
+        overrides={**_BASE, "RAG_QUERY_ROUTE": True},
+    ),
+    "chunk-semantic": Variant(
+        name="chunk-semantic",
+        description=(
+            "语义分块：按相邻句向量距离找断点，而不是按空行。"
+            "重点看 boundary / cross_section 两个探针——它们考的正是"
+            "答案跨段落时分块有没有切在错的地方。入库时 embedding 调用量翻倍"
+        ),
+        overrides={**_BASE, "CHUNK_STRATEGY": "semantic"},
+    ),
+    # ===== 向量存储 =====
+    # 这两个变体量的**不是**回答质量，是 ANN 与向量库的代价。当前语料几千个向量，
+    # 精确检索召回本来就是 100%，所以正确的预期是「召回略降或不变、延迟变化」。
+    # 如果 ann-hnsw 的召回明显下降，说明参数太激进（调 VECTOR_HNSW_EF_SEARCH），
+    # 而不是"HNSW 不好用"。
+    "ann-hnsw": Variant(
+        name="ann-hnsw",
+        description=(
+            "进程内索引换成 HNSW 近似最近邻。和 baseline 比 recall@5 与 "
+            "avgRetrievalMs：这是「ANN 拿召回换延迟」这笔交易在本项目规模下的实价。"
+            "小库上它大概率是净亏——知道亏多少，比笼统说「大了要上 ANN」有用"
+        ),
+        overrides={**_BASE, "VECTOR_ANN": "hnsw"},
+    ),
+    "qdrant": Variant(
+        name="qdrant",
+        description=(
+            "向量走 Qdrant。**需要先起服务并回填**（docker-compose.qdrant.yml + "
+            "scripts/backfill_qdrant.py），否则会降级回 memory 后端跑出一份"
+            "和 baseline 一样的数字——那不是「Qdrant 没差别」，是它根本没被用到。"
+            "召回应当与 baseline 接近；真正的收益（多 worker 共享、重启不丢）"
+            "这套单进程评估量不出来"
+        ),
+        overrides={**_BASE, "VECTOR_STORE": "qdrant"},
+    ),
+    # ===== 脏语料：两个不同的问题，别混着读 =====
+    #
+    # A) dirty-pdf-like（无 +clean 对照）——量的是「丢掉结构要付多少代价」。
+    #    它的损伤清洗**修不了**：词内空格、丢掉的 # 标记、页眉页脚，全都只能靠
+    #    PDF 的字号与坐标复原，而降级产物是纯文本，没有几何信息。所以配一个
+    #    +clean 对照组只会得到"清洗毫无作用"这个假结论。和 baseline 比。
+    #
+    # B) dirty-gbk / dirty-unicode（成对）——量的是「清洗追回了多少」。
+    #    这两类损伤清洗修得了，差值才有意义。
+    "dirty-pdf-like": Variant(
+        name="dirty-pdf-like",
+        description=(
+            "语料按 PyPDF2 抽取 PDF 的样子降级（抹掉 # 标记、注入页眉页码、"
+            "长英文词里插空格、删空行）。和 baseline 比，差值就是「结构丢了值多少」，"
+            "也就是第 1 条 PDF 结构恢复的动机。重点看 recallByProbe 的 lexical——"
+            "RESOURCE_EXHAUSTED 被切成 RESOURC E_EXHAU STED 之后 BM25 的词元就没了"
+        ),
+        overrides={**_BASE, "EVAL_CORPUS_DEGRADE": "pdf_like"},
+    ),
+    "dirty-gbk": Variant(
+        name="dirty-gbk",
+        description=(
+            "语料真的用 GBK 重新编码，编码嗅探关闭。走 errors=\"replace\" 之后正文"
+            "变成一串 U+FFFD → tokenize 返回空 → BM25 建索引时整块跳过。"
+            "预期召回接近 0，且入库自检把文档判成 failed 并写明原因"
+        ),
+        overrides={**_BASE, "EVAL_CORPUS_DEGRADE": "gbk_bytes", "INGEST_CLEAN": False},
+    ),
+    "dirty-gbk+clean": Variant(
+        name="dirty-gbk+clean",
+        description=(
+            "同一份 GBK 语料，编码嗅探打开。这一对的差值应当接近「从完全不可用"
+            "到和 baseline 齐平」——七条改造里差值最大、也最容易被忽略的一条"
+        ),
+        overrides={**_BASE, "EVAL_CORPUS_DEGRADE": "gbk_bytes", "INGEST_CLEAN": True},
+    ),
+    "dirty-unicode": Variant(
+        name="dirty-unicode",
+        description=(
+            "全角 ASCII + 词内零宽字符 + CRLF + 控制字符，清洗关闭。"
+            "这类损伤比 pdf_like 隐蔽得多：屏幕上看起来完全正常，但 ４２９ 在"
+            "tokenize 眼里不是 429，夹了 U+200B 的词是两个词元"
+        ),
+        overrides={
+            **_BASE,
+            "EVAL_CORPUS_DEGRADE": "noisy_unicode",
+            "INGEST_CLEAN": False,
+        },
+    ),
+    "dirty-unicode+clean": Variant(
+        name="dirty-unicode+clean",
+        description=(
+            "同一份语料，清洗打开。clean_text 折全角、去零宽、规整换行,"
+            "所以这一对的差值全部归 clean_text —— 不掺 PDF 结构恢复那一侧"
+        ),
+        overrides={
+            **_BASE,
+            "EVAL_CORPUS_DEGRADE": "noisy_unicode",
+            "INGEST_CLEAN": True,
+        },
+    ),
+    "dirty-scanned": Variant(
+        name="dirty-scanned",
+        description=(
+            "图片型 PDF：有文件、抽不出任何文本。这个变体不是用来比召回的"
+            "（必然是 0），它验证的是入库自检真的把文档判成了 failed —— "
+            "改动前它会落成 status=indexed、chunks=0，界面上和正常文档毫无区别"
+        ),
+        overrides={**_BASE, "EVAL_CORPUS_DEGRADE": "scanned"},
     ),
 }
 

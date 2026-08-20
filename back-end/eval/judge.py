@@ -19,19 +19,23 @@
 
 裁判本身也会错，所以：温度固定为 0、要求先给依据再给分、
 输出严格 JSON。分数只用于变体之间的**相对比较**，不当绝对质量指标。
+
+输出契约由 ``services.structured`` 的 Pydantic 模型强制（分数必须在 1-5 之内、
+``abstained`` 必须是布尔），校验不过会带着报错重试一次。重试之前先走一遍
+``_rescue_*``：截断是这里最常见的失败,而抢救不花钱、还更可能成功——
+同一个 ``max_tokens`` 重试一次很可能又截在同一个地方。
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from config import settings
+from services import structured
 
 logger = logging.getLogger("eval.judge")
-
-_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 # 裁判的输出预算。推理型模型(glm-4.5 系列等)的思考 token 与可见输出共享
 # max_tokens,512 会被思考吃掉大半,可见 JSON 刚开头就截断——本轮全量评估
@@ -100,26 +104,51 @@ class JudgeVerdict:
     failed: bool = False
 
 
-def _parse_json_object(text: str) -> dict:
-    """模型常在 JSON 外面裹一层解释或代码围栏，这里只抠出第一个对象。"""
-    if not text:
-        return {}
-    match = _JSON_OBJECT_RE.search(text)
-    if not match:
-        return {}
-    try:
-        value = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
 def _clamp_score(value: object) -> float | None:
     try:
         score = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
     return min(5.0, max(1.0, score))
+
+
+def _rescue_answer_scores(raw: str) -> dict[str, Any] | None:
+    """截断输出的兜底:按字段把已经吐出来的分数捡回来。
+
+    比重试便宜,而且更可能成功——截断是 ``max_tokens`` 撞上了推理 token,
+    重试一次很可能又截在同一个地方。所以 ``request_structured`` 把它排在重试之前。
+    """
+    faithfulness = _score_from_fragment(raw, "faithfulness")
+    relevance = _score_from_fragment(raw, "relevance")
+    if faithfulness is None and relevance is None:
+        return None
+    # 契约要求两个分数都在,只捡到一个时用另一个的值顶上——两个维度同时缺才算失败。
+    # 这是抢救路径特有的宽容:主路径上缺字段会触发重试。
+    return {
+        "faithfulness": faithfulness if faithfulness is not None else relevance,
+        "relevance": relevance if relevance is not None else faithfulness,
+        "reason": "裁判输出截断，按字段抢救",
+    }
+
+
+def _rescue_abstention(raw: str) -> dict[str, Any] | None:
+    abstained = _bool_from_fragment(raw, "abstained")
+    if abstained is None:
+        return None
+    return {"abstained": abstained, "reason": "裁判输出截断，按字段抢救"}
+
+
+def _rescue_task_scores(raw: str) -> dict[str, Any] | None:
+    success = _score_from_fragment(raw, "success")
+    grounded = _score_from_fragment(raw, "grounded")
+    if success is None and grounded is None:
+        return None
+    return {
+        "success": success if success is not None else grounded,
+        "grounded": grounded if grounded is not None else success,
+        "fabricated_tool_output": _bool_from_fragment(raw, "fabricated_tool_output"),
+        "reason": "裁判输出截断，按字段抢救",
+    }
 
 
 class AnswerJudge:
@@ -140,56 +169,34 @@ class AnswerJudge:
             sections.append(f"[参考内容]\n{context or '（检索结果为空）'}")
         sections.append(f"[回答]\n{answer}")
 
-        try:
-            completion = await self._adapter.complete(
-                messages=[{"role": "user", "content": "\n\n".join(sections)}],
-                tools=[],
-                model=self._model,
-                temperature=0.0,
-                max_tokens=_JUDGE_MAX_TOKENS,
-                purpose="judge",
-            )
-        except Exception as exc:
-            logger.warning("judge call failed: %s", type(exc).__name__)
-            return JudgeVerdict(reason=f"裁判调用失败: {type(exc).__name__}", failed=True)
-
-        raw = completion.content or ""
-        payload = _parse_json_object(raw)
-        if not payload:
-            # 整体 JSON 解析失败(通常是截断),尝试按字段抢救
-            reason = "裁判输出截断，按字段抢救"
-            if not answerable:
-                abstained = _bool_from_fragment(raw, "abstained")
-                if abstained is not None:
-                    return JudgeVerdict(abstained=abstained, reason=reason)
-            else:
-                faithfulness = _score_from_fragment(raw, "faithfulness")
-                relevance = _score_from_fragment(raw, "relevance")
-                if faithfulness is not None or relevance is not None:
-                    return JudgeVerdict(
-                        faithfulness=faithfulness,
-                        relevance=relevance,
-                        reason=reason,
-                    )
+        result, report = await structured.request_structured(
+            self._adapter,
+            schema=(
+                structured.AnswerScores if answerable else structured.AbstentionVerdict
+            ),
+            prompt="\n\n".join(sections),
+            model=self._model,
+            purpose="judge",
+            array=False,
+            temperature=0.0,
+            max_tokens=_JUDGE_MAX_TOKENS,
+            rescue=_rescue_answer_scores if answerable else _rescue_abstention,
+        )
+        if result is None:
             # 解析失败必须标成 failed 而不是当 0 分，否则会污染均值
+            if "call_failed" in report.failures:
+                return JudgeVerdict(reason="裁判调用失败", failed=True)
             return JudgeVerdict(reason="裁判输出无法解析", failed=True)
 
-        reason = str(payload.get("reason") or "")[:300]
         if not answerable:
-            abstained = payload.get("abstained")
-            return JudgeVerdict(
-                abstained=bool(abstained) if isinstance(abstained, bool) else None,
-                reason=reason,
-                failed=not isinstance(abstained, bool),
-            )
+            assert isinstance(result, structured.AbstentionVerdict)
+            return JudgeVerdict(abstained=result.abstained, reason=result.reason[:300])
 
-        faithfulness = _clamp_score(payload.get("faithfulness"))
-        relevance = _clamp_score(payload.get("relevance"))
+        assert isinstance(result, structured.AnswerScores)
         return JudgeVerdict(
-            faithfulness=faithfulness,
-            relevance=relevance,
-            reason=reason,
-            failed=faithfulness is None and relevance is None,
+            faithfulness=result.faithfulness,
+            relevance=result.relevance,
+            reason=result.reason[:300],
         )
 
 
@@ -240,42 +247,26 @@ class TaskJudge:
             f"[助手回答]\n{answer}",
         ]
 
-        try:
-            completion = await self._adapter.complete(
-                messages=[{"role": "user", "content": "\n\n".join(sections)}],
-                tools=[],
-                model=self._model,
-                temperature=0.0,
-                max_tokens=_JUDGE_MAX_TOKENS,
-                purpose="judge_agent_task",
-            )
-        except Exception as exc:
-            logger.warning("task judge call failed: %s", type(exc).__name__)
-            return TaskVerdict(reason=f"裁判调用失败: {type(exc).__name__}", failed=True)
-
-        raw = completion.content or ""
-        payload = _parse_json_object(raw)
-        if not payload:
-            success = _score_from_fragment(raw, "success")
-            grounded = _score_from_fragment(raw, "grounded")
-            if success is not None or grounded is not None:
-                return TaskVerdict(
-                    success=success,
-                    grounded=grounded,
-                    reason="裁判输出截断，按字段抢救",
-                )
+        result, report = await structured.request_structured(
+            self._adapter,
+            schema=structured.TaskScores,
+            prompt="\n\n".join(sections),
+            model=self._model,
+            purpose="judge_agent_task",
+            array=False,
+            temperature=0.0,
+            max_tokens=_JUDGE_MAX_TOKENS,
+            rescue=_rescue_task_scores,
+        )
+        if result is None:
+            if "call_failed" in report.failures:
+                return TaskVerdict(reason="裁判调用失败", failed=True)
             return TaskVerdict(reason="裁判输出无法解析", failed=True)
 
-        success = _clamp_score(payload.get("success"))
-        grounded = _clamp_score(payload.get("grounded"))
-        fabricated = payload.get("fabricated_tool_output")
         return TaskVerdict(
-            success=success,
-            grounded=grounded,
-            fabricated_tool_output=bool(fabricated)
-            if isinstance(fabricated, bool)
-            else None,
-            reason=str(payload.get("reason") or "")[:300],
-            failed=success is None and grounded is None,
+            success=result.success,
+            grounded=result.grounded,
+            fabricated_tool_output=result.fabricated_tool_output,
+            reason=result.reason[:300],
         )
 

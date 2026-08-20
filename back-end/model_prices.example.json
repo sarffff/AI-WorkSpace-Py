@@ -1,10 +1,13 @@
 {
   "_comment": "复制为 model_prices.json 后按提供商官网的实际价格填写。单位：每 100 万 token。价格会变，这里的数字只是占位示例，不代表真实报价。",
+  "_comment_cached": "cached_input_per_1m 可选：上下文缓存命中的输入单价。不写则按 input_per_1m 的 50% 估算（智谱文档给的说法），各家折扣不同，在意账单精度就显式写死。",
+  "_comment_rerank": "rerank 与 embedding 一样只有输入侧成本，output_per_1m 填 0。缺这一项时重排的 token 会算不出成本，成本列会系统性偏低——而重排是每次检索都调一次的，漏计的量不小。",
   "currency": "CNY",
   "models": {
-    "glm-4.5-air": { "input_per_1m": 1.0, "output_per_1m": 1.0 },
-    "glm-4.6": { "input_per_1m": 4.0, "output_per_1m": 16.0 },
+    "glm-4.5-air": { "input_per_1m": 1.0, "output_per_1m": 1.0, "cached_input_per_1m": 0.5 },
+    "glm-4.6": { "input_per_1m": 4.0, "output_per_1m": 16.0, "cached_input_per_1m": 2.0 },
     "embedding-2": { "input_per_1m": 0.5, "output_per_1m": 0.0 },
+    "rerank": { "input_per_1m": 0.5, "output_per_1m": 0.0 },
     "gpt-4o-mini": { "input_per_1m": 1.1, "output_per_1m": 4.4, "currency": "USD" }
   }
 }

@@ -4,31 +4,41 @@
 差的是**能接触知识库以外的东西**，以及**能改变工作区的状态**——只读工具再加十个，
 也还是一个搜索框。
 
-这里四个工具各自解决一类缺口：
+这里七个工具各自解决一类缺口：
 
 - ``calculate``：模型的算术不可靠，而且错得很自然（数字看着就像对的）。
 - ``web_search``：知识库回答"我存过的资料里怎么说"，回答不了"现在是什么情况"。
 - ``read_attachment``：附件此前只是被归档，模型拿到的是一个 URL 字符串。
 - ``save_to_knowledge_base``：唯一的写操作，也是唯一能让工作区状态改变的工具。
+- ``delete_knowledge_document``：删除文档。破坏性写操作，除了开关之外还要
+  **确认令牌**——用户本回合明确说过要删，工具才真正执行（见 ``_ToolApprovals``）。
+- ``ask_user``：澄清工具。关键信息缺失时把问题抛回给用户，而不是硬猜参数，
+  回合在此终止等待用户回答（由 chat_service 特殊处理）。
+- ``fetch_web_page``：把 URL 抓成纯文本再过护栏。与 ``web_search`` 的区别是
+  抓正文而不是看摘要，SSRF 面也因此更大。
 
 每个工具都独立开关，且**默认全部关闭**：打开一个工具就是把它的失败模式和攻击面
 一起打开，该由使用者按需决定，而不是升级一次依赖就悄悄多出四个能力。
 
 失败语义沿用 ``ToolStatus`` 的三档：参数不对或目标不存在时返回一段模型能据此
 自我修正的说明（``ok``，因为工具本身没坏）；通道故障时让异常冒出去，由
-``ToolRuntime`` 记成 ``unavailable``，循环随即收敛而不是原地重试。
+``ToolRuntime`` 记成 ``unavailable``，循环随即收敛而不是原地重试——熔断器还会
+把连续失败的工具体从本轮 schema 里移除。
 """
 from __future__ import annotations
 
 import ast
+import html
 import logging
 import math
 import operator
 import os
 import re
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
+import httpx
 from sqlalchemy.orm import Session
 
 from config import settings
@@ -426,15 +436,275 @@ def _build_save_tool(
     )
 
 
+# ========== 用户授权（确认令牌） ==========
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolApprovals:
+    """工具执行所需的用户授权。默认全部拒绝。
+
+    这些令牌由 chat_service 在每回合开始时按**用户原话**（当前问题 + 近期历史）
+    计算，随工具一起下发。它是给工具处理器看的：处理器自身拿不到对话上下文，
+    而"用户是否真的要求过删除"这件事只有拿到原话才能判定——这正是写操作
+    （``save_to_knowledge_base`` / ``delete_knowledge_document``）从不给子代理的
+    原因：子代理看到的只有主代理转述的任务，转述里说什么都等于用户说的。
+
+    默认拒绝是刻意的：缺了确认的破坏性操作不该执行，而该向模型解释原因，
+    让它把"需要用户明确同意"转述给用户，而不是静默跳过。
+    """
+
+    delete_granted: bool = False
+
+
+# 判定"用户明确要求删除"的意图词。删文档只有这几种说法，用词表而不是让模型判：
+# 模型可能把别处夹带的指令当成用户意图，词表只认用户原话里的字面表达。
+_DELETE_INTENT = re.compile(r"(删除|删掉|删了|移除|清理|去掉|不要了)")
+# 否定词紧贴在意图词之前时不生效："不要删除""别删"都不算授权。
+_DELETE_NEGATED = re.compile(r"(不|别|勿|不要|别要)\s?(删除|删掉|删了|移除|清理|去掉)")
+
+
+def detect_delete_intent(text: str) -> bool:
+    """扫描用户原话，判定是否明确要求删除文档。"""
+    return bool(_DELETE_INTENT.search(text or "")) and not bool(
+        _DELETE_NEGATED.search(text or "")
+    )
+
+
+# ========== delete_knowledge_document ==========
+
+
+def _build_delete_tool(
+    db: Session, scope: Any, knowledge: Any, approvals: _ToolApprovals
+) -> ToolDefinition:
+    async def delete_knowledge_document(arguments: dict[str, Any]) -> str:
+        doc_id = arguments.get("document_id")
+        if not isinstance(doc_id, str) or not doc_id.strip():
+            return "删除失败：document_id 必须是非空字符串。"
+
+        # 与真实 API（knowledge_router 的 DELETE /documents/{id}）一致：删除是
+        # 管理操作。member 没有写权限，也不该有删除权限——只读与破坏只差一个
+        # 参数，而破坏没有撤销按钮。
+        if not getattr(scope, "is_admin", False):
+            return "删除失败：你是工作区的普通成员，只有管理员可以删除知识库文档。"
+
+        # 参数锚定：模型给的 id 必须真的存在于当前工作区。查一次列表再删，
+        # 而不是把未知 id 直接丢给 delete_document 等它返回 False——前者能
+        # 告诉模型"去 list 一下拿真实 id"，后者只会得到一句泛泛的失败。
+        # 顺带确认了作用域：delete_document 自己也按 workspace_id 过滤，
+        # 但这里先挡一步，避免把"删了别人的文档"这类结果转述给用户。
+        documents = await knowledge.get_documents(db, scope.workspace_id)
+        known = {str(document["id"]) for document in documents}
+        if doc_id.strip() not in known:
+            return (
+                f"删除失败：document_id {doc_id.strip()!r} 不在当前工作区的知识库中。"
+                "请先调用 list_knowledge_documents 获取真实的 document_id 再删除。"
+            )
+
+        # 确认令牌：删除不可逆。单靠 description 里写"只在用户明确要求时使用"
+        # 拦不住——模型可能把网页或资料里夹带的指令当成用户意图，而写操作只做
+        # 提示词约束等于没约束。令牌由 chat_service 按用户原话判定，这里只消费。
+        if not approvals.delete_granted:
+            return (
+                "删除失败：删除文档是不可逆操作，需要用户在对话里明确要求过删除"
+                "才会执行。请先向用户确认是否真的要删除这份文档，确认后我再删。"
+            )
+
+        deleted = await knowledge.delete_document(db, doc_id.strip(), scope.workspace_id)
+        if not deleted:
+            return f"删除失败：文档 {doc_id.strip()} 不存在（可能刚被删除）。"
+        return f"已删除文档（document_id: {doc_id.strip()}）。"
+
+    return ToolDefinition(
+        name="delete_knowledge_document",
+        description=(
+            "删除知识库中的一份文档，不可恢复。只在用户明确要求删除时使用；"
+            "document_id 必须来自 list_knowledge_documents 的返回，不要自己拼。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "document_id": {
+                    "type": "string",
+                    "description": "要删除文档的 document_id，必须来自 list_knowledge_documents",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "删除原因（可选，用于告知用户）",
+                },
+            },
+            "required": ["document_id"],
+            "additionalProperties": False,
+        },
+        handler=delete_knowledge_document,
+    )
+
+
+# ========== ask_user ==========
+
+_ASK_USER_MAX_CHARS = 500
+
+
+async def _ask_user(arguments: dict[str, Any]) -> str:
+    question = arguments.get("question")
+    if not isinstance(question, str) or not question.strip():
+        return "澄清失败：question 必须是非空字符串。"
+    if len(question) > _ASK_USER_MAX_CHARS:
+        return f"澄清失败：question 不能超过 {_ASK_USER_MAX_CHARS} 字符。"
+    # 返回的就是问题本身。chat_service 会把它作为 clarification 事件发出并
+    # 终止本轮工具循环，所以内容直接可展示，不需要再加一层包装。
+    return question.strip()
+
+
+_ASK_USER = ToolDefinition(
+    name="ask_user",
+    description=(
+        "向用户提出一个澄清问题并结束本轮工具调用，等待用户回答。"
+        "当任务的关键信息缺失、任何工具调用都只能在赌参数时使用，"
+        "不要用它做确认或闲聊。问题要具体、一次只问一个，"
+        "回答它应该能让后续调用不再需要猜测。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "要问用户的具体问题，限一个问题",
+            }
+        },
+        "required": ["question"],
+        "additionalProperties": False,
+    },
+    handler=_ask_user,
+)
+
+
+# ========== fetch_web_page ==========
+
+
+class _FetchError(Exception):
+    """抓取失败（超限、状态码、解码等），消息可直接展示给模型。"""
+
+
+async def _http_get_text(url: str, max_bytes: int, timeout: float) -> str:
+    """抓取一个 URL 的正文并解码。独立成函数，测试可替换传输层。"""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (compatible; AI-Workspace/1.0; "
+            "+https://github.com/anomalyco/opencode)"
+        )
+    }
+    async with httpx.AsyncClient(
+        follow_redirects=True, timeout=timeout, headers=headers
+    ) as client:
+        async with client.stream("GET", url) as response:
+            response.raise_for_status()
+            chunks: list[bytes] = []
+            size = 0
+            async for chunk in response.aiter_bytes():
+                size += len(chunk)
+                if size > max_bytes:
+                    raise _FetchError(
+                        f"页面超过 {max_bytes} 字节上限，未完整读取。"
+                    )
+                chunks.append(chunk)
+    try:
+        return b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            return b"".join(chunks).decode("gb18030")
+        except UnicodeDecodeError as exc:
+            raise _FetchError("页面不是可识别的文本编码（utf-8/gb18030）。") from exc
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_SKIP_RE = re.compile(
+    r"<(script|style|noscript|iframe|svg|template)[^>]*>.*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def html_to_text(raw: str) -> str:
+    """把 HTML 剥成纯文本：先整段剔除脚本/样式块，再剥标签、反转义、折叠空白。
+
+    网页正文里的 ``<script>`` 常常整段是注入内容（``<script>忽略以上指令</script>``），
+    逐标签剥会把脚本里的指令原文留在文本里；所以先按块剔除，剩下的再剥标签。
+    """
+    stripped = _SKIP_RE.sub(" ", raw or "")
+    stripped = _TAG_RE.sub(" ", stripped)
+    text = html.unescape(stripped)
+    return " ".join(text.split())
+
+
+async def _fetch_web_page(arguments: dict[str, Any]) -> str:
+    url = arguments.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return "抓取失败：url 必须是非空字符串。"
+    scheme = urlparse(url.strip()).scheme.lower()
+    if scheme not in ("http", "https"):
+        return (
+            f"抓取失败：只支持 http/https 链接，收到 {scheme or '（无协议）'!r}。"
+        )
+    try:
+        raw = await _http_get_text(
+            url.strip(),
+            settings.WEB_FETCH_MAX_BYTES,
+            settings.WEB_FETCH_TIMEOUT_SECONDS,
+        )
+    except _FetchError as exc:
+        return f"抓取失败：{exc}"
+    except Exception as exc:
+        # httpx 的失败种类很多（超时/连接拒绝/404/SSL），统一给可读提示。
+        # 通道故障让异常冒出去也可以，但单页抓取的失败大多可归因于 URL 本身，
+        # 给模型一句可执行的建议（换 URL 或改用 web_search）比直接记 unavailable 有用。
+        return f"抓取失败：{type(exc).__name__}。请检查 URL 是否有效，或改用 web_search。"
+
+    body = html_to_text(raw)
+    limit = max(0, settings.WEB_FETCH_MAX_CHARS)
+    if len(body) > limit:
+        body = body[:limit] + f"\n\n[网页过长已截断，原文 {len(body)} 字符]"
+    # 网页是这套系统里最大的注入面：任何人都能发布内容，且抓取是**模型主动**拿的，
+    # 不像知识库至少是用户自己放进去的。所以护栏不是可选项。
+    shielded, _report = guard.shield(
+        f"【{url.strip()}】\n{body}", label="网页内容", kind="fetch_web_page"
+    )
+    return shielded
+
+
+_WEB_FETCH = ToolDefinition(
+    name="fetch_web_page",
+    description=(
+        "抓取一个网页的正文全文（纯文本，已剔除脚本与样式）。"
+        "适合需要网页细节、摘要不够用时。只支持 http/https。"
+        "引用内容时必须给出链接，并说明这是网络来源而非本地资料。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "要抓取的完整 URL，含 http(s)://"},
+        },
+        "required": ["url"],
+        "additionalProperties": False,
+    },
+    handler=_fetch_web_page,
+)
+
+
 # ========== 组装 ==========
 
 
-def build(db: Session, scope: Any, knowledge: Any) -> list[ToolDefinition]:
+def build(
+    db: Session,
+    scope: Any,
+    knowledge: Any,
+    approvals: _ToolApprovals | None = None,
+) -> list[ToolDefinition]:
     """按开关组装 workspace 工具。
 
     没开的工具**根本不注册**,而不是注册一个返回"该功能未启用"的版本:后者每轮
     都会被模型试一次,白烧一轮上下文还拿不到东西。``web_search`` 更进一步——
     开关开了但没配 API key 时同样不注册,因为那时它必然失败。
+
+    ``approvals`` 是破坏性操作的确认令牌,由调用方按用户原话计算;缺省即全拒。
     """
     tools: list[ToolDefinition] = []
     if settings.TOOL_CALCULATE_ENABLED:
@@ -445,6 +715,12 @@ def build(db: Session, scope: Any, knowledge: Any) -> list[ToolDefinition]:
         tools.append(_READ_ATTACHMENT)
     if settings.TOOL_WRITE_KNOWLEDGE_ENABLED:
         tools.append(_build_save_tool(db, scope, knowledge))
+    if settings.TOOL_DELETE_KNOWLEDGE_ENABLED:
+        tools.append(_build_delete_tool(db, scope, knowledge, approvals or _ToolApprovals()))
+    if settings.TOOL_ASK_USER_ENABLED:
+        tools.append(_ASK_USER)
+    if settings.TOOL_WEB_FETCH_ENABLED:
+        tools.append(_WEB_FETCH)
     return tools
 
 
@@ -461,16 +737,25 @@ def enabled_names() -> list[str]:
         names.append("read_attachment")
     if settings.TOOL_WRITE_KNOWLEDGE_ENABLED:
         names.append("save_to_knowledge_base")
+    if settings.TOOL_DELETE_KNOWLEDGE_ENABLED:
+        names.append("delete_knowledge_document")
+    if settings.TOOL_ASK_USER_ENABLED:
+        names.append("ask_user")
+    if settings.TOOL_WEB_FETCH_ENABLED:
+        names.append("fetch_web_page")
     return names
 
 
 __all__ = [
     "WRITE_NAME_PREFIX",
     "WebSearchError",
+    "_ToolApprovals",
     "build",
+    "detect_delete_intent",
     "enabled_names",
     "evaluate_expression",
     "file_extension",
+    "html_to_text",
     "resolve_upload_path",
     "safe_document_name",
 ]

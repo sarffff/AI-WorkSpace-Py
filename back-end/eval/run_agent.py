@@ -50,6 +50,7 @@ _DIAGNOSTICS = [
     ("modelToolCalls", "模型工具调用"),
     ("prefetchCalls", "预检索次数"),
     ("repeatedCalls", "重复调用"),
+    ("repeatedBlocked", "重复已拦截"),
     ("unavailableCalls", "工具不可用"),
     ("invalidCalls", "参数错误"),
     ("guardrailHits", "护栏命中"),

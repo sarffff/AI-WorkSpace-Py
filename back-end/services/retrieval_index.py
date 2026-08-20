@@ -148,10 +148,44 @@ class VectorIndex:
             self._matrix = matrix / norms  # 归一化后内积即余弦相似度
 
             if _FAISS_AVAILABLE:
-                self._faiss_index = faiss.IndexFlatIP(self._matrix.shape[1])
-                self._faiss_index.add(self._matrix)
+                self._faiss_index = self._build_faiss(self._matrix)
             else:
                 self._faiss_index = None
+
+    @staticmethod
+    def _build_faiss(matrix: "np.ndarray"):
+        """按 ``VECTOR_ANN`` 建精确索引或 HNSW 图。
+
+        HNSW 在这个语料规模下**只会更差**：几千个向量的暴力内积本来就是毫秒级，
+        而 HNSW 既有建图开销又有召回损失。它存在的意义是让"ANN 要付多少代价"变成
+        一个能量出来的数（``recall@5`` 与 ``avgRetrievalMs`` 一起看），而不是一句
+        "到了大规模就该上 ANN"的口号——真到那个规模时，代价曲线长什么样得先知道。
+
+        用 ``IndexHNSWFlat`` + ``METRIC_INNER_PRODUCT``：向量已经 L2 归一化，
+        所以内积就是余弦相似度，和 ``IndexFlatIP`` 那条路的分数量纲一致。量纲不一致
+        会让 ``RAG_MIN_SCORE`` 这个阈值在两个后端下含义不同——那种 bug 不会报错。
+        """
+        dimension = matrix.shape[1]
+        if (settings.VECTOR_ANN or "").strip().lower() != "hnsw":
+            index = faiss.IndexFlatIP(dimension)
+            index.add(matrix)
+            return index
+
+        index = faiss.IndexHNSWFlat(
+            dimension, max(4, settings.VECTOR_HNSW_M), faiss.METRIC_INNER_PRODUCT
+        )
+        index.hnsw.efConstruction = max(8, settings.VECTOR_HNSW_EF_CONSTRUCT)
+        index.hnsw.efSearch = max(8, settings.VECTOR_HNSW_EF_SEARCH)
+        index.add(matrix)
+        logger.info(
+            "built HNSW index: n=%s d=%s M=%s efC=%s efS=%s",
+            matrix.shape[0],
+            dimension,
+            settings.VECTOR_HNSW_M,
+            settings.VECTOR_HNSW_EF_CONSTRUCT,
+            settings.VECTOR_HNSW_EF_SEARCH,
+        )
+        return index
 
     def search(self, query_vector: list[float], top_k: int = 5) -> list[tuple[float, str]]:
         """返回 [(余弦相似度, chunk_id), ...]，按分数降序。"""
@@ -281,18 +315,29 @@ class BM25Index:
 
 
 def reciprocal_rank_fusion(
-    rankings: list[list[str]], k: int = 60
+    rankings: list[list[str]], k: int = 60, weights: list[float] | None = None
 ) -> list[tuple[str, float]]:
     """RRF 融合多条召回通道。
 
-    每条通道贡献 ``1 / (k + rank)``，只用排名不用分数——这样余弦相似度和 BM25
+    每条通道贡献 ``weight / (k + rank)``，只用排名不用分数——这样余弦相似度和 BM25
     分数不需要归一化就能合并，也不会因为某一路分数尺度大而独占结果。
     常数 k（经验值 60）压低头部名次的权重差，让多路都命中的文档更容易冒头。
+
+    ``weights`` 让不同通道有不同话语权：一个精确编号查询本该偏 BM25，一个
+    改述式提问本该偏稠密向量，而"两路各占一半"对两者都不是最优。缺省 ``None``
+    等价于全 1.0，与加权之前**逐位相同**——这一点是有意保证的，否则所有既有
+    评估基线都会因为一次重构而失效，没法再和新数字比。
+
+    权重个数与通道数不匹配时按 1.0 补齐而不是抛错：多查询改写会让通道数变成
+    动态的（每个改写变体各贡献两路），调用方很难预先算准个数。
     """
     scores: dict[str, float] = {}
-    for ranking in rankings:
+    for index, ranking in enumerate(rankings):
+        weight = 1.0
+        if weights is not None and index < len(weights):
+            weight = weights[index]
         for rank, chunk_id in enumerate(ranking, start=1):
-            scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank)
+            scores[chunk_id] = scores.get(chunk_id, 0.0) + weight / (k + rank)
     return sorted(scores.items(), key=lambda item: (-item[1], item[0]))
 
 

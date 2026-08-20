@@ -1,6 +1,7 @@
 import json
 import logging
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator
 
 from sqlalchemy.orm import Session
@@ -15,16 +16,36 @@ from services import guardrails
 from services.guardrails import guard, mask_markup
 from services.knowledge_service import KnowledgeService
 from services.memory_service import memory_service
-from services.model_adapter import ModelAdapter, ModelCompletion, OpenAICompatibleAdapter
+from services.model_adapter import (
+    ModelAdapter,
+    ModelCompletion,
+    OpenAICompatibleAdapter,
+    ToolCall,
+)
 from services import prompt_library
 from services.semantic_cache import semantic_cache
-from services.telemetry import SpanKind, set_span_defaults, tracer
+from services.telemetry import (
+    SpanKind,
+    current_trace_id,
+    set_span_defaults,
+    tracer,
+)
 from services.token_budget import HistoryMessage
 from services import agent_roles
+from services import agent_state
+from services import approval
+from services import checkpoint_store
 from services import subagent
 from services import tool_history
 from services import workspace_service
-from services.tool_runtime import ToolDefinition, ToolRuntime, ToolStatus
+from services.tool_runtime import (
+    CircuitBreaker,
+    RepeatGuard,
+    ToolDefinition,
+    ToolResult,
+    ToolRuntime,
+    ToolStatus,
+)
 from services import vision
 from services import workspace_tools
 
@@ -47,6 +68,18 @@ class _ToolResultBudget:
     def exhausted(self) -> bool:
         return self._remaining <= 0
 
+    @property
+    def remaining(self) -> int:
+        return self._remaining
+
+    def restore(self, remaining: int) -> None:
+        """从快照恢复余额。
+
+        不恢复就是"中断一次 = 预算重置一次":用户点一下同意,模型又拿到一整份
+        12000 字符的额度。审批的语义是"这一次操作我批准了",不是"重新发一次预算"。
+        """
+        self._remaining = max(0, remaining)
+
     def take(self, text: str) -> str:
         limit = min(self._per_call, self._remaining)
         if limit <= 0:
@@ -64,11 +97,16 @@ class _ToolScope:
 
     知识库的可见单位是工作区(全员共享、admin 管理),而记忆、附件这些
     仍然是用户个人的——两个 id 必须一起传,否则总有一处作用域用错。
+
+    ``history`` 在工具构建之前取回并回填(确认令牌按用户原话计算,搜索工具的
+    指代消解也要靠它),工具处理器执行时直接读这个字段。
+    默认空列表,于是没填的调用方(比如子代理)行为与改动前逐位相同。
     """
 
     user_id: str
     workspace_id: str
     is_admin: bool
+    history: list[HistoryMessage] = field(default_factory=list)
 
 
 class _Delegations:
@@ -97,6 +135,51 @@ class _Delegations:
         outcomes = self.pending
         self.pending = []
         return outcomes
+
+
+@dataclass(slots=True)
+class _TurnContext:
+    """一个回合里**不可序列化**的那一半。
+
+    与 ``agent_state.TurnState`` 正好互补:那边是数据(能进数据库、能跨请求),
+    这边是协作者(持有数据库会话、HTTP 客户端、埋点 span)。恢复时 state 从
+    快照读出来,context 按 state 里的参数**重建**——所以重建必须是确定性的,
+    这是"恢复"与"重新开始"唯一的区别所在。
+
+    把两者分开是这次重构的全部收益:改动之前它们混在同一批局部变量里,
+    于是没有任何一个子集是可以存下来的。
+    """
+
+    runtime: ToolRuntime
+    budget: _ToolResultBudget
+    repeats: RepeatGuard
+    breaker: CircuitBreaker
+    citations: list[dict]
+    generation: dict[str, Any]
+    scope: _ToolScope
+    turn: Any
+    delegations: _Delegations | None = None
+    gated: frozenset[str] = frozenset()
+
+    def sync_to(self, state: agent_state.TurnState) -> None:
+        """把守卫余额写回 state。每次快照之前调。"""
+        state.budget_remaining = self.budget.remaining
+        counts, blocked = self.repeats.snapshot()
+        state.repeat_counts = counts
+        state.repeat_blocked = blocked
+        consecutive, tripped = self.breaker.snapshot()
+        state.breaker_consecutive = consecutive
+        state.breaker_tripped = tripped
+        if self.delegations is not None:
+            state.delegations_used = self.delegations.used
+
+    def restore_from(self, state: agent_state.TurnState) -> None:
+        """把 state 里的余额灌回守卫。重建 context 之后立刻调。"""
+        self.budget.restore(state.budget_remaining)
+        self.repeats.restore(state.repeat_counts, state.repeat_blocked)
+        self.breaker.restore(state.breaker_consecutive, state.breaker_tripped)
+        if self.delegations is not None:
+            self.delegations.used = state.delegations_used
 
 
 class ChatService:
@@ -180,6 +263,8 @@ class ChatService:
         # 反馈随对话删的取舍写在 feedback_service.discard_chat 的文档串里。
         tool_history.discard_chat(db, chat_id)
         feedback_service.discard_chat(db, chat_id)
+        # 快照里存着整段 messages。用户删了对话却留下一份完整副本是说不过去的
+        checkpoint_store.discard_chat(db, chat_id)
         db.delete(chat)
         db.commit()
         self._invalidate_chats_cache(user_id)
@@ -357,7 +442,15 @@ class ChatService:
 
         没声明 ``prefetched`` 的版本(比如关掉 RAG 那一版)硬传进去会直接抛错,
         这正是想要的:换版本时漏改调用方,应该在这里炸,而不是静默少一段约束。
+
+        ``PROMPT_CACHE_STABLE_PREFIX`` 开启时一律按 ``prefetched=False`` 渲染。
+        提供商的上下文缓存是隐式的、按前缀逐字匹配的,而这条消息是整个前缀的第一
+        条——它随预检索命中与否在两种正文之间来回切,等于每次翻转都把整段缓存作废。
+        那句"已预检索过、不要重复检索"改由用户消息携带(见 ``_run_turn``),
+        它讲的本来就是"本轮发生了什么",和预检索没命中时那句提示同属一类。
         """
+        if settings.PROMPT_CACHE_STABLE_PREFIX:
+            prefetched = False
         flags = {"prefetched": prefetched} if "prefetched" in template.flags else None
         return template.render(flags=flags)
 
@@ -404,6 +497,7 @@ class ChatService:
         scope: "_ToolScope",
         use_rag: bool,
         citation_sink: list[dict] | None = None,
+        approvals: workspace_tools._ToolApprovals | None = None,
     ) -> list[ToolDefinition]:
         """本轮下发给模型的工具面。
 
@@ -412,14 +506,37 @@ class ChatService:
         知识库,把它们绑在同一个开关上,用户关掉知识库就连计算器都没了。
 
         workspace 工具默认全部关闭,所以默认行为与只有知识库工具时逐位相同。
+        ``approvals`` 是破坏性操作的确认令牌(按用户原话计算),传给 workspace
+        工具的构建器;缺省即全拒。
         """
         tools: list[ToolDefinition] = []
         if use_rag:
             tools.extend(self._create_knowledge_tools(db, scope, citation_sink))
         tools.extend(
-            workspace_tools.build(db, scope, self._get_knowledge_service())
+            workspace_tools.build(db, scope, self._get_knowledge_service(), approvals)
         )
         return tools
+
+    def _approvals_for(
+        self, prompt: str, history: list[HistoryMessage]
+    ) -> workspace_tools._ToolApprovals:
+        """本回合工具执行需要的用户授权。
+
+        确认令牌的全部意义在于"用户真的要求过"这件事，只能由拿得到用户原话的
+        一方来判定——主代理看得到，子代理看不到（所以写操作永远不给子代理）。
+        这里扫的是当前问题与近期历史里**用户的消息原文**，而不是模型对原话的
+        转述：转述可能掺入资料或网页里夹带的指令，原文不会。
+        """
+        texts = [prompt]
+        for message in reversed(history):
+            if message.role == "user":
+                texts.append(message.content or "")
+            if len(texts) >= 3:
+                break
+        joined = "\n".join(texts)
+        return workspace_tools._ToolApprovals(
+            delete_granted=workspace_tools.detect_delete_intent(joined)
+        )
 
     @staticmethod
     def _supervisor_tools(
@@ -483,6 +600,57 @@ class ChatService:
             handler=delegate,
         )
 
+    def _build_tool_surface(
+        self,
+        base_tools: list[ToolDefinition],
+        *,
+        generation: dict[str, Any],
+        take_budget: Any,
+        breaker: CircuitBreaker,
+        turn: Any,
+    ) -> tuple[ToolRuntime, _Delegations | None]:
+        """组装本回合真正下发的工具面（含委派）。
+
+        新回合和**中断恢复**都走这一个函数。这不是为了少写二十行:恢复要求
+        "同样的参数得到同一套工具面",两条各自构建的路径迟早会漂移,而漂移的
+        表现是"恢复之后行为微妙地不一样"——比在这里多一层间接要难查得多。
+
+        子代理的运行时拿的是**未经角色过滤的**完整工具集合,按角色过滤发生在
+        ``SubAgentRunner._schemas_for``(下发哪些 schema)和它的执行前检查(越权拦截)
+        两处。让运行时本身只装该角色的工具也能做到,但那样每次委派都要重建一次
+        ToolRuntime,而这几个工具里有的持有数据库会话与 HTTP 客户端。
+
+        熔断器各自持有:子代理里的失败不该把主代理的工具熔断掉,反之亦然——
+        它们面对的是不同的模型行为,不该互相牵连。
+        """
+        delegations: _Delegations | None = None
+        tools = base_tools
+        if subagent.enabled():
+            registered = {tool.name for tool in base_tools}
+            roles = agent_roles.available(registered)
+            if roles:
+                delegations = _Delegations(settings.AGENT_MAX_DELEGATIONS)
+                runner = subagent.SubAgentRunner(
+                    self.model_adapter,
+                    ToolRuntime(
+                        base_tools,
+                        CircuitBreaker(settings.TOOL_CIRCUIT_BREAKER_FAILURES),
+                    ),
+                    generation=generation,
+                    take_budget=take_budget,
+                )
+                if settings.AGENT_DELEGATION_MODE == "supervisor":
+                    tools = self._supervisor_tools(base_tools, roles)
+                tools = [
+                    *tools,
+                    self._create_delegate_tool(roles, runner, delegations),
+                ]
+                turn.set(
+                    delegation_mode=settings.AGENT_DELEGATION_MODE,
+                    delegation_roles=[role.name for role in roles],
+                )
+        return ToolRuntime(tools, breaker), delegations
+
     def _create_knowledge_tools(
         self,
         db: Session,
@@ -495,9 +663,14 @@ class ChatService:
             query = arguments.get("query")
             if not isinstance(query, str) or not query.strip():
                 return "检索失败：query 必须是非空字符串。"
+            # 循环里的检索同样要过指代消解。改动前它只作用于预检索,于是
+            # "那它的赔偿标准呢"这类省略式追问在**第一轮**被改写、在模型自己
+            # 发起的后续检索里却没有——而模型很容易把用户的原话直接抄进 query。
+            # 表现是同一个问题预检索命中、工具检索漂掉,极难归因。
+            search_query = await self._condense_query(scope.history, query.strip())
             context, citations = await knowledge_service.build_rag_context_with_citations(
                 db,
-                query.strip(),
+                search_query,
                 scope.workspace_id,
                 top_k=settings.RAG_TOP_K,
             )
@@ -721,6 +894,9 @@ class ChatService:
                 model=model or settings.LLM_MODEL,
                 use_rag=use_rag,
                 prefetch=settings.RAG_PREFETCH if use_rag else None,
+                # 提示词缓存的 A/B 维度:事后要能按它分组比 cache_hit_ratio,
+                # 否则"稳定前缀到底提了多少命中率"只能靠感觉。
+                stable_prefix=settings.PROMPT_CACHE_STABLE_PREFIX,
                 # 只记版本号,不记正文:span 属性里永不出现提示词内容
                 prompt_version=system_template.ref,
             ) as turn:
@@ -801,8 +977,7 @@ class ChatService:
         db: Session,
         outcome: subagent.SubAgentOutcome,
         *,
-        chat_id: str,
-        message_id: str | None,
+        state: agent_state.TurnState,
         round_index: int,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """把子代理内部轨迹翻译成主 SSE 流，并逐步落库。
@@ -811,7 +986,35 @@ class ChatService:
         UI 会把 researcher 的第 1 轮排到主代理第 1 轮旁边，看起来像并行调用。
         所以 SSE 的 ``round`` 保持外层主代理轮次，内层轮次单独放 ``agentRound``。
         数据库仍用外层轮次排序，``agent_role`` 用来区分归属。
+
+        每次委派额外开一行 ``agent_runs``（``parent_run_id`` 指向主代理）。子代理跑完
+        才建这行、并且直接落终态：它是在一个工具处理器内部同步跑完的，没有"正在
+        运行"这个可观察的中间态可言。这样"这次回答起了几个子代理、哪个失败了、
+        哪个是半截报告"变成一次 SQL 查询，而不是按 ``(agent_role, 时间)`` 去推断
+        ——一回合里委派两个同角色子代理时，推断必然出错。
         """
+        child_run_id = str(uuid.uuid4())
+        if checkpoint_store.enabled():
+            checkpoint_store.start_run(
+                db,
+                run_id=child_run_id,
+                chat_id=state.chat_id,
+                user_id=state.user_id,
+                message_id=state.message_id,
+                model=None,
+                prompt_ref=None,
+                parent_run_id=state.run_id,
+                agent_role=outcome.role,
+            )
+            checkpoint_store.update_run(
+                db,
+                child_run_id,
+                status="failed" if outcome.failed else "done",
+                rounds=outcome.rounds,
+                error_type="subagent_failed" if outcome.failed else None,
+                finished=True,
+            )
+
         for index, step in enumerate(outcome.steps):
             yield {
                 "type": "agent_step",
@@ -836,8 +1039,8 @@ class ChatService:
             # 会把几次委派里的第 0 步全排在一起。
             tool_history.record(
                 db,
-                chat_id=chat_id,
-                message_id=message_id,
+                chat_id=state.chat_id,
+                message_id=state.message_id,
                 round_index=round_index,
                 call_index=10_000 + index,
                 tool_name=step.tool,
@@ -847,6 +1050,7 @@ class ChatService:
                 arguments=step.arguments,
                 citations=step.citations,
                 agent_role=outcome.role,
+                run_id=child_run_id,
             )
         yield {
             "type": "agent_state",
@@ -856,6 +1060,7 @@ class ChatService:
             "rounds": outcome.rounds,
             "steps": len(outcome.steps),
             "truncated": outcome.truncated,
+            "runId": child_run_id,
         }
 
     async def _run_turn(
@@ -878,52 +1083,47 @@ class ChatService:
 
         每一轮:流式调用模型 -> 若模型请求工具则执行并把结果回灌 messages -> 下一轮。
         循环在下列任一条件下收敛到最终回答:模型不再请求工具、轮次用尽、
-        工具结果预算耗尽、或本轮请求的工具全部不可用。
+        工具结果预算耗尽、或本轮请求的工具全部没带回新内容(不可用或重复调用)。
         """
         citations: list[dict] = []
         budget = _ToolResultBudget(
             settings.TOOL_RESULT_TOTAL_CHARS, settings.TOOL_RESULT_MAX_CHARS
         )
+        # 重复调用检测。作用域是一次回答——跨回合不算重复:用户第二次问同一件事时
+        # 重新检索一遍是对的,那时知识库可能已经变了。
+        repeats = RepeatGuard(settings.AGENT_REPEAT_LIMIT)
+        # 熔断器显式持有(改动前是内联在 ToolRuntime 构造里):它的状态要进快照,
+        # 否则中断一次就能让一个正在连续失败的工具复活。
+        breaker = CircuitBreaker(settings.TOOL_CIRCUIT_BREAKER_FAILURES)
         generation: dict[str, Any] = {
             "model": model or settings.LLM_MODEL,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "top_p": top_p,
         }
+        run_id = str(uuid.uuid4())
 
-        base_tools = self._create_tools(db, scope, use_rag, citations)
+        # 历史要先于工具构建取回：确认令牌要按用户原话计算，而工具处理器
+        # 执行时还要用它做指代消解（scope.history 在这里一起回填）。
+        history = await self._get_chat_history_messages(
+            db, chat_id, exclude_message_id=message_id
+        )
+        scope.history = history
+        approvals = self._approvals_for(prompt, history)
+        base_tools = self._create_tools(db, scope, use_rag, citations, approvals)
         # ---- 多代理:委派 ----
         # 子代理的运行时拿的是**未经角色过滤的**完整工具集合,按角色过滤发生在
         # SubAgentRunner._schemas_for(下发哪些 schema)和它的执行前检查(越权拦截)
         # 两处。让运行时本身只装该角色的工具也能做到,但那样每次委派都要重建一次
         # ToolRuntime,而这几个工具里有的持有数据库会话与 HTTP 客户端。
-        delegations: _Delegations | None = None
-        tools = base_tools
-        if subagent.enabled():
-            registered = {tool.name for tool in base_tools}
-            roles = agent_roles.available(registered)
-            if roles:
-                delegations = _Delegations(settings.AGENT_MAX_DELEGATIONS)
-                runner = subagent.SubAgentRunner(
-                    self.model_adapter,
-                    ToolRuntime(base_tools),
-                    generation=generation,
-                    take_budget=budget.take,
-                )
-                if settings.AGENT_DELEGATION_MODE == "supervisor":
-                    tools = self._supervisor_tools(base_tools, roles)
-                tools = [
-                    *tools,
-                    self._create_delegate_tool(roles, runner, delegations),
-                ]
-                turn.set(
-                    delegation_mode=settings.AGENT_DELEGATION_MODE,
-                    delegation_roles=[role.name for role in roles],
-                )
-
-        runtime = ToolRuntime(tools)
-        history = await self._get_chat_history_messages(
-            db, chat_id, exclude_message_id=message_id
+        # 熔断器单独实例、各自持有:子代理里的失败不该把主代理的工具熔断掉,
+        # 反之亦然——它们面对的是不同的模型行为,不该互相牵连。
+        runtime, delegations = self._build_tool_surface(
+            base_tools,
+            generation=generation,
+            take_budget=budget.take,
+            breaker=breaker,
+            turn=turn,
         )
         context = await self._get_context_builder().build(chat_id, history)
         if context.compacted:
@@ -990,17 +1190,44 @@ class ChatService:
                 result=prefetch_context,
                 arguments={"query": search_query},
                 citations=prefetch_citations,
+                run_id=run_id,
             )
             if prefetch_context:
                 prefetched = True
+                # 稳定前缀模式下,"已预检索过、不要重复检索"这句约束由这里携带,
+                # 而不是由系统提示词里的 [[if prefetched]] 段。放在参考内容之后、
+                # 用户问题之前:它是对紧接着这段材料的使用说明。
+                guidance = (
+                    "\n\n[以上参考内容由系统预先检索得到。若已经足够，请直接回答、"
+                    "不要重复检索；不足时再调用工具补充。]"
+                    if settings.PROMPT_CACHE_STABLE_PREFIX
+                    else ""
+                )
                 user_content = (
                     "[系统已预先从本地知识库检索到以下参考内容]\n"
                     + prefetch_context
+                    + guidance
                     + "\n\n[用户问题]\n"
                     + prompt
                 )
                 if prefetch_citations:
                     yield {"type": "citations", "items": prefetch_citations}
+            elif not prefetch_failed:
+                # 预检索跑了但没查到。不说这件事的话,模型看到的和"没做预检索"
+                # 完全一样,于是很可能用几乎相同的查询再检索一次——那一轮必然
+                # 也是空的。轨迹里记了这次查询,但那是给**下一回合**回灌的,
+                # 本回合的 messages 里没有。
+                #
+                # 放在用户消息里而不是加一个模板开关:五个提示词版本都要改才能
+                # 让开关生效,而这条信息本身是"本轮发生了什么"——和预检索命中时
+                # 注入参考内容是同一件事,理应走同一条路。
+                user_content = (
+                    f"[系统已用「{search_query[:200]}」预先检索过本地知识库，"
+                    "没有找到达到相关度要求的内容。若这个问题确实需要知识库资料，"
+                    "请换一种说法重新检索，或先调用 list_knowledge_documents "
+                    "看有哪些文档；若本来就不需要，直接作答。]\n\n[用户问题]\n"
+                    + prompt
+                )
 
         # ---- 跨会话长期记忆 ----
         # 独立的 system 消息而不是拼进主系统提示词:提示词是带版本管理的"代码",
@@ -1024,87 +1251,266 @@ class ChatService:
             *trajectory,
             {"role": "user", "content": self._user_content(user_content, turn, model)},
         ]
+        # ---- 状态与协作者分离 ----
+        # state 是能进数据库、能跨请求的那一半;context 是持有会话与客户端的那一半。
+        # 改动之前两者混在同一批局部变量里,所以没有任何一个子集是可以存下来的。
+        state = agent_state.TurnState(
+            run_id=run_id,
+            chat_id=chat_id,
+            user_id=user_id,
+            workspace_id=scope.workspace_id,
+            is_admin=scope.is_admin,
+            message_id=message_id,
+            use_rag=use_rag,
+            prompt=prompt,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            prompt_ref=system_template.ref,
+            delegation_mode=settings.AGENT_DELEGATION_MODE,
+            messages=messages,
+            budget_remaining=budget.remaining,
+            budget_per_call=settings.TOOL_RESULT_MAX_CHARS,
+        )
+        ctx = _TurnContext(
+            runtime=runtime,
+            budget=budget,
+            repeats=repeats,
+            breaker=breaker,
+            citations=citations,
+            generation=generation,
+            scope=scope,
+            turn=turn,
+            delegations=delegations,
+            gated=frozenset(approval.gated_tools()),
+        )
+        if checkpoint_store.enabled():
+            checkpoint_store.start_run(
+                db,
+                run_id=run_id,
+                chat_id=chat_id,
+                user_id=user_id,
+                message_id=message_id,
+                model=generation["model"],
+                prompt_ref=system_template.ref,
+                trace_id=current_trace_id(),
+            )
+            turn.set(run_id=run_id)
+
+        async for event in self._drive_loop(db, state, ctx):
+            yield event
+
+    async def _drive_loop(
+        self,
+        db: Session,
+        state: agent_state.TurnState,
+        ctx: _TurnContext,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Agent 主循环。状态全部读写 ``state``,协作者全部来自 ``ctx``。
+
+        新回合与恢复走的是同一个函数,区别只在进来时 ``state`` 的内容:新回合是
+        刚构造的(``pending_calls`` 空、``round_index`` 为 0),恢复是从快照读出来的
+        (``pending_calls`` 非空、``pending_index`` 指向下一个要跑的调用)。
+        这一点是整个设计的支点——如果恢复走另一条代码路径,两条路就会各自漂移,
+        而漂移的表现是"恢复之后行为微妙地不一样",极难定位。
+        """
         max_rounds = max(1, settings.AGENT_MAX_TOOL_ROUNDS)
-        emitted_any = False
-        force_final = False
-        round_index = 0
+        emitted_any = state.emitted_any
+        force_final = state.force_final
+        round_index = state.round_index
+        # 恢复进来时本轮的工具还没跑完:跳过模型调用,直接进工具执行段。
+        resuming = bool(state.pending_calls) and state.pending_index < len(
+            state.pending_calls
+        )
+        turn = ctx.turn
+        runtime = ctx.runtime
+        budget = ctx.budget
+        repeats = ctx.repeats
+        citations = ctx.citations
+        delegations = ctx.delegations
+        generation = ctx.generation
+        # 同一个列表对象:往它 append 就是往 state.messages append。
+        # 这是刻意的——循环里到处都在追加消息,每次都写 state.messages 会让
+        # 这段代码比改动前难读,而收益是零(反正是同一个对象)。
+        messages = state.messages
 
         while True:
-            round_index += 1
-            # 本轮内创建的所有 span(模型调用、工具、检索)都会自动带上轮次
-            set_span_defaults(round=round_index)
-            turn.set(rounds=round_index)
-            # 最后一轮不再下发工具 schema:模型只能作答,循环必然终止。
-            is_final_round = force_final or round_index >= max_rounds
-            if is_final_round and round_index > 1:
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": "[系统提示] 工具调用阶段已结束，请基于当前已获得的信息"
-                        "给出最终回答，不要再尝试调用任何工具。",
-                    }
-                )
-                yield {"type": "tool_rounds_ended", "rounds": round_index - 1}
+            if not resuming:
+                round_index += 1
+                state.round_index = round_index
+                # 本轮内创建的所有 span(模型调用、工具、检索)都会自动带上轮次
+                set_span_defaults(round=round_index)
+                turn.set(rounds=round_index)
+                # 最后一轮不再下发工具 schema:模型只能作答,循环必然终止。
+                is_final_round = force_final or round_index >= max_rounds
+                if is_final_round and round_index > 1:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": "[系统提示] 工具调用阶段已结束，请基于当前已获得的信息"
+                            "给出最终回答，不要再尝试调用任何工具。",
+                        }
+                    )
+                    yield {"type": "tool_rounds_ended", "rounds": round_index - 1}
 
-            tools_for_round = [] if is_final_round else runtime.schemas
-            completion: ModelCompletion | None = None
-            round_streamed_text = False
-            try:
-                async for chunk in self.model_adapter.stream_completion(
-                    messages=messages, tools=tools_for_round, **generation
-                ):
-                    if chunk.text:
-                        emitted_any = True
-                        round_streamed_text = True
-                        yield {"type": "message_delta", "content": chunk.text}
-                    elif chunk.completion is not None:
-                        completion = chunk.completion
-            except Exception as exc:
-                logger.error(
-                    "stream_completion failed on round %s: %s",
-                    round_index,
-                    type(exc).__name__,
-                )
-                completion = None
+                tools_for_round = [] if is_final_round else runtime.schemas
+                completion: ModelCompletion | None = None
+                round_streamed_text = False
+                try:
+                    async for chunk in self.model_adapter.stream_completion(
+                        messages=messages, tools=tools_for_round, **generation
+                    ):
+                        if chunk.text:
+                            emitted_any = True
+                            round_streamed_text = True
+                            yield {"type": "message_delta", "content": chunk.text}
+                        elif chunk.completion is not None:
+                            completion = chunk.completion
+                except Exception as exc:
+                    logger.error(
+                        "stream_completion failed on round %s: %s",
+                        round_index,
+                        type(exc).__name__,
+                    )
+                    completion = None
 
-            if completion is None:
-                # 已经流出过文本就不能重来,否则用户会看到重复内容。
-                if round_streamed_text:
-                    return
-                completion = await self._complete_fallback(
-                    messages, tools_for_round, generation
-                )
                 if completion is None:
-                    yield {"type": "error", "error": "模型调用失败，请稍后重试。"}
+                    # 已经流出过文本就不能重来,否则用户会看到重复内容。
+                    if round_streamed_text:
+                        self._finish_run(db, state, status="failed", error="stream_broken")
+                        return
+                    completion = await self._complete_fallback(
+                        messages, tools_for_round, generation
+                    )
+                    if completion is None:
+                        self._finish_run(db, state, status="failed", error="model_failed")
+                        yield {"type": "error", "error": "模型调用失败，请稍后重试。"}
+                        return
+
+                if completion.protocol_error:
+                    self._finish_run(db, state, status="failed", error="protocol_error")
+                    yield {"type": "error", "error": completion.protocol_error}
                     return
 
-            if completion.protocol_error:
-                yield {"type": "error", "error": completion.protocol_error}
-                return
-
-            pending_calls = [] if is_final_round else completion.tool_calls
-            if not pending_calls:
-                # 适配器已在流式阶段透出前 streamed_length 个字符,只补发剩余部分。
-                remainder = completion.content[completion.streamed_length :]
-                if remainder.strip():
-                    yield {"type": "message_delta", "content": remainder}
+                pending_calls = [] if is_final_round else completion.tool_calls
+                if not pending_calls:
+                    # 适配器已在流式阶段透出前 streamed_length 个字符,只补发剩余部分。
+                    remainder = completion.content[completion.streamed_length :]
+                    if remainder.strip():
+                        yield {"type": "message_delta", "content": remainder}
+                        self._finish_run(db, state, status="done")
+                        return
+                    if emitted_any:
+                        self._finish_run(db, state, status="done")
+                        return
+                    # 不把空输出当成一条成功的 assistant 消息,给用户可见的错误提示。
+                    self._finish_run(db, state, status="failed", error="empty_answer")
+                    yield {"type": "error", "error": "模型未返回最终回答，请稍后重试。"}
                     return
-                if emitted_any:
-                    return
-                # 不把空输出当成一条成功的 assistant 消息,给用户可见的错误提示。
-                yield {"type": "error", "error": "模型未返回最终回答，请稍后重试。"}
-                return
 
-            # ---- 执行本轮工具调用,把结果回灌 messages 后进入下一轮 ----
-            messages.append(completion.as_assistant_message())
-            text_protocol_results: list[str] = []
-            unavailable_count = 0
+                # ---- 执行本轮工具调用,把结果回灌 messages 后进入下一轮 ----
+                messages.append(completion.as_assistant_message())
+                state.uses_text_protocol = completion.uses_text_tool_protocol
+                state.text_results = []
+                state.pending_calls = [
+                    {"id": call.id, "name": call.name, "arguments": call.arguments}
+                    for call in pending_calls
+                ]
+                state.pending_index = 0
+                state.writes = []
+                state.phase = "pre_tools"
+                state.emitted_any = emitted_any
+                state.force_final = force_final
+                state.streamed_text = round_streamed_text
+                if round_streamed_text:
+                    state.streamed_prefix += completion.content[
+                        : completion.streamed_length
+                    ]
+                # 本轮的快照。位置是刻意的:模型已经说完、工具一个都还没跑,
+                # 此刻本轮没有任何面向用户的输出,是唯一能安全回到的点。
+                ctx.sync_to(state)
+                checkpoint_store.put(db, state)
+            else:
+                # 恢复路径:本轮的模型调用早就做完了,pending_calls 从快照来。
+                pending_calls = [
+                    ToolCall(
+                        id=str(raw.get("id") or ""),
+                        name=str(raw.get("name") or ""),
+                        arguments=str(raw.get("arguments") or "{}"),
+                    )
+                    for raw in state.pending_calls
+                ]
+                is_final_round = force_final or round_index >= max_rounds
+                resuming = False
 
-            for call_index, call in enumerate(pending_calls):
+            # 本轮有几次调用什么新东西都没带回来(工具挂了,或者是重复调用)。
+            # 全都是的话继续循环只会原地转圈,下面据此强制收敛。
+            barren_count = 0
+
+            # 从 pending_index 起跑:恢复时前面那几个已经执行过了,它们的结果
+            # 由 replay_writes 摆回了 messages。重跑一遍就是让那几次检索的钱
+            # 白花第二遍,而结果不会更新——这是幂等性的全部所在。
+            start_index = state.pending_index
+            for call_index, call in enumerate(
+                pending_calls[start_index:], start=start_index
+            ):
                 try:
                     arguments = json.loads(call.arguments)
                 except json.JSONDecodeError:
                     arguments = {}
+                if not isinstance(arguments, dict):
+                    arguments = {}
+
+                # ---- 人工审批闸门 ----
+                # 位置是刻意的:在 tool_start 之前。发了 tool_start 再中断,界面上
+                # 会留一个永远等不到 tool_result 的"正在执行",而它其实一步都没跑。
+                call_key = call.id or f"r{round_index}c{call_index}"
+                rejected_result: ToolResult | None = None
+                if call.name in ctx.gated:
+                    if call_key in state.rejected_call_ids:
+                        rejected_result = ToolResult(
+                            approval.rejection_message(call.name, state.interrupt_note),
+                            ToolStatus.REJECTED,
+                        )
+                    elif call_key not in state.approved_call_ids:
+                        # 停在这里，把状态落库，然后让这个请求结束。
+                        # 恢复发生在另一个 HTTP 请求里——这正是快照存在的理由。
+                        ctx.sync_to(state)
+                        state.phase = "waiting_approval"
+                        state.status = "waiting_approval"
+                        state.pending_index = call_index
+                        state.emitted_any = emitted_any
+                        state.force_final = force_final
+                        request = agent_state.InterruptRequest(
+                            kind="tool_approval",
+                            tool=call.name,
+                            arguments=arguments,
+                            call_index=call_index,
+                            tool_call_id=call.id,
+                            reason=approval.reason_for(call.name),
+                        )
+                        state.interrupt = request.to_dict()
+                        seq = checkpoint_store.put(db, state, interrupt=state.interrupt)
+                        checkpoint_store.update_run(
+                            db,
+                            state.run_id,
+                            status="waiting_approval",
+                            rounds=round_index,
+                            bump_interrupts=True,
+                        )
+                        turn.set(interrupted="tool_approval", interrupt_tool=call.name)
+                        yield {
+                            "type": "approval_required",
+                            "runId": state.run_id,
+                            "tool": call.name,
+                            "preview": approval.build_preview(arguments),
+                            "reason": request.reason,
+                            "round": round_index,
+                            "checkpoint": seq,
+                        }
+                        return
+
                 yield {
                     "type": "tool_start",
                     "tool": call.name,
@@ -1123,8 +1529,27 @@ class ChatService:
                 async with tracer.span(
                     f"tool.{call.name}", SpanKind.TOOL, arguments=len(arguments) or None
                 ) as tool_span:
-                    with guardrails.collecting() as reports:
-                        result = await runtime.execute(call)
+                    # 被用户拒绝的调用在这里短路,连重复检测都不走:它不是"又调了
+                    # 一次",而是"这一次不许调"。也因此它绝不碰熔断器——用户拒绝
+                    # 一次不代表工具坏了,熔断掉会让他改主意之后反而调不动。
+                    if rejected_result is not None:
+                        result = rejected_result
+                        reports = []
+                        tool_span.set(rejected=True)
+                        tool_span.status = "error"
+                        tool_span.error_type = "user_rejected"
+                    # 重复检测放在执行之前:被拦下的调用不该真的跑一遍。它也必须
+                    # 在 span 之内——"这一步被拦了"和"这一步失败了"一样是轨迹的
+                    # 一部分,漏在 span 外面的话 trace 里会缺一步,轮次对不上。
+                    else:
+                        result = repeats.check(call.name, arguments)
+                        if result is None:
+                            with guardrails.collecting() as reports:
+                                result = await runtime.execute(call)
+                        else:
+                            # 没执行就没有护栏可收。给个空列表让下面的汇总逻辑统一。
+                            reports = []
+                            tool_span.set(repeated=True)
                     tool_span.set(result_status=result.status.value)
                     if result.status is not ToolStatus.OK:
                         # 工具失败要能在 trace 里直接筛出来,而不是埋在 attributes 里
@@ -1139,8 +1564,7 @@ class ChatService:
                         async for event in self._emit_subagent_steps(
                             db,
                             outcome,
-                            chat_id=chat_id,
-                            message_id=message_id,
+                            state=state,
                             round_index=round_index,
                         ):
                             yield event
@@ -1158,15 +1582,21 @@ class ChatService:
                 if citations:
                     yield {"type": "citations", "items": step_citations}
                     citations.clear()
-                if result.status is ToolStatus.UNAVAILABLE:
-                    unavailable_count += 1
+                # 被拒绝的调用也算"没带回新东西":它确实没有。不算的话,模型下一轮
+                # 很可能把同一件事换个说法再提一次,而人已经说过不同意了。
+                if result.status in (
+                    ToolStatus.UNAVAILABLE,
+                    ToolStatus.REPEATED,
+                    ToolStatus.REJECTED,
+                ):
+                    barren_count += 1
 
                 # 存的是预算裁剪之前的原文。预算约束的是"这一回合往上下文塞多少",
                 # 不该顺手决定"以后还能回看多少"。
                 tool_history.record(
                     db,
-                    chat_id=chat_id,
-                    message_id=message_id,
+                    chat_id=state.chat_id,
+                    message_id=state.message_id,
                     round_index=round_index,
                     call_index=call_index,
                     tool_name=call.name,
@@ -1175,29 +1605,267 @@ class ChatService:
                     tool_call_id=call.id,
                     arguments=arguments,
                     citations=step_citations,
+                    run_id=state.run_id,
                 )
 
+                # 澄清工具:回合在这里终止,等用户回答。结果不回灌 messages——
+                # 没有下一轮了,回灌只会污染历史;budget 也不需要为它记账。
+                # 非 OK 状态(参数校验不过)走正常回灌路径,让模型自己改。
+                if call.name == "ask_user" and result.status is ToolStatus.OK:
+                    turn.set(clarification=True)
+                    self._finish_run(db, state, status="done", rounds=round_index)
+                    yield {
+                        "type": "clarification",
+                        "question": result.content.strip(),
+                        "round": round_index,
+                    }
+                    return
+
                 content = budget.take(result.content)
-                if completion.uses_text_tool_protocol:
-                    text_protocol_results.append(f"工具 {call.name} 的结果：\n{content}")
+                if state.uses_text_protocol:
+                    state.text_results.append(f"工具 {call.name} 的结果：\n{content}")
                 else:
                     messages.append(
                         {"role": "tool", "tool_call_id": call.id, "content": content}
                     )
 
-            if completion.uses_text_tool_protocol:
+                # 这一步做完了。记一条 write 并把游标往前挪一格——如果本轮后面
+                # 某个调用要审批,快照就带着这条记录停下,恢复时它被摆回 messages
+                # 而**不重新执行**。这是幂等性的全部来源。
+                repeat_counts, repeat_blocked = repeats.snapshot()
+                breaker_consecutive, breaker_tripped = ctx.breaker.snapshot()
+                state.writes.append(
+                    agent_state.make_write(
+                        index=call_index,
+                        call_id=call.id,
+                        name=call.name,
+                        status=result.status.value,
+                        content=content,
+                        budget_after=budget.remaining,
+                        repeat_counts=repeat_counts,
+                        repeat_blocked=repeat_blocked,
+                        breaker_consecutive=breaker_consecutive,
+                        breaker_tripped=breaker_tripped,
+                        citations=step_citations,
+                    )
+                )
+                state.pending_index = call_index + 1
+
+            if state.uses_text_protocol:
                 messages.append(
                     {
                         "role": "user",
                         "content": "以下是已执行工具的内部结果。请据此继续，"
                         "必要时可再次调用工具；不要展示工具调用标记或工具协议。\n\n"
-                        + "\n\n".join(text_protocol_results),
+                        + "\n\n".join(state.text_results),
                     }
                 )
 
-            # 本轮所有工具都不可用时,继续循环只会重复失败;结果预算耗尽同理。
-            if unavailable_count == len(pending_calls) or budget.exhausted:
+            # 本轮每次调用都没带回新东西(工具全不可用,或全是重复调用)时,继续
+            # 循环只会原地转圈;结果预算耗尽同理。
+            if barren_count == len(pending_calls) or budget.exhausted:
                 force_final = True
+            if repeats.blocked:
+                # 埋在 turn 上而不是逐次记:关心的是"这次回答里模型转了几圈",
+                # 一个数就够,而它要能和轮次、成本放在同一行里看。
+                turn.set(repeated_blocked=repeats.blocked)
+
+            # 本轮收尾:把游标清零,下一轮重新填。不清的话下一轮进来时
+            # pending_index 还指着上一轮的末尾,新一批工具会被整批跳过。
+            state.phase = "post_tools"
+            state.pending_calls = []
+            state.pending_index = 0
+            state.writes = []
+            state.text_results = []
+            state.emitted_any = emitted_any
+            state.force_final = force_final
+            ctx.sync_to(state)
+            checkpoint_store.update_run(
+                db,
+                state.run_id,
+                rounds=round_index,
+                delegations=state.delegations_used,
+            )
+
+    @staticmethod
+    def _finish_run(
+        db: Session,
+        state: agent_state.TurnState,
+        *,
+        status: str,
+        error: str | None = None,
+        rounds: int | None = None,
+    ) -> None:
+        """给执行记录盖章。
+
+        每条 ``return`` 路径都要走这里,否则那一行会永远停在 ``running``——
+        而"还在跑"和"跑挂了"在待恢复列表里是完全不同的意思。
+        """
+        state.status = status  # type: ignore[assignment]
+        checkpoint_store.update_run(
+            db,
+            state.run_id,
+            status=status,
+            rounds=rounds,
+            error_type=error,
+            finished=True,
+        )
+
+    async def resume_turn(
+        self,
+        db: Session,
+        user_id: str,
+        run_id: str,
+        *,
+        approved: bool,
+        note: str = "",
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """从审批中断处恢复一次执行。
+
+        这个方法是整套改动的目的所在：它跑在**另一个 HTTP 请求**里，原来那条 SSE
+        连接早就断了，驱动它的那个异步生成器早就被回收了。能接上，是因为状态在
+        数据库里而不在进程里。
+
+        三件事必须做对，少一件恢复就是"重新开始"：
+
+        1. **重建的工具面要和中断前一致。** 走 ``_build_tool_surface``，与新回合
+           同一个函数（理由见那边的文档串）。
+        2. **守卫余额要拨回中断那一刻。** ``replay_writes`` + ``restore_from``。
+           少了这一步，用户点一次同意就等于给模型重发一份预算、清空重复计数、
+           复活被熔断的工具。
+        3. **已经执行过的工具不能再执行。** 同样由 ``replay_writes`` 保证：它把
+           那几步的结果摆回 ``messages``，而不是让它们重跑一遍。
+        """
+        run = checkpoint_store.get_run(db, run_id)
+        if run is None or run.user_id != user_id:
+            yield {"type": "error", "error": "找不到这次执行，或它不属于当前用户。"}
+            return
+        if run.status != "waiting_approval":
+            # 幂等：同一个审批被点两次（双击、两个标签页）时第二次走到这里。
+            # 报一句明确的话，而不是让它再跑一遍——那会把已批准的写操作执行两次。
+            yield {
+                "type": "error",
+                "error": f"这次执行当前状态是 {run.status}，不在等待审批。",
+            }
+            return
+
+        state = checkpoint_store.latest(db, run_id)
+        if state is None or state.interrupt is None:
+            yield {"type": "error", "error": "这次执行的状态快照已不可用，无法恢复。"}
+            return
+
+        request = state.interrupt_request
+        if request is None:
+            yield {"type": "error", "error": "中断请求已损坏，无法恢复。"}
+            return
+
+        # 裁决只对**这一次调用**生效。用 call_id（缺失时用轮次+下标）而不是工具名：
+        # 按工具名放行等于"以后这个工具都不用问了"，那审批就只剩第一次有意义。
+        call_key = request.tool_call_id or f"r{state.round_index}c{request.call_index}"
+        if approved:
+            state.approved_call_ids = [*state.approved_call_ids, call_key]
+        else:
+            state.rejected_call_ids = [*state.rejected_call_ids, call_key]
+        state.interrupt_note = note
+        state.interrupt = None
+        state.phase = "pre_tools"
+        state.status = "running"
+        checkpoint_store.update_run(db, run_id, status="running")
+
+        yield {
+            "type": "approval_resolved",
+            "runId": run_id,
+            "tool": request.tool,
+            "approved": approved,
+            "round": state.round_index,
+        }
+
+        async for event in self._resume_loop(db, state, request, approved):
+            yield event
+
+    async def _resume_loop(
+        self,
+        db: Session,
+        state: agent_state.TurnState,
+        request: agent_state.InterruptRequest,
+        approved: bool,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """重建协作者，把状态拨回中断那一刻，然后交给主循环。"""
+        # 作用域从快照来，不重新解析：中断期间用户的 workspace 或角色理论上可能
+        # 变过，但那时候正确的做法是让这次恢复失败，而不是拿新权限接着跑一个
+        # 在旧权限下批准的操作。
+        scope = _ToolScope(
+            user_id=state.user_id,
+            workspace_id=state.workspace_id,
+            is_admin=state.is_admin,
+        )
+        async with tracer.trace(
+            user_id=state.user_id, chat_id=state.chat_id, message_id=state.message_id
+        ):
+            async with tracer.span(
+                "chat.resume",
+                SpanKind.AGENT,
+                model=state.model or settings.LLM_MODEL,
+                run_id=state.run_id,
+                resumed_from=state.round_index,
+                approved=approved,
+                prompt_version=state.prompt_ref,
+            ) as turn:
+                history = await self._get_chat_history_messages(
+                    db, state.chat_id, exclude_message_id=state.message_id
+                )
+                scope.history = history
+                # 确认令牌：用户在界面上点的那一下，比词表扫出来的"用户说过删除"
+                # 是更强的证据。所以这里不再扫原话，直接按裁决给——但**只在**
+                # 被批准的那次调用确实是删除操作时给，而不是整回合放开。
+                approvals = workspace_tools._ToolApprovals(
+                    delete_granted=(
+                        approved and request.tool == "delete_knowledge_document"
+                    )
+                )
+                citations: list[dict] = []
+                budget = _ToolResultBudget(
+                    settings.TOOL_RESULT_TOTAL_CHARS, settings.TOOL_RESULT_MAX_CHARS
+                )
+                breaker = CircuitBreaker(settings.TOOL_CIRCUIT_BREAKER_FAILURES)
+                repeats = RepeatGuard(settings.AGENT_REPEAT_LIMIT)
+                generation: dict[str, Any] = {
+                    "model": state.model or settings.LLM_MODEL,
+                    "temperature": state.temperature,
+                    "max_tokens": state.max_tokens,
+                    "top_p": state.top_p,
+                }
+                base_tools = self._create_tools(
+                    db, scope, state.use_rag, citations, approvals
+                )
+                runtime, delegations = self._build_tool_surface(
+                    base_tools,
+                    generation=generation,
+                    take_budget=budget.take,
+                    breaker=breaker,
+                    turn=turn,
+                )
+                ctx = _TurnContext(
+                    runtime=runtime,
+                    budget=budget,
+                    repeats=repeats,
+                    breaker=breaker,
+                    citations=citations,
+                    generation=generation,
+                    scope=scope,
+                    turn=turn,
+                    delegations=delegations,
+                    gated=frozenset(approval.gated_tools()),
+                )
+                # 顺序要紧：先 replay（它会按 writes 把余额算到中断那一刻），
+                # 再 restore（把算出来的余额灌进守卫对象）。反过来就白算了。
+                agent_state.replay_writes(state)
+                state.pending_index = request.call_index
+                ctx.restore_from(state)
+                turn.set(replayed_writes=len(state.writes))
+
+                async for event in self._drive_loop(db, state, ctx):
+                    yield event
 
     async def generate_ai_response(
         self,

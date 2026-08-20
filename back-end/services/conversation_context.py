@@ -18,6 +18,7 @@ from typing import Any
 
 from config import settings
 from redis_service import redis_service
+from services import prompt_library
 from services.token_budget import (
     HistoryMessage,
     TokenCounter,
@@ -89,13 +90,6 @@ def _fingerprint(messages: list[HistoryMessage]) -> str:
     return digest.hexdigest()
 
 
-_SUMMARY_INSTRUCTION = (
-    "把下面的对话压缩成要点摘要，供后续对话继续使用。必须保留：用户的目标与偏好、"
-    "已经确认的事实与结论、尚未完成的任务、明确的约束。省略寒暄与重复表述。"
-    "直接输出摘要正文，不要加标题或解释。"
-)
-
-
 class ConversationContextBuilder:
     """把完整历史压成预算内的消息列表。"""
 
@@ -160,14 +154,16 @@ class ConversationContextBuilder:
         transcript = "\n".join(
             f"{message.role}: {message.content}" for message in messages
         )
-        sections = [_SUMMARY_INSTRUCTION]
-        if previous:
-            sections.append(f"[已有摘要]\n{previous}")
-        sections.append(f"[新增对话]\n{transcript}")
+        content = prompt_library.render(
+            "history_summary",
+            flags={"has_previous": bool(previous)},
+            previous=previous,
+            transcript=transcript,
+        )
 
         try:
             completion = await self._model_adapter.complete(
-                messages=[{"role": "user", "content": "\n\n".join(sections)}],
+                messages=[{"role": "user", "content": content}],
                 tools=[],
                 model=settings.utility_model,
                 temperature=0.2,

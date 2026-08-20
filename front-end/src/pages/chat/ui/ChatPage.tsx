@@ -34,6 +34,7 @@ import type {
 import { MessageContent } from "./MessageContent";
 import { FeedbackButtons } from "@/features/message-feedback/ui/FeedbackButtons";
 import { ToolTrace } from "@/widgets/tool-trace/ui/ToolTrace";
+import { ToolApprovalCard } from "@/widgets/tool-approval";
 import {
   ChatInsightPanel,
   type InsightEvent,
@@ -202,6 +203,24 @@ export const ChatPage: React.FC = () => {
   const [capabilities, setCapabilities] = useState<ServerCapabilities | null>(
     null,
   );
+  /**
+   * 当前会话里停着的那次工具审批。
+   *
+   * 两条来源：流式期间的 approval_required 事件，以及切换会话时的
+   * GET /chats/runs/pending。后者是刷新页面之后唯一能把卡片找回来的路径——
+   * 中断存在数据库里，不存在那条已经断掉的 SSE 连接里。
+   *
+   * assistantId 记的是被打断时本地那条 assistant 气泡；恢复时续写到它上面，
+   * 否则一次问答会留下两个气泡。刷新之后没有本地气泡，它是 null。
+   */
+  const [pendingApproval, setPendingApproval] = useState<{
+    runId: string;
+    tool: string;
+    reason: string;
+    preview: Record<string, unknown>;
+    assistantId: string | null;
+  } | null>(null);
+  const [approvalBusy, setApprovalBusy] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -479,6 +498,46 @@ export const ChatPage: React.FC = () => {
   }, [assistantIds]);
 
   /**
+   * 切换会话时把停着的审批找回来。
+   *
+   * 这是可恢复执行与"挂一个长连接等用户点"最直观的区别：刷新页面、换台机器、
+   * 隔一天回来，卡片都还在，因为中断存在 agent_checkpoints 里。
+   *
+   * assistantId 传 null——本地那条气泡已经随页面一起没了，恢复之后靠重新拉
+   * 消息列表拿后端拼好的完整回答。
+   */
+  useEffect(() => {
+    if (!currentChatId) {
+      setPendingApproval(null);
+      return;
+    }
+    let cancelled = false;
+    apiClient
+      .getPendingApprovals()
+      .then((items) => {
+        if (cancelled) return;
+        const hit = items.find((item) => item.chatId === currentChatId);
+        setPendingApproval(
+          hit
+            ? {
+                runId: hit.runId,
+                tool: hit.tool ?? "",
+                reason: hit.reason ?? "",
+                preview: hit.preview ?? {},
+                assistantId: null,
+              }
+            : null,
+        );
+      })
+      .catch(() => {
+        // 审批功能关掉时这个接口返回空/报错都不该影响对话
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentChatId]);
+
+  /**
    * 轨迹按用户消息归属，但要显示在回答下面，所以这里做一次映射。
    *
    * 按消息顺序把"最近一条用户消息"的轨迹挂到紧随其后的那条回答上，而不是去前端
@@ -593,6 +652,20 @@ export const ChatPage: React.FC = () => {
       sessionId: string,
       userMsg: string,
       userMessageId: string,
+      /**
+       * 带上它表示这不是一次新提问，而是从审批快照接着跑。
+       *
+       * 走同一个渲染循环：恢复之后模型还要继续调工具、继续流式输出，事件和普通
+       * 对话完全一样。抄第二份循环的代价是以后往流里加字段得改两处，漏一处的
+       * 症状只在用过审批的会话里出现，很难对上原因。
+       */
+      resume?: {
+        runId: string;
+        approved: boolean;
+        note: string;
+        /** 被打断时那条 assistant 气泡；续写到它上面而不是新建 */
+        assistantId: string | null;
+      },
     ) => {
       const ts = new Date().toLocaleTimeString([], {
         hour: "2-digit",
@@ -602,36 +675,64 @@ export const ChatPage: React.FC = () => {
       setShowThinking(true);
       setToolStatus(null);
       setReplyStarted(false);
-      setInsightEvents([]);
-      citationsRef.current = [];
-      guardrailRef.current = null;
+      if (!resume) {
+        setInsightEvents([]);
+        citationsRef.current = [];
+        guardrailRef.current = null;
+      }
       // 重新生成 / 编辑重发会走到同一个 userMessageId：后端那边会先把这一回合的
       // 旧轨迹删掉再重新记，前端不清就会把新旧两份接在一起，看起来像它查了两倍的东西。
-      setToolStepsByMessage((prev) => {
-        if (!prev[userMessageId]) return prev;
-        const next = { ...prev };
-        delete next[userMessageId];
-        return next;
-      });
+      if (!resume) {
+        setToolStepsByMessage((prev) => {
+          if (!prev[userMessageId]) return prev;
+          const next = { ...prev };
+          delete next[userMessageId];
+          return next;
+        });
+      }
 
       const controller = new AbortController();
       abortRef.current = controller;
 
-      let assistantMsgId = "";
+      // 恢复时接着那条气泡写。空串表示还没有气泡，等第一段正文到达时再建。
+      let assistantMsgId = resume?.assistantId ?? "";
+      if (assistantMsgId) {
+        // 打断时 flushBuffer 已经把前缀写进 Redux，这里把它读回缓冲区，
+        // 否则续写的第一次 flush 会用后半段覆盖掉前半段。
+        const existing = (messagesBySession[sessionId] ?? []).find(
+          (m) => m.id === assistantMsgId,
+        );
+        bufferRef.current = {
+          id: assistantMsgId,
+          content: existing?.content ?? "",
+          sessionId,
+        };
+        setShowThinking(false);
+        setReplyStarted(true);
+      }
+
+      const stream = resume
+        ? apiClient.resumeRun(
+            resume.runId,
+            resume.approved,
+            resume.note,
+            controller.signal,
+          )
+        : apiClient.streamMessage(
+            {
+              prompt: userMsg,
+              model: selectedModel,
+              chat_id: sessionId,
+              use_rag: useRag,
+              message_id: userMessageId,
+              // 提示词实验台里挂上的版本；没挂就交给服务端默认版本
+              ...(promptVersion ? { prompt_version: promptVersion } : {}),
+            },
+            controller.signal,
+          );
 
       try {
-        for await (const chunk of apiClient.streamMessage(
-          {
-            prompt: userMsg,
-            model: selectedModel,
-            chat_id: sessionId,
-            use_rag: useRag,
-            message_id: userMessageId,
-            // 提示词实验台里挂上的版本；没挂就交给服务端默认版本
-            ...(promptVersion ? { prompt_version: promptVersion } : {}),
-          },
-          controller.signal,
-        )) {
+        for await (const chunk of stream) {
           if (chunk.error) {
             stopFlushTimer();
             setShowThinking(false);
@@ -707,6 +808,47 @@ export const ChatPage: React.FC = () => {
               });
             assistantMsgId = "";
             break;
+          }
+
+          if (chunk.type === "approval_required") {
+            // 后端已经把整个回合存进检查点并主动结束了这条流。这里要做的是收尾：
+            // 把已经流出的正文落定，然后把卡片挂出来等人点。不是错误，也不要删气泡。
+            stopFlushTimer();
+            flushBuffer();
+            setShowThinking(false);
+            setToolStatus(null);
+            dispatch(setIsGenerating(false));
+            if (chunk.runId) {
+              setPendingApproval({
+                runId: chunk.runId,
+                tool: chunk.tool ?? "",
+                reason: chunk.reason ?? "",
+                preview: chunk.preview ?? {},
+                assistantId: assistantMsgId || null,
+              });
+            }
+            setInsightEvents((prev) => [
+              ...prev,
+              {
+                type: "approval",
+                label: `等待确认 · ${toolLabel(chunk.tool)}`,
+                detail: "已保存执行状态",
+              },
+            ]);
+            // 气泡要留着——恢复时续写到它上面
+            break;
+          }
+
+          if (chunk.type === "approval_resolved") {
+            setInsightEvents((prev) => [
+              ...prev,
+              {
+                type: "approval",
+                label: chunk.approved ? "已同意执行" : "已拒绝执行",
+                detail: toolLabel(chunk.tool),
+              },
+            ]);
+            continue;
           }
 
           if (chunk.type === "agent_state") {
@@ -1044,6 +1186,73 @@ export const ChatPage: React.FC = () => {
       flushBuffer,
       stopFlushTimer,
       startFlushTimer,
+      messagesBySession,
+      promptVersion,
+    ],
+  );
+
+  /**
+   * 裁决一次审批。
+   *
+   * 恢复走 runCompletion 的同一条渲染循环，只是换了流的来源。第三个参数传空串：
+   * 恢复不需要 prompt，后端从快照里读消息历史——重发 prompt 反而会让同一个问题
+   * 在上下文里出现两次。
+   *
+   * 409 表示这次执行已经不在等待审批了（另一个标签页点过、或者手抖点了两次）。
+   * 那不是错误，把卡片收掉就行。
+   */
+  const handleApprovalDecision = useCallback(
+    async (approved: boolean, note: string) => {
+      const pending = pendingApproval;
+      if (!pending || !currentChatId || approvalBusy) return;
+      setApprovalBusy(true);
+      setPendingApproval(null);
+      try {
+        await runCompletion(currentChatId, "", "", {
+          runId: pending.runId,
+          approved,
+          note,
+          assistantId: pending.assistantId,
+        });
+        // 刷新过页面的情况下本地没有那条 assistant 气泡，恢复流里也只有后半段
+        // 正文。这时把整个会话重新拉一次，拿后端拼好的完整回答。
+        if (!pending.assistantId) {
+          const msgs = await apiClient.getMessages(currentChatId);
+          dispatch(
+            setMessages({
+              sessionId: currentChatId,
+              messages: msgs.map((m) => ({
+                id: m.id,
+                sessionId: m.chatId,
+                role: m.role,
+                content: m.content,
+                timestamp: new Date(m.createdAt).toLocaleTimeString([], {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                }),
+                model: m.model,
+              })),
+            }),
+          );
+        }
+      } catch (err) {
+        if ((err as Error)?.message === "STALE_APPROVAL") {
+          toast.info("这次执行已经处理过了");
+        } else if ((err as Error)?.name !== "AbortError") {
+          toast.error(toastMessageFrom(err, "恢复执行失败"));
+        }
+        dispatch(setIsGenerating(false));
+      } finally {
+        setApprovalBusy(false);
+      }
+    },
+    [
+      pendingApproval,
+      currentChatId,
+      approvalBusy,
+      runCompletion,
+      dispatch,
+      toast,
     ],
   );
 
@@ -1527,6 +1736,25 @@ export const ChatPage: React.FC = () => {
                   <Sparkles className="w-4 h-4 animate-spin text-[#da7756]" />
                   <span>{toolStatus || "正在深度思考与规划..."}</span>
                 </div>
+              </div>
+            </div>
+          )}
+
+          {/* 停着的工具审批。放在消息流末尾：它是这一回合的下一步，
+              不是某条历史消息的附属物。 */}
+          {pendingApproval && (
+            <div className="flex items-start gap-4 max-w-3xl">
+              <div className="w-8 h-8 rounded-xl bg-[#282724] dark:bg-[#2e2d2a] flex items-center justify-center text-[#da7756] shadow-sm">
+                <Bot className="w-4 h-4" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <ToolApprovalCard
+                  tool={pendingApproval.tool}
+                  reason={pendingApproval.reason}
+                  preview={pendingApproval.preview}
+                  busy={approvalBusy}
+                  onDecide={handleApprovalDecision}
+                />
               </div>
             </div>
           )}

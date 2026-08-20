@@ -1,6 +1,7 @@
 ---
 label: 候选：扩大后的工具面（知识库 + 网页 + 附件 + 计算 + 写入）
 status: candidate
+expects: workspace-tools
 notes: 打开 TOOL_* 里任何一个 workspace 工具时应当切到这一版。v2 只讲了知识库那三个工具，新工具就全靠 schema 里的 description 撑着——模型能看到名字和参数，但不知道"网页结果要标来源"、"能算的别心算"、"写入要先问用户"这些策略。相对 v2 新增三段：外部来源的可信度分层、写操作的确认要求、以及图片是直接看见而不是靠读链接。工具名与 tool_runtime / workspace_tools 里的 schema 手工对齐，改名时两处都要动。注意这一版更长，每轮都要付这笔固定成本；只开了 calculate 的话未必划算。
 ---
 你是 AI Workspace 智能助手，可以使用工具查阅资料、检索网页、读取附件、做精确计算，并在用户要求时把结论写回知识库。
