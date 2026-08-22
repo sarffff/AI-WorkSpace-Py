@@ -67,6 +67,21 @@ class ModelCompletion:
     protocol_error: str | None = None
     # content 中已在流式阶段透出给用户的前缀长度,调用方据此避免重复输出。
     streamed_length: int = 0
+    # 提供商回传的终止原因(stop / length / tool_calls / ...)。
+    #
+    # 为什么必须带出来:混合推理模型会先花 max_tokens 思考,预算不够时返回的
+    # content 是**空串**,而不是截断到一半的正文。没有这个字段,"模型没什么要说"
+    # 和"预算被思考吃光了"在调用方看来完全同形——两者都是 content 为空。
+    # 2026-08-22 实测全库 7 个辅助调用点有 5 个栽在这上面(见
+    # scripts/probe_structured_budgets.py),其中记忆抽取 100% 失效了很久。
+    #
+    # None 表示提供商没给(老端点或非标准实现),不等于 "stop"。
+    finish_reason: str | None = None
+
+    @property
+    def truncated(self) -> bool:
+        """输出是否因为撞到 max_tokens 而中止。"""
+        return self.finish_reason == "length"
 
     def as_assistant_message(self) -> dict[str, Any]:
         """返回该轮次对应的正确继续消息。"""
@@ -263,6 +278,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
 
             message = response.choices[0].message
             content = message.content if isinstance(message.content, str) else ""
+            finish_reason = getattr(response.choices[0], "finish_reason", None)
             standard_calls = [
                 ToolCall(
                     id=call.id,
@@ -275,7 +291,38 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 span, getattr(response, "usage", None), messages, content, model
             )
             span.set(tool_calls=len(standard_calls) or None)
-            return self._build_completion(content, standard_calls)
+            self._record_truncation(span, finish_reason, content, max_tokens, purpose)
+            return self._build_completion(
+                content, standard_calls, finish_reason=finish_reason
+            )
+
+    @staticmethod
+    def _record_truncation(
+        span: Any,
+        finish_reason: str | None,
+        content: str,
+        max_tokens: int,
+        purpose: str,
+    ) -> None:
+        """撞到 max_tokens 时留下痕迹——埋点一条,空输出再加一条日志。
+
+        分两级是有意的:``finish_reason=length`` 而正文非空是常见的"答长了",
+        属于成本项,记进 span 供事后统计就够;而 **正文为空** 的截断是故障,
+        意味着预算全被思考吃掉、调用方拿到的是空串,它会走静默降级路径,
+        所以必须当场喊出来。这正是记忆抽取失效很久没人发现的原因。
+        """
+        if finish_reason != "length":
+            return
+        span.set(truncated=True)
+        if content.strip():
+            return
+        logger.warning(
+            "llm.%s returned empty content and finish_reason=length: "
+            "max_tokens=%s was fully consumed (reasoning models spend it on thinking "
+            "before emitting any text) — raise the budget for this call site",
+            purpose,
+            max_tokens,
+        )
 
     @staticmethod
     def _cached_tokens(usage: Any) -> int | None:
@@ -362,6 +409,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
         content: str,
         standard_calls: list[ToolCall],
         streamed_length: int = 0,
+        finish_reason: str | None = None,
     ) -> ModelCompletion:
         """把原始内容与已装配的工具调用归一化为 ModelCompletion。
 
@@ -373,6 +421,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 content=content,
                 tool_calls=standard_calls,
                 streamed_length=streamed_length,
+                finish_reason=finish_reason,
             )
 
         text_calls = cls.parse_text_tool_calls(content)
@@ -382,6 +431,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 tool_calls=text_calls,
                 raw_content=content,
                 uses_text_tool_protocol=True,
+                finish_reason=finish_reason,
             )
 
         if "<function=call>" in content.lower():
@@ -389,10 +439,14 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 content="",
                 tool_calls=[],
                 protocol_error="模型返回了无法解析的工具调用格式",
+                finish_reason=finish_reason,
             )
 
         return ModelCompletion(
-            content=content, tool_calls=[], streamed_length=streamed_length
+            content=content,
+            tool_calls=[],
+            streamed_length=streamed_length,
+            finish_reason=finish_reason,
         )
 
     # 部分 OpenAI 兼容端点不认 stream_options。被拒一次就记住，不再重复试探。
@@ -453,12 +507,17 @@ class OpenAICompatibleAdapter(ModelAdapter):
             blocked = False
             usage = None
             first_token_ms: int | None = None
+            finish_reason: str | None = None
 
             async for chunk in stream:
                 # include_usage 生效时,用量在最后一个不含 choices 的分片里到达
                 usage = getattr(chunk, "usage", None) or usage
                 if not chunk.choices:
                     continue
+                # 终止原因只出现在最后一个带 choices 的分片上,前面的分片是 None
+                finish_reason = (
+                    getattr(chunk.choices[0], "finish_reason", None) or finish_reason
+                )
                 delta = chunk.choices[0].delta
 
                 for raw_call in getattr(delta, "tool_calls", None) or []:
@@ -521,8 +580,9 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 first_token_ms=first_token_ms,
                 tool_calls=len(standard_calls) or None,
             )
+            self._record_truncation(span, finish_reason, content, max_tokens, purpose)
             yield StreamChunk(
                 completion=self._build_completion(
-                    content, standard_calls, streamed_length
+                    content, standard_calls, streamed_length, finish_reason
                 )
             )

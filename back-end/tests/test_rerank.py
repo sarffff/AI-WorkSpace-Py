@@ -68,13 +68,22 @@ def _install(monkeypatch, responses) -> _FakeClient:
     return client
 
 
-def _payload(pairs, prompt_tokens: int = 10) -> dict:
-    return {
-        "results": [
-            {"index": index, "relevance_score": score} for index, score in pairs
-        ],
-        "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens},
-    }
+def _payload(pairs, prompt_tokens: int = 10) -> _Response:
+    """成功响应。必须包成 _Response——被测代码会先调 raise_for_status()。
+
+    之前这里返回裸 dict，8 条用例挂在 `'dict' object has no attribute
+    'raise_for_status'`，而失败信息指向 rerank.py 内部，看着像被测代码坏了。
+    直接用 _Response 的那几条（500、非 dict、缺字段）一直是通的，因为它们没走
+    这个辅助函数。
+    """
+    return _Response(
+        {
+            "results": [
+                {"index": index, "relevance_score": score} for index, score in pairs
+            ],
+            "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens},
+        }
+    )
 
 
 # ========== 配置 ==========
@@ -236,15 +245,17 @@ def test_malformed_items_are_dropped(monkeypatch):
     _install(
         monkeypatch,
         [
-            {
-                "results": [
-                    "not a dict",
-                    {"index": "0", "relevance_score": 0.9},  # 下标是字符串
-                    {"index": True, "relevance_score": 0.9},  # bool 是 int 的子类
-                    {"index": 1, "relevance_score": "high"},  # 分数不是数字
-                    {"index": 0, "relevance_score": 0.4},
-                ]
-            }
+            _Response(
+                {
+                    "results": [
+                        "not a dict",
+                        {"index": "0", "relevance_score": 0.9},  # 下标是字符串
+                        {"index": True, "relevance_score": 0.9},  # bool 是 int 的子类
+                        {"index": 1, "relevance_score": "high"},  # 分数不是数字
+                        {"index": 0, "relevance_score": 0.4},
+                    ]
+                }
+            )
         ],
     )
 

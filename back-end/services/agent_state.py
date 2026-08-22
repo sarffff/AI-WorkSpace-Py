@@ -113,6 +113,16 @@ class TurnState:
     top_p: float = 1.0
     prompt_ref: str = ""
     delegation_mode: str = "off"
+    # 本回合的计划，``[{goal, tool}, ...]``。空列表 = 没开规划，或模型判断不用分步。
+    #
+    # 存进快照的理由和 messages 一样：恢复发生在另一个请求里，那边不会重新规划。
+    # 少了它，用户点一次同意就等于把计划丢掉——而计划正文已经在 messages 里了，
+    # 于是模型还能看到它，只有我们这边看不到。那种"半个状态"最难查。
+    #
+    # 不存 step 游标：没有可靠信号说明"这一步做完了"（一轮可能并行调三个工具，
+    # 也可能一轮什么都没做完）。按轮次推游标是个看起来精确的假数字。
+    # 计划到底有没有被照做，由 eval 侧用"点名的工具实际调没调"来量。
+    plan: list[dict[str, Any]] = field(default_factory=list)
 
     # ---- 进度 ----
     messages: list[dict[str, Any]] = field(default_factory=list)

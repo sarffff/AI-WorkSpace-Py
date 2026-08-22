@@ -1,10 +1,7 @@
 import React, { useState } from "react";
 import { ThumbsUp, ThumbsDown, Check, X } from "lucide-react";
 import { apiClient } from "@/shared/api/client";
-import type {
-  FeedbackReason,
-  MessageFeedback,
-} from "@/shared/types/api.types";
+import type { FeedbackReason, MessageFeedback } from "@/shared/types/api.types";
 
 const REASON_LABELS: { value: FeedbackReason; label: string }[] = [
   { value: "inaccurate", label: "内容不准确" },
@@ -46,7 +43,11 @@ export const FeedbackButtons: React.FC<Props> = ({ messageId, initial }) => {
 
   const send = async (
     next: "up" | "down",
-    extra?: { reason?: FeedbackReason; comment?: string; expectedAnswer?: string },
+    extra?: {
+      reason?: FeedbackReason;
+      comment?: string;
+      expectedAnswer?: string;
+    },
   ) => {
     if (!messageId) return;
     setBusy(true);

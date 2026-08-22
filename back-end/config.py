@@ -93,6 +93,32 @@ class Settings(BaseSettings):
     # 而每一次都是一个完整的嵌套循环——AGENT_MAX_TOOL_ROUNDS 管不到它。
     AGENT_MAX_DELEGATIONS: int = 3
 
+    # ========== 显式规划(plan-and-execute) ==========
+    # off          : 纯 ReAct,与加这个功能之前逐位相同(默认)
+    # plan_execute : 进循环之前先让辅助模型把问题拆成有序步骤,计划作为一条
+    #                指引注入,然后照常跑现在这个执行循环
+    #
+    # 为什么不换掉现在的循环:ReAct 的"边走边看"在工具结果不确定时是优势——
+    # 检索空了就换查询,这件事计划里写不出来。plan_execute 加的是**事前的全局
+    # 视野**,它该压住的是"一次只想一步、于是绕路"。两者不是替代关系,所以这里
+    # 是在同一个执行循环前面加一段,而不是另开一条代码路径。
+    #
+    # 已知失效模式写在提示词里(prompts/agent_plan/):给简单问题硬凑几步。所以
+    # 空计划是合法输出,而 planAdherence 这个指标专门盯"计划了却没照做"。
+    #
+    # 收益无法先验断定,只能量:规划本身是一次额外的辅助模型调用,而这个仓库里
+    # 已经有一半的"增强"被证明零收益甚至没执行过。所以 eval 里有 plan-execute
+    # 变体,和 delegation-* 一样,先量再说。
+    AGENT_PLAN_MODE: str = "off"
+    # 计划最多几步。上限是**校验**不是截断:多出来的步骤砍掉等于把"模型没照
+    # max_steps 做"翻译成"计划就这么长"(见 structured.Plan)。
+    AGENT_PLAN_MAX_STEPS: int = 5
+    # 规划那次调用的输出预算。默认给到 2048 而不是"够输出五行 JSON 就行"——
+    # 本仓库 2026-08-22 实测七个辅助调用点有五个因为按输出长度定预算而 100%
+    # 返回空串(推理模型先花预算思考)。这里从第一天就按思考开销定,
+    # 而不是等它静默失效一次。判据见 scripts/probe_structured_budgets.py。
+    AGENT_PLAN_MAX_TOKENS: int = 2048
+
     # ========== 状态快照与中断恢复 ==========
     # 关掉即退回"一个回合的状态只活在 SSE 生成器的局部变量里":连接一断就没了,
     # 也就没有人工审批(它要跨请求)、没有重放、没有 agent_runs 记录。
@@ -291,7 +317,9 @@ class Settings(BaseSettings):
     # 亲手废掉稀疏通道:假答案里的专有名词、编号、错别字全是模型编的,拿它做字面
     # 匹配只会命中一堆无关内容。
     RAG_HYDE: bool = False
-    RAG_HYDE_MAX_TOKENS: int = 200
+    # 实测原值 200 不够:HyDE 的正确输出只有 88 字,但思考先把 200 花光,返回空串,
+    # 于是 hyde 变体与 baseline 逐位相同。见下面那组"辅助调用的输出预算"。
+    RAG_HYDE_MAX_TOKENS: int = 2048
     # 查询路由:让辅助模型判断这个查询偏字面还是偏语义,据此调整两路的 RRF 权重。
     # eval 数据集的 probe 标注(lexical / paraphrase / table_lookup ...)天生就是
     # 这个分类器的标注集,所以它的准确率是可测的,不用凭感觉。
@@ -301,6 +329,62 @@ class Settings(BaseSettings):
     RAG_RRF_SPARSE_WEIGHT: float = 1.0
     # 路由判定为偏字面/偏语义时,弱侧通道的权重降到多少
     RAG_ROUTE_WEAK_WEIGHT: float = 0.4
+
+    # ---------- 辅助调用的输出预算 ----------
+    # 这一组存在的理由是两次实测,而不是"参数最好都可配"。
+    #
+    # 第一次(scripts/probe_structured_budgets.py):量全库 7 个辅助模型调用点,
+    # 同一段提示词跑现有预算和 2048 两次,**5 个在现有预算下 100% 返回空串**。
+    # 原因是 glm-4.5-air 这类混合推理模型会先花 max_tokens 思考,预算不够时
+    # 一个字都不吐——不是截断到一半的 JSON,是空串。
+    #
+    # 空串之后的链路每一环都"合理":解析不出 JSON → 调用方按"这是增强不是依赖"
+    # 静默降级 → 没有日志。叠起来的结果是这四个检索增强从来没有执行过,而
+    # eval/variants.py 里对应的 5 个变体与 baseline 逐位相同——报告上读作
+    # "这个技术没有增益",真相是它没跑。
+    #
+    # 第二次(scripts/sweep_worst_case_budgets.py):第一次的结论是**假绿灯**。
+    # 那个探针用玩具输入(一个短问题、5 个候选),而思考开销跟着输入长度涨。
+    # 按各自的输入上界重量之后,统一配 1024 的三个调用点仍然 100% 失败:
+    #
+    #   rerank         提示词 10241 字(20 候选 × 500)  最低 3072
+    #   query_condense 提示词  2653 字(6 轮 × 400)     最低 2048
+    #   history_summary提示词 15945 字(无硬截断!)      最低 2048
+    #   memory_extract 提示词  6322 字(2000 + 4000)    最低 1024
+    #
+    # 教训不是"1024 不够",是**按典型输入定预算会漏掉配置放大的那一档**。
+    # 所以下面每个值都留一倍余量:候选数、历史预算都是可配的,贴着最低值配
+    # 等于把"改大那个配置"变成一个静默失效的开关。
+    #
+    # 为什么可以大方给:max_tokens 是**上界不是账单**。计费按真实输出 token,
+    # 而失效那一侧的代价是"思考的 token 全额付费、拿回来一个空串"——所以
+    # 宁大勿小在这里连成本权衡都不算。
+    #
+    # 现在这类失效不再无声:finish_reason=length 且正文为空会在 model_adapter
+    # 里记 span 并打 warning(见 _record_truncation),structured 层再补一条
+    # ``truncated`` 失败标签和 ``budget_exhausted`` 埋点。
+    #
+    # 这三个的输入是固定的短提示词(一个问题),量下来 1024 就够,但仍然给到
+    # 2048 保持一致的余量——见上面"上界不是账单"。
+    RAG_ROUTE_MAX_TOKENS: int = 2048
+    RAG_MULTI_QUERY_MAX_TOKENS: int = 2048
+    # 输入随 RAG_RERANK_CANDIDATES × RAG_RERANK_SNIPPET_CHARS 增长,是七个调用点里
+    # 唯一输入会被配置放大的,也是唯一一个"按合成语料扫出来的下限不够用"的。
+    #
+    # 扫出来的最低值是 3072(20 候选 × 500 字的填充文本),按惯例给一倍余量配了
+    # 6144。然后真实语料打回来了:2026-08-22 那轮 30 题 × 2 个重排变体里
+    # **7 次仍然空串**(约 12%)。真实分块的信息密度比填充文本高,读 20 段要想的
+    # 更多。所以这里按实测又翻了一倍。
+    #
+    # 这一条要记住的不是数字,是**输入会被配置放大的调用点必须按真实数据校准**,
+    # 合成输入只能给下界。改动 RAG_RERANK_CANDIDATES 或 RAG_RERANK_SNIPPET_CHARS
+    # 之后要重新跑一遍 scripts/sweep_worst_case_budgets.py,并盯住运行日志里
+    # 有没有 "llm.rerank returned empty content"。
+    RAG_RERANK_MAX_TOKENS: int = 12288
+    # 指代消解。这一项是唯一**默认开启**的受害者(RAG_CONDENSE_QUERY=True),
+    # 也就是说真实链路上每一次追问都在拿原文检索,而系统提示词还告诉模型
+    # "已经预检索过了,够用就直接答"。最低 2048。
+    RAG_CONDENSE_MAX_TOKENS: int = 4096
 
     # ========== 向量存储 ==========
     # memory | qdrant
@@ -343,7 +427,17 @@ class Settings(BaseSettings):
     HISTORY_FETCH_LIMIT: int = 80
     # 超出预算的早期历史是否压成滚动摘要(关闭则直接丢弃)
     HISTORY_SUMMARY: bool = True
-    HISTORY_SUMMARY_MAX_TOKENS: int = 400
+    # 这一项是七个调用点里输入**没有硬截断**的那个:滑出预算的历史有多少就压多少。
+    # 按 HISTORY_TOKEN_BUDGET 量级构造(提示词 15945 字)实测最低 2048,给一倍余量。
+    #
+    # 这个数同时管两件互相冲突的事:给思考的余地,以及摘要本身的长度上限
+    # (摘要要进 HISTORY_TOKEN_BUDGET,长了就挤掉真实历史)。API 只给一个旋钮,
+    # 所以分工是:**这里给够思考**,长度由提示词那句"压缩成要点摘要"约束。
+    # 代价要说清楚:2048 下最坏情况摘要是 530 字(约 350 token,占 4000 预算的 9%),
+    # 4096 下可能更长。如果哪天摘要开始又长又啰嗦,该改的是
+    # prompts/history_summary/ 里加一句字数上限,**不是把这个数调回去**——
+    # 调小它只会让摘要重新变成空串(实测 400 和 1024 都失败)。
+    HISTORY_SUMMARY_MAX_TOKENS: int = 4096
 
     # ========== 语义缓存 ==========
     # 默认关闭:嵌入向量对时间、否定这类"改变答案"的差异不敏感,
@@ -374,6 +468,18 @@ class Settings(BaseSettings):
     MEMORY_INJECT_LIMIT: int = 20
     # 单条记忆的字符上限,超长的"记忆"多半是把整段对话抄了一遍
     MEMORY_ITEM_MAX_CHARS: int = 200
+    # 抽取那次辅助模型调用的输出上限。
+    #
+    # 这个数给小了会让整个记忆功能静默失效,而且完全看不出来:推理型模型
+    # (glm-4.5-air 这类)会先花掉一部分预算做思考,预算不够时返回的 content 是
+    # **空串**——于是 request_structured 连着两次拿到 no_json、返回 None,而
+    # extract 对 None 的处理是"这轮不记"(抽取是增强不是依赖)。三层加起来的结果
+    # 是:抽取 100% 不工作,日志干净,报告上只表现为"用户没有任何长期记忆"。
+    # 原来写死的 512 正好落在失效那一侧,实测 1024 才刚够。
+    #
+    # 留出余量而不是贴着 1024:提示词里的 question/answer 各截到 2000/4000 字,
+    # 长对话的思考开销更大。抽取每轮只跑一次,多给点输出预算比静默失效便宜。
+    MEMORY_EXTRACT_MAX_TOKENS: int = 2048
 
     # ========== 提示词版本 ==========
     # 实际正文在 back-end/prompts/<key>/<version>.md,这里只选用哪一版。

@@ -35,6 +35,7 @@ from services import agent_roles
 from services import agent_state
 from services import approval
 from services import checkpoint_store
+from services import planner
 from services import subagent
 from services import tool_history
 from services import workspace_service
@@ -805,7 +806,7 @@ class ChatService:
                 tools=[],
                 model=settings.utility_model,
                 temperature=0.0,
-                max_tokens=256,
+                max_tokens=settings.RAG_CONDENSE_MAX_TOKENS,
                 purpose="query_condense",
             )
         except Exception as exc:
@@ -814,7 +815,19 @@ class ChatService:
         # 长度检查针对整个输出而不是第一行:把整段对话抄一遍的"改写"第一行
         # 可能很短,单看第一行拦不住
         raw = (completion.content or "").strip()
-        if not raw or len(raw) > len(prompt) * 3 + 200:
+        if not raw:
+            # 空输出以前和"改写没必要"共用同一条静默 return。它们不是一回事:
+            # 这一条是故障。原来 max_tokens=256 时它 100% 走这里——推理模型把
+            # 预算花在思考上,一个字都没吐——于是指代消解从未生效,而系统提示词
+            # 仍然告诉模型"已经预检索过了",等于把弱检索包装成"已查过"。
+            logger.warning(
+                "query condense produced no output (finish_reason=%s, max_tokens=%s); "
+                "falling back to the raw follow-up question",
+                completion.finish_reason,
+                settings.RAG_CONDENSE_MAX_TOKENS,
+            )
+            return prompt
+        if len(raw) > len(prompt) * 3 + 200:
             return prompt
         condensed = raw.splitlines()[0].strip().strip('"“”')
         if not condensed:
@@ -1153,6 +1166,10 @@ class ChatService:
         # 「检索知识库...」->「检索知识库完成,正在思考下一步...」状态。
         user_content = prompt
         prefetched = False
+        # 显式初始化而不是只在预检索块里赋值:下面规划那段要读它。靠 prefetched
+        # 短路虽然当前也不会 NameError,但那是个只对"求值顺序"成立的巧合,
+        # 而这两处离得很远。
+        prefetch_context = ""
         # 条件是 use_rag 而不是"有没有工具":workspace 工具打开之后,关掉知识库的
         # 请求也会有非空的 tools,拿它当代理会让预检索在 RAG 关闭时照样触发。
         if use_rag and settings.RAG_PREFETCH:
@@ -1251,6 +1268,32 @@ class ChatService:
             *trajectory,
             {"role": "user", "content": self._user_content(user_content, turn, model)},
         ]
+
+        # ---- 显式规划(plan-and-execute) ----
+        # 位置是有讲究的:必须在 messages 拼好之后、进循环之前。
+        #   - 在预检索之后:计划要能看到"资料已经拿到了",否则它会规划一步去查
+        #     已经在眼前的东西(见 prompts/agent_plan/ 里那条规则)
+        #   - 在循环之前:计划是**事前**的全局视野,边跑边规划就退回 ReAct 了
+        # 计划接在用户消息后面而不是塞进系统提示词:它每轮都不同,而系统提示词是
+        # 整个前缀的第一条消息,让它随本轮内容变化就是把提示词缓存整段作废
+        # (同 PROMPT_CACHE_STABLE_PREFIX 那段的理由)。
+        plan: list[dict[str, Any]] = []
+        if planner.enabled() and runtime.schemas:
+            plan = await planner.build_plan(
+                self.model_adapter,
+                question=prompt,
+                context=prefetch_context if prefetched else "",
+                tool_names=[
+                    schema["function"]["name"] for schema in runtime.schemas
+                ],
+            )
+            # 空计划不发事件也不注入:模型判断"直接答就行"是正确输出,给前端推一个
+            # 空计划卡片纯属噪声。步数进埋点,那样"规划到底有没有产出"是可查的
+            # ——0 步和"规划挂了"在这里同形,靠 planner 里那条 warning 区分。
+            turn.set(plan_steps=len(plan) or None)
+            if plan:
+                messages.append({"role": "user", "content": planner.format_steps(plan)})
+                yield {"type": "plan", "steps": plan}
         # ---- 状态与协作者分离 ----
         # state 是能进数据库、能跨请求的那一半;context 是持有会话与客户端的那一半。
         # 改动之前两者混在同一批局部变量里,所以没有任何一个子集是可以存下来的。
@@ -1269,6 +1312,7 @@ class ChatService:
             top_p=top_p,
             prompt_ref=system_template.ref,
             delegation_mode=settings.AGENT_DELEGATION_MODE,
+            plan=plan,
             messages=messages,
             budget_remaining=budget.remaining,
             budget_per_call=settings.TOOL_RESULT_MAX_CHARS,

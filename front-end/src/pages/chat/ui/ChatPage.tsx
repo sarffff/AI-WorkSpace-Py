@@ -166,9 +166,16 @@ export const ChatPage: React.FC = () => {
     pendingInput,
     promptVersion,
   } = useSelector((state: RootState) => state.chat);
-  const messages = currentChatId
-    ? (messagesBySession[currentChatId] ?? [])
-    : [];
+  /**
+   * 当前会话的消息。用 useMemo 而不是直接算：没有会话、或者这个会话还没拉到
+   * 消息时，三元表达式每次 render 都会产出一个**新的** `[]`，于是所有把
+   * `messages` 列进依赖的 hook 都会跟着每次 render 重跑一遍——包括下面跟随
+   * 滚动那个 effect，正好抵掉给它加依赖数组的意义。
+   */
+  const messages = useMemo(
+    () => (currentChatId ? (messagesBySession[currentChatId] ?? []) : []),
+    [currentChatId, messagesBySession],
+  );
   const [input, setInput] = useState("");
   const [useRag, setUseRag] = useState(false);
   const [showThinking, setShowThinking] = useState(false);
@@ -638,9 +645,26 @@ export const ChatPage: React.FC = () => {
     }
   }, []);
 
+  /**
+   * 跟随流式输出。两个地方容易写反，都会表现成"滚动一卡一卡"：
+   *
+   * 1. **条件是"用户在底部"才跟，不是反过来。** 写成 `!isNearBottom()` 的话，
+   *    在底部跟读时反而不滚——新文字往下长、飘出 150px、才追一下、追到底又
+   *    停下。那 150px 就成了卡顿的步长。而它同时还会在用户往上翻历史时把人
+   *    拽回底部，正好是这个判断本来要防的事。
+   *
+   * 2. **用 scrollTop 直接赋值，不用 behavior:"smooth"。** flushBuffer 每
+   *    FLUSH_INTERVAL(60ms) dispatch 一次，而平滑滚动要 300ms 以上走完缓动。
+   *    每 60ms 发一个新的平滑滚动会不断重定向上一个还没走完的动画，每次都从
+   *    缓动曲线最慢的起步段重来，于是既追不上也看起来在抖。瞬时滚动每次只动
+   *    几像素，本身就是平滑的。
+   *
+   * 依赖挂 messages：不写依赖数组会让它每次 render 都跑一遍。isNearBottom 与
+   * scrollToBottom 都是空依赖的 useCallback，引用稳定，列进去不会多跑。
+   */
   useEffect(() => {
-    if (!isNearBottom()) scrollToBottom();
-  });
+    if (isNearBottom()) scrollToBottom(false);
+  }, [messages, toolStatus, pendingApproval, isNearBottom, scrollToBottom]);
 
   /**
    * 核心：把用户消息发给后端并流式渲染 AI 回复。
@@ -1332,6 +1356,11 @@ export const ChatPage: React.FC = () => {
         }),
       );
 
+      // 自己发出的消息一定要能看见,哪怕此刻正翻在历史里——上面那个跟随用的
+      // effect 只在"已经贴着底部"时才滚,不覆盖这一下。这里是离散跳转,
+      // 用平滑动画正合适(它不会像流式跟随那样每 60ms 被重发一次)。
+      requestAnimationFrame(() => scrollToBottom(true));
+
       await runCompletion(sessionId, apiPrompt, userMessageId);
     },
     [
@@ -1345,6 +1374,7 @@ export const ChatPage: React.FC = () => {
       capabilities,
       runCompletion,
       toast,
+      scrollToBottom,
     ],
   );
 

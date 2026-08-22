@@ -517,11 +517,16 @@ export class ApiClient {
    * 卡片找回来的入口。
    */
   async getPendingApprovals(): Promise<PendingApproval[]> {
-    const response = await this.authedFetch(`${this.baseUrl}/chats/runs/pending`, {
-      method: "GET",
-    });
+    const response = await this.authedFetch(
+      `${this.baseUrl}/chats/runs/pending`,
+      {
+        method: "GET",
+      },
+    );
     if (!response.ok) {
-      throw new Error(`Failed to fetch pending approvals: ${response.statusText}`);
+      throw new Error(
+        `Failed to fetch pending approvals: ${response.statusText}`,
+      );
     }
     return response.json();
   }
@@ -531,9 +536,12 @@ export class ApiClient {
    * GET /chats/runs/{runId}
    */
   async getAgentRun(runId: string): Promise<AgentRunDetail> {
-    const response = await this.authedFetch(`${this.baseUrl}/chats/runs/${runId}`, {
-      method: "GET",
-    });
+    const response = await this.authedFetch(
+      `${this.baseUrl}/chats/runs/${runId}`,
+      {
+        method: "GET",
+      },
+    );
     if (!response.ok) {
       throw new Error(`Failed to fetch run: ${response.statusText}`);
     }
@@ -708,7 +716,8 @@ export class ApiClient {
     if (!response.ok) {
       const error = await response.json().catch(() => ({}));
       throw new Error(
-        error.detail || `Failed to regenerate invite code: ${response.statusText}`,
+        error.detail ||
+          `Failed to regenerate invite code: ${response.statusText}`,
       );
     }
 

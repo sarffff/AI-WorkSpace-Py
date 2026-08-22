@@ -48,6 +48,17 @@ DATASET_PATH = os.path.join(_EVAL_DIR, "datasets", "rag_golden.jsonl")
 # 评估语料挂在这个固定的伪用户下，和真实用户数据完全隔离
 EVAL_USER_ID = "eval-harness"
 
+# 生成被评回答那一次调用的输出预算。
+#
+# 原来是写死的 800，而 2026-08-22 加上 finish_reason 之后立刻看到它在真实运行里
+# 返回**空串**:推理模型先花预算思考，800 不够时一个字都不吐。后果比别处更严重
+# ——空答案会被裁判判成失败，于是报告上呈现为"这个变体答不出来"，而模型其实
+# 从没得到过说话的机会。尺子自己坏在了最不容易怀疑的地方。
+#
+# 给得比 _JUDGE_MAX_TOKENS 小一点是有意的:回答要的是几百字散文，裁判要的是
+# 一个带 reason 的 JSON，后者更容易被思考挤掉。
+_ANSWER_MAX_TOKENS = 3072
+
 
 def ensure_eval_user(session: Any) -> None:
     """确保评估用的伪用户在 ``users`` 表里存在。
@@ -318,7 +329,7 @@ async def _run_case(
                     tools=[],
                     model=settings.LLM_MODEL,
                     temperature=0.0,
-                    max_tokens=800,
+                    max_tokens=_ANSWER_MAX_TOKENS,
                     purpose="eval_answer",
                 )
                 answer = completion.content or ""

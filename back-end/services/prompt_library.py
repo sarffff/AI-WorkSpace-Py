@@ -138,6 +138,15 @@ SPECS: dict[str, PromptSpec] = {
         default_version="v1",
         required=("question", "answer"),
     ),
+    # 显式规划(plan-and-execute)。不给 setting:规划模式本身由
+    # AGENT_PLAN_MODE 控制,而"用哪一版规划提示词"目前没有第二版可选——
+    # 等真有 v2 再加覆盖项,提前加一个永远填不满的开关只是噪声。
+    "agent_plan": PromptSpec(
+        key="agent_plan",
+        purpose="回答之前先把问题拆成有序步骤，交给执行循环",
+        default_version="v1",
+        required=("question", "context", "tools", "max_steps"),
+    ),
     # 子代理各自一个 key,而不是共用一个带 [[if role]] 分支的模板:三个角色的
     # 约束几乎不重叠(researcher 要讲出处分层,analyst 要讲"缺输入就停",
     # critic 要讲"没依据别提"),塞进一版会变成一个谁都不好改的大文件,
