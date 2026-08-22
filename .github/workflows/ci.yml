@@ -16,7 +16,7 @@ jobs:
       JWT_SECRET_KEY: ci-only-secret-key-not-for-production-0123456789
       WORKING_DIR: back-end
       # 测试需要的最小配置
-      DATABASE_URL: sqlite:///:memory:
+      DATABASE_URL: "sqlite:///:memory:"
       LLM_API_KEY: test-key
       LLM_BASE_URL: https://example.invalid/v4/
       RERANK_API_KEY: test-key
