@@ -175,4 +175,14 @@ class ConversationContextBuilder:
             return ""
 
         content = (completion.content or "").strip()
+        if not content:
+            # 空摘要会让 HISTORY_SUMMARY=true 静默退化成 false(滑出预算的历史
+            # 直接丢掉)。实测这个调用点在 400 预算下还没掉到空串,但余量很薄
+            # ——同一类失效在别处已经发生了五次,所以这里先把话筒装上。
+            logger.warning(
+                "history summarization produced no output "
+                "(finish_reason=%s, max_tokens=%s); rolling summary stays unchanged",
+                completion.finish_reason,
+                settings.HISTORY_SUMMARY_MAX_TOKENS,
+            )
         return content

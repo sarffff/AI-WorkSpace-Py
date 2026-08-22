@@ -57,6 +57,28 @@ def rerank_mode() -> str:
     return "llm" if settings.RAG_RERANK else "off"
 
 
+def _warn_degraded(stage: str, report, fallback: str) -> None:
+    """检索增强降级时留一条日志。
+
+    这四处(路由/HyDE/多查询/重排)的降级路径本身是对的——增强失败不该让回答
+    失败。问题在于**降级是无声的**:``result is None`` 就静默走 fallback,报告里
+    只看到"这个技术没有增益"。2026-08-22 实测四处全部 100% 降级(预算被思考
+    吃光),而 eval 里对应的变体与 baseline 逐位相同,持续了很久没人发现。
+
+    所以这条日志的作用不是排错细节,而是让"我配了但它没生效"这件事**可见**。
+    ``budget_exhausted`` 时 structured 层已经喊过一次预算问题,这里补上业务后果:
+    哪个阶段降级了、退成了什么。
+    """
+    logger.warning(
+        "%s degraded (attempts=%s failures=%s finish_reason=%s) → %s",
+        stage,
+        report.attempts,
+        report.failures,
+        report.finish_reason,
+        fallback,
+    )
+
+
 @dataclass(slots=True)
 class RetrievedChunk:
     """一条检索结果。经过邻域扩展后可能覆盖多个相邻分块。"""
@@ -282,7 +304,7 @@ class HybridRetriever:
             '格式：{"intent": "lexical"}，不要任何解释。\n\n'
             f"问题：{query}"
         )
-        result, _report = await structured.request_structured(
+        result, report = await structured.request_structured(
             self._get_model_adapter(),
             schema=structured.QueryRoute,
             prompt=prompt,
@@ -290,8 +312,10 @@ class HybridRetriever:
             purpose="query_route",
             array=False,
             temperature=0.0,
-            max_tokens=32,
+            max_tokens=settings.RAG_ROUTE_MAX_TOKENS,
         )
+        if result is None:
+            _warn_degraded("query_route", report, "两路 RRF 权重都用默认值")
         return result
 
     async def _hyde_query(self, query: str) -> str:
@@ -312,7 +336,7 @@ class HybridRetriever:
             '只输出 JSON：{"answer": "..."}，不要任何解释。\n\n'
             f"问题：{query}"
         )
-        result, _report = await structured.request_structured(
+        result, report = await structured.request_structured(
             self._get_model_adapter(),
             schema=structured.HypotheticalAnswer,
             prompt=prompt,
@@ -323,6 +347,7 @@ class HybridRetriever:
             max_tokens=settings.RAG_HYDE_MAX_TOKENS,
         )
         if result is None:
+            _warn_degraded("hyde", report, "稠密通道用原查询")
             return query
         # 原查询拼在前面而不是整个替换掉：假答案可能整段跑偏，留着原查询
         # 至少保证向量里还有用户真正问的那件事
@@ -372,7 +397,7 @@ class HybridRetriever:
             '只输出 JSON 字符串数组，例如 ["查询1", "查询2"]，不要任何解释。\n\n'
             f"问题：{query}"
         )
-        result, _report = await structured.request_structured(
+        result, report = await structured.request_structured(
             self._get_model_adapter(),
             schema=structured.QueryVariants,
             prompt=prompt,
@@ -380,10 +405,11 @@ class HybridRetriever:
             purpose="query_rewrite",
             array=True,
             temperature=0.3,
-            max_tokens=256,
+            max_tokens=settings.RAG_MULTI_QUERY_MAX_TOKENS,
         )
         if result is None:
             # 改写是增强不是依赖:失败就用原查询单路召回
+            _warn_degraded("query_rewrite", report, "退回单路召回")
             return [query]
 
         variants = [item for item in result.items if item != query]
@@ -460,7 +486,7 @@ class HybridRetriever:
             "例如 [3, 1, 5]，不要任何解释。\n\n"
             f"问题：{query}\n\n" + "\n\n".join(passages)
         )
-        result, _report = await structured.request_structured(
+        result, report = await structured.request_structured(
             self._get_model_adapter(),
             schema=structured.RerankOrder,
             prompt=prompt,
@@ -468,9 +494,10 @@ class HybridRetriever:
             purpose="rerank",
             array=True,
             temperature=0.0,
-            max_tokens=256,
+            max_tokens=settings.RAG_RERANK_MAX_TOKENS,
         )
         if result is None:
+            _warn_degraded("rerank", report, "退回融合序")
             return []
 
         seen: set[str] = set()

@@ -199,7 +199,7 @@ def test_blocked_retrieval_never_reaches_main_model(db, monkeypatch):
 
     main_messages = adapter.calls[0]["messages"]
     joined = "".join(message.get("content", "") for message in main_messages)
-    assert "这段检索结果因包含疑似提示注入内容而未被注入" in joined
+    assert "这段外部内容因包含疑似提示注入内容而未被注入" in joined
     assert canary not in joined
 
 

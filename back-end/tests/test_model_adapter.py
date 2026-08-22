@@ -13,9 +13,11 @@ from conftest import run
 from services.model_adapter import OpenAICompatibleAdapter
 
 
-def _chunk(content=None, tool_calls=None):
+def _chunk(content=None, tool_calls=None, finish_reason=None):
     delta = SimpleNamespace(content=content, tool_calls=tool_calls)
-    return SimpleNamespace(choices=[SimpleNamespace(delta=delta)])
+    return SimpleNamespace(
+        choices=[SimpleNamespace(delta=delta, finish_reason=finish_reason)]
+    )
 
 
 def _tool_delta(index, call_id=None, name=None, arguments=None):
@@ -175,3 +177,83 @@ def test_prose_then_function_markup_is_a_protocol_error():
     assert texts == ["好的，"]
     assert completion.protocol_error == "模型返回了无法解析的工具调用格式"
     assert completion.tool_calls == []
+
+
+# ========== finish_reason ==========
+#
+# 这个字段是为一类具体故障加的:混合推理模型先花 max_tokens 思考,预算不够时
+# 返回空串。没有它,"模型没什么要说"和"预算被思考吃光了"在调用方看来完全同形
+# ——两者都是 content 为空,而后者会让整个功能静默失效(实测全库 7 个辅助
+# 调用点有 5 个长期落在这里)。
+
+
+def test_stream_captures_finish_reason():
+    """终止原因只出现在最后一个带 choices 的分片上,前面的都是 None。"""
+    adapter, _completions = _adapter(
+        [_chunk("你"), _chunk("好"), _chunk(None, finish_reason="stop")]
+    )
+
+    _texts, completion = run(_drain(adapter))
+
+    assert completion.finish_reason == "stop"
+    assert completion.truncated is False
+
+
+def test_stream_marks_truncation():
+    adapter, _completions = _adapter(
+        [_chunk("答案是"), _chunk(None, finish_reason="length")]
+    )
+
+    _texts, completion = run(_drain(adapter))
+
+    assert completion.finish_reason == "length"
+    assert completion.truncated is True
+
+
+def test_empty_content_with_length_is_reported(caplog):
+    """预算全被思考吃掉——正文为空的截断是故障,必须当场喊出来。
+
+    正文非空的截断只是"答长了",属于成本项,记 span 就够;正文为空的那种会让
+    调用方走静默降级路径,而那正是这类 bug 藏得住的原因。
+    """
+    import logging
+
+    adapter, _completions = _adapter([_chunk(None, finish_reason="length")])
+
+    with caplog.at_level(logging.WARNING, logger="model_adapter"):
+        _texts, completion = run(_drain(adapter))
+
+    assert completion.content == ""
+    assert completion.truncated is True
+    assert any("finish_reason=length" in record.message for record in caplog.records)
+
+
+def test_non_empty_truncation_is_not_warned(caplog):
+    import logging
+
+    adapter, _completions = _adapter(
+        [_chunk("说到一半"), _chunk(None, finish_reason="length")]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="model_adapter"):
+        run(_drain(adapter))
+
+    assert not [r for r in caplog.records if "finish_reason=length" in r.message]
+
+
+def test_missing_finish_reason_stays_none():
+    """老端点/非标准实现可能不给这个字段。None 不等于 "stop"——
+
+    "没有截断信息"和"正常结束"是两件事,把缺失当成正常会让排查时误以为
+    已经排除了预算问题。
+    """
+    adapter = OpenAICompatibleAdapter()
+    completions = _FakeCompletions([SimpleNamespace(choices=[
+        SimpleNamespace(delta=SimpleNamespace(content="你好", tool_calls=None))
+    ])])
+    adapter._client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    _texts, completion = run(_drain(adapter))
+
+    assert completion.finish_reason is None
+    assert completion.truncated is False

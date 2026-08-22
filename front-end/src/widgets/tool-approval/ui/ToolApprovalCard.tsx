@@ -39,6 +39,16 @@ const renderValue = (value: unknown): string => {
   }
 };
 
+/**
+ * 后端对超长字符串会截断，并额外给一个 `<键>__chars` 记原文长度
+ * （services/approval.py 的 build_preview）。
+ *
+ * 它不是一个参数，不能当条目渲染——那会变成一行「content__chars 2000」。
+ * 但也不能丢掉：卡片上显示的是前 800 字，用户点「同意」批准的是完整 2000 字，
+ * 这个差额必须让人看见，否则审批看到的和实际执行的不是同一个东西。
+ */
+const CHARS_SUFFIX = "__chars";
+
 const FIELD_LABELS: Record<string, string> = {
   title: "标题",
   content: "正文",
@@ -57,7 +67,14 @@ export const ToolApprovalCard: React.FC<ToolApprovalCardProps> = ({
   const [rejecting, setRejecting] = useState(false);
   const [note, setNote] = useState("");
 
-  const entries = Object.entries(preview ?? {});
+  const all = Object.entries(preview ?? {});
+  const entries = all.filter(([key]) => !key.endsWith(CHARS_SUFFIX));
+  /** 键 -> 原文字符数，只有被截断的字段才有 */
+  const truncated = new Map<string, number>(
+    all
+      .filter(([key, value]) => key.endsWith(CHARS_SUFFIX) && typeof value === "number")
+      .map(([key, value]) => [key.slice(0, -CHARS_SUFFIX.length), value as number]),
+  );
 
   return (
     <div className="my-3 rounded-xl border border-amber-500/40 bg-amber-500/5 dark:bg-amber-500/[0.07] overflow-hidden">
@@ -84,6 +101,12 @@ export const ToolApprovalCard: React.FC<ToolApprovalCardProps> = ({
               </span>
               <span className="min-w-0 whitespace-pre-wrap break-words text-[#3d3929] dark:text-[#e8e6dc]">
                 {renderValue(value)}
+                {truncated.has(key) ? (
+                  <span className="block mt-1 text-[10px] text-[#a19f96]">
+                    原文共 {truncated.get(key)!.toLocaleString()} 字，此处只显示开头一段；
+                    同意后写入的是完整内容
+                  </span>
+                ) : null}
               </span>
             </div>
           ))}

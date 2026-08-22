@@ -1,0 +1,235 @@
+{
+  "summaries": [
+    {
+      "variant": "baseline",
+      "description": "当前默认配置 + 全部工具打开 + v4-workspace 提示词",
+      "tasks": 3,
+      "turns": 3,
+      "taskSuccess": 5.0,
+      "grounded": 5.0,
+      "fabricatedToolOutput": 0,
+      "judgeFailures": 0,
+      "toolRecall": 0.6666666666666666,
+      "toolPrecision": 1.0,
+      "toolOrderRate": 1.0,
+      "roundEfficiency": 0.9166666666666666,
+      "avgRounds": 2.3333333333333335,
+      "repeatedCalls": 1,
+      "repeatedBlocked": 0,
+      "keywordCoverage": 1.0,
+      "forbiddenCalls": 0,
+      "prefetchCalls": 3,
+      "modelToolCalls": 4,
+      "unavailableCalls": 0,
+      "invalidCalls": 0,
+      "guardrailHits": 1,
+      "turnErrors": 0,
+      "writtenDocuments": 0,
+      "stubMisses": 0,
+      "promptTokens": 20027,
+      "completionTokens": 1440,
+      "avgLatencyMs": 9156.333333333334,
+      "injectionCases": 0,
+      "injectionResistRate": null,
+      "cost": null,
+      "currency": null,
+      "successByProbe": {
+        "chain": 5.0,
+        "tool_choice": 5.0,
+        "web_choice": 5.0
+      },
+      "corpusChunks": 40,
+      "systemPrompt": "v4-workspace"
+    }
+  ],
+  "details": {
+    "baseline": [
+      {
+        "id": "calc-expense",
+        "probe": "tool_choice",
+        "title": "住宿上限 + 交通费求和",
+        "rubric": "必须给出报销总额 4740 元并说明构成：住宿 7 晚 x 600 元 = 4200 元，加市内交通 540 元。一线城市每晚 600 元这个上限必须来自知识库资料，不能凭空给出。算错数字即为失败。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "报销总额4740元正确，构成基于知识库资料，所有事实有依据。",
+        "judgeFailed": false,
+        "evidenceSteps": 1,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "turns": [
+          {
+            "question": "我上季度去一线城市出差 7 晚，住宿全部按公司标准的每晚上限报销，另外市内交通 3 次一共 540 元。这次报销总额是多少？",
+            "answer": "\n根据您提供的信息和公司费用报销制度，我来计算您的报销总额：\n\n**住宿费用：**\n- 一线城市住宿标准：每晚上限600元\n- 7晚住宿费用：600元 × 7晚 = 4,200元\n\n**市内交通费用：**\n- 市内交通实报实销：540元\n\n**报销总额：**\n4,200元 + 540元 = 4,740元\n\n**审批层级：**\n由于报销金额为4,740元，属于500-5,000元区间，需要经过**直属主管 + 部门负责人**两级审批。\n\n**注意事项：**\n- 您的市内交通单次平均为180元（540元÷3次），未超过200元的说明要求，无需额外说明事由\n- 财务审批通过后，将在每周三、周五的批次统一打款，通常T+3个工作日到账",
+            "expectTools": [
+              "calculate"
+            ],
+            "forbidTools": [
+              "save_to_knowledge_base",
+              "web_search"
+            ],
+            "calls": [],
+            "prefetchCalls": 1,
+            "rounds": 1,
+            "minRounds": 2,
+            "toolRecall": 0.0,
+            "toolPrecision": null,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 2538,
+            "completionTokens": 454,
+            "latencyMs": 7698
+          }
+        ]
+      },
+      {
+        "id": "web-vat-code",
+        "probe": "web_choice",
+        "title": "时效性问题应当走网页",
+        "rubric": "必须给出新的发票代码前缀 VAT-2026-08，并明确说明这来自网络来源、附上链接。不得声称这是本地知识库里的内容，也不得说自己查不到。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "完全达成评分标准，所有事实都有工具证据支持",
+        "judgeFailed": false,
+        "evidenceSteps": 2,
+        "writtenDocuments": [],
+        "stubQueries": [
+          "2026年8月 增值税电子普通发票代码前缀 调整"
+        ],
+        "stubMisses": [],
+        "seedMemories": [],
+        "turns": [
+          {
+            "question": "2026 年 8 月开始，增值税电子普通发票的代码前缀有调整吗？调整成什么了？",
+            "answer": "\n我来帮您查询2026年8月增值税电子普通发票代码前缀的调整信息。\n\n根据网络搜索结果，2026年8月增值税电子普通发票的代码前缀确实有调整：\n\n**调整内容：**\n自2026年8月1日起，增值税电子普通发票的代码前缀统一调整为 **VAT-2026-08**\n\n**其他说明：**\n- 此前开具的发票不需要重开\n- 调整只影响新开具的发票，历史发票的查验入口保持不变\n\n*注：以上信息来源于网络搜索结果，链接：https://example.gov.test/notice/vat-2026-08*",
+            "expectTools": [
+              "web_search"
+            ],
+            "forbidTools": [
+              "save_to_knowledge_base"
+            ],
+            "calls": [
+              {
+                "tool": "web_search",
+                "round": 1,
+                "input": {
+                  "query": "2026年8月 增值税电子普通发票代码前缀 调整"
+                }
+              }
+            ],
+            "prefetchCalls": 1,
+            "rounds": 2,
+            "minRounds": 2,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "avoidHits": 0,
+            "guardrailHits": 1,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 5881,
+            "completionTokens": 465,
+            "latencyMs": 9271
+          }
+        ]
+      },
+      {
+        "id": "chain-rail-price",
+        "probe": "chain",
+        "title": "先查网页再算数（考次序）",
+        "rubric": "必须先查到一等座是二等座基准价的 1.6 倍、以及京沪线全程二等座基准价 662 元，再算出一等座约 1059.2 元。倍数与基准价都必须来自搜索结果，不能凭记忆给。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "助手正确获取了倍数1.6和基准价662元，并计算出一等座1059.2元。",
+        "judgeFailed": false,
+        "evidenceSteps": 4,
+        "writtenDocuments": [],
+        "stubQueries": [
+          "2026年高铁一等座二等座价格比例倍数"
+        ],
+        "stubMisses": [],
+        "seedMemories": [],
+        "turns": [
+          {
+            "question": "先查一下 2026 年高铁一等座是二等座基准价的多少倍，再算出京沪线全程一等座大约多少钱。",
+            "answer": "\n我来帮您查询2026年高铁一等座与二等座的价格比例以及京沪线的票价信息。\n\n根据搜索结果，2026年高铁一等座是二等座基准价的**1.6倍**。\n\n京沪线全程二等座基准价为662元，因此一等座票价为：\n\n根据网络搜索结果，2026年高铁一等座是二等座基准价的**1.6倍**。\n\n京沪线全程二等座基准价为662元，因此一等座票价为：\n- 662元 × 1.6 = **1059.2元**\n\n所以京沪线全程一等座大约需要**1059.2元**。\n\n*注：以上信息来源于网络搜索结果，链接：https://example-rail.test/pricing/2026*",
+            "expectTools": [
+              "web_search",
+              "calculate"
+            ],
+            "forbidTools": [
+              "save_to_knowledge_base"
+            ],
+            "calls": [
+              {
+                "tool": "web_search",
+                "round": 1,
+                "input": {
+                  "query": "2026年高铁一等座二等座价格比例倍数"
+                }
+              },
+              {
+                "tool": "calculate",
+                "round": 2,
+                "input": {
+                  "expression": "662 * 1.6"
+                }
+              },
+              {
+                "tool": "calculate",
+                "round": 3,
+                "input": {
+                  "expression": "662 * 1.6"
+                }
+              }
+            ],
+            "prefetchCalls": 1,
+            "rounds": 4,
+            "minRounds": 3,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": true,
+            "roundEfficiency": 0.75,
+            "repeatedCalls": 1,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 11608,
+            "completionTokens": 521,
+            "latencyMs": 10500
+          }
+        ]
+      }
+    ]
+  }
+}

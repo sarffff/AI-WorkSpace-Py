@@ -78,11 +78,23 @@ class StructuredReport:
     """
 
     attempts: int = 0
-    # 每次失败的原因标签:call_failed / no_json / invalid
+    # 每次失败的原因标签:call_failed / no_json / invalid / truncated
     failures: list[str] = field(default_factory=list)
     # 靠 rescue 回调救回来的(而不是模型直接给对的)
     rescued: bool = False
     last_raw: str = ""
+    # 最后一次调用的终止原因。``truncated`` 与 ``no_json`` 会同时出现:
+    # 前者说明**为什么**抠不出 JSON,而这个区别决定了该改预算还是改提示词。
+    finish_reason: str | None = None
+
+    @property
+    def budget_exhausted(self) -> bool:
+        """预算被吃光:撞到 max_tokens 且一个字都没输出。
+
+        这是混合推理模型特有的失败形状——思考先花预算,不够时 content 是空串。
+        和"输出太长被截断"要分开:后者还有内容可以 rescue,前者什么都没有。
+        """
+        return self.finish_reason == "length" and not self.last_raw.strip()
 
     @property
     def ok(self) -> bool:
@@ -212,6 +224,51 @@ class MemoryItems(BaseModel):
     items: list[MemoryItem]
 
 
+class PlanStep(BaseModel):
+    """显式规划里的一步。
+
+    ``tool`` 允许空串:比较两处规定、汇总、下结论这类步骤没有对应工具,硬要求
+    每步都填一个会直接鼓励模型乱调。工具名的**合法性**不在这里查——可用工具是
+    调用方才知道的(它随开关和委派模式变),所以那一层校验留给 planner。
+    """
+
+    goal: str
+    tool: str = ""
+
+    @field_validator("goal")
+    @classmethod
+    def _bounded_goal(cls, value: str) -> str:
+        goal = value.strip()
+        if not goal:
+            raise ValueError("goal 不能为空")
+        # 上限在契约里:一个"步骤"写到两百字就不是步骤了,是把整段回答提前写完。
+        # 那属于模型没照指令做,应该重试一次,而不是静默接受一个假计划。
+        if len(goal) > 200:
+            raise ValueError("goal 超过 200 字，请只写这一步要得到什么")
+        return goal
+
+
+class Plan(BaseModel):
+    """一份计划。空列表是合法的——见 prompts/agent_plan/。
+
+    步数上限由 ``AGENT_PLAN_MAX_STEPS`` 强制,而且是**校验**而不是截断:
+    多出来的步骤直接砍掉等于把"模型没照 max_steps 做"翻译成"计划就这么长",
+    而前者该让它重写一次(和 MemoryItem 超长时的取舍一致)。
+    """
+
+    items: list[PlanStep]
+
+    @field_validator("items")
+    @classmethod
+    def _bounded_length(cls, value: list[PlanStep]) -> list[PlanStep]:
+        limit = max(1, settings.AGENT_PLAN_MAX_STEPS)
+        if len(value) > limit:
+            raise ValueError(
+                f"最多 {limit} 步，收到 {len(value)} 步；请合并成更少的步骤"
+            )
+        return value
+
+
 class AnswerScores(BaseModel):
     """``AnswerJudge`` 的可答问题评分。"""
 
@@ -264,7 +321,11 @@ async def request_structured(
     purpose: str,
     array: bool,
     temperature: float = 0.0,
-    max_tokens: int = 512,
+    # 默认值曾经是 512,而它是个陷阱:混合推理模型先花预算思考,512 在实测里
+    # 正好落在"返回空串"那一侧(见 scripts/probe_structured_budgets.py)。所有
+    # 调用方现在都显式传值,这个默认值只对**下一个**调用方生效——所以它必须
+    # 站在安全的一侧,而不是省钱的一侧。
+    max_tokens: int = 2048,
     retries: int | None = None,
     rescue: Callable[[str], dict[str, Any] | None] | None = None,
 ) -> tuple[T | None, StructuredReport]:
@@ -305,12 +366,24 @@ async def request_structured(
 
         raw = completion.content or ""
         report.last_raw = raw
+        report.finish_reason = getattr(completion, "finish_reason", None)
         payload = extract_json(raw, array=array)
         if payload is None:
             error: Exception = ValueError(
                 f"输出里找不到合法的 {'JSON 数组' if array else 'JSON 对象'}"
             )
             report.failures.append("no_json")
+            if report.budget_exhausted:
+                # 单独标一个标签:``no_json`` 会让人去改提示词,而这里该改的是
+                # max_tokens。两者的修法完全不同,混在一个标签里等于没有信息。
+                report.failures.append("truncated")
+                logger.warning(
+                    "%s: max_tokens=%s exhausted before any output — "
+                    "the model spent the whole budget thinking. This call site "
+                    "degrades silently; raise its budget instead of editing the prompt.",
+                    purpose,
+                    max_tokens,
+                )
         else:
             try:
                 value = schema.model_validate(
@@ -337,6 +410,10 @@ async def request_structured(
 
         if attempt >= limit:
             break
+        if report.budget_exhausted:
+            # 和 call_failed 同理:重试解决不了预算问题。而且更糟——回灌的
+            # assistant 空消息 + 纠正说明会占掉输入,下一次思考的余地只会更小。
+            break
         # 把这一轮的输出和纠正说明一起接在后面。带上模型自己那句话是必要的:
         # 只发纠正说明的话它看不到"上一次"指的是什么。
         messages.append({"role": "assistant", "content": raw})
@@ -361,5 +438,10 @@ def _record(purpose: str, report: StructuredReport) -> None:
             f"structured.{purpose}.attempts": report.attempts,
             f"structured.{purpose}.failures": report.failures or None,
             f"structured.{purpose}.rescued": report.rescued or None,
+            # 预算耗尽单独占一列:它和其他失败的区别是"改配置能修",
+            # 而报告里看到这一列非零就说明有个调用点在静默降级。
+            f"structured.{purpose}.budget_exhausted": (
+                True if report.budget_exhausted else None
+            ),
         }
     )
