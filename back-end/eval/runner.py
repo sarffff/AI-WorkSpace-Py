@@ -126,6 +126,10 @@ class QuestionResult:
     completion_tokens: int
     cost: float | None
     currency: str | None
+    # 有 token 但价目表命中不了的模型名。空集才代表成本列是完整的。
+    unpriced_models: set[str]
+    # 降级了的检索增强阶段，同一阶段多次降级就出现多次。
+    degraded_stages: list[str]
     latency_ms: int
     retrieval_ms: int
 
@@ -268,28 +272,65 @@ def _document_label(name: str) -> str:
     return base
 
 
-def _span_totals(trace: Any) -> tuple[int, int, float | None, str | None]:
-    """把一棵 trace 的 token 与成本加总。成本按币种分别累加，混币时不合并。"""
+def _degraded_stages(trace: Any) -> list[str]:
+    """这一题里哪些检索增强阶段降级了。
+
+    ``services/retriever._mark_degraded`` 往当前 span 写 ``degraded_stage``，
+    这里把整棵 trace 扫一遍收集起来。之所以要汇总进报告：降级只写日志的话，
+    报告上呈现的是"这个技术没有增益"，与"这个技术根本没跑"**长得一模一样**。
+    ``rerank-api`` 就是这样一直被读成前者的（端点返 429/1113）。
+
+    返回列表而不是集合：同一题里同一阶段可能降级多次（多查询下每路一次），
+    次数本身是信息——偶发失败和 100% 失效是两回事。
+    """
     if trace is None:
-        return 0, 0, None, None
+        return []
+    return [
+        stage
+        for span in trace.spans
+        if (stage := span.attributes.get("degraded_stage"))
+    ]
+
+
+def _span_totals(
+    trace: Any,
+) -> tuple[int, int, float | None, str | None, set[str]]:
+    """把一棵 trace 的 token 与成本加总。成本按币种分别累加，混币时不合并。
+
+    第五个返回值是**算不出价的模型名集合**。价目表命中不了时 ``estimate_cost``
+    返回 ``None``，这是有意的("宁可承认不知道")，但光是跳过它就让成本列可以
+    静默变空:2026-08-23 查出 ``model_prices.json`` 从来没建过,于是历史上**所有**
+    报告的 ``cost`` 都是 ``None``,而 25 个变体的结论全是单边的——只有准确度,
+    没有代价。换个模型名、改个渠道都会重演一次。
+
+    所以把"谁没算出价"一路带到 summary 里。成本列为空时报告本身就能说出原因,
+    而不是让读的人以为这套 eval 不测成本。
+    """
+    if trace is None:
+        return 0, 0, None, None, set()
     prompt = sum(span.prompt_tokens or 0 for span in trace.spans)
     completion = sum(span.completion_tokens or 0 for span in trace.spans)
 
     by_currency: dict[str, float] = {}
+    unpriced: set[str] = set()
     for span in trace.spans:
+        # 没有 token 的 span 不算漏价:检索、工具执行这些本来就没有 token
+        if not (span.prompt_tokens or span.completion_tokens):
+            continue
         cost = estimate_cost(
             span.model, span.prompt_tokens, span.completion_tokens, span.cached_tokens
         )
         if cost is None:
+            unpriced.add(span.model or "<unknown>")
             continue
         by_currency[cost.currency] = by_currency.get(cost.currency, 0.0) + float(
             cost.amount
         )
     if not by_currency:
-        return prompt, completion, None, None
+        return prompt, completion, None, None, unpriced
     # 单币种是常态；真出现多币种就只报最大的那个并在报告里注明局限
     currency = max(by_currency, key=lambda key: by_currency[key])
-    return prompt, completion, by_currency[currency], currency
+    return prompt, completion, by_currency[currency], currency, unpriced
 
 
 async def _run_case(
@@ -346,7 +387,8 @@ async def _run_case(
             )
             latency_ms = int((time.perf_counter() - started) * 1000)
 
-        prompt_tokens, completion_tokens, cost, currency = _span_totals(trace)
+        prompt_tokens, completion_tokens, cost, currency, unpriced = _span_totals(trace)
+        degraded = _degraded_stages(trace)
         return QuestionResult(
             case=case,
             retrieved_documents=ranked,
@@ -361,6 +403,8 @@ async def _run_case(
             completion_tokens=completion_tokens,
             cost=cost,
             currency=currency,
+            unpriced_models=unpriced,
+            degraded_stages=degraded,
             latency_ms=latency_ms,
             retrieval_ms=retrieval_ms,
         )
@@ -412,6 +456,22 @@ def summarize(variant: Variant, results: list[QuestionResult]) -> dict[str, Any]
     costs = [r.cost for r in results if r.cost is not None]
     summary["cost"] = sum(costs) if costs else None
     summary["currency"] = next((r.currency for r in results if r.currency), None)
+    # 算不出价的模型。非空就说明成本列不完整——此时 cost 是**下界**而不是总额,
+    # 拿它去比"哪个变体更划算"会偏向漏价多的那个。空列表才允许直接比。
+    unpriced = sorted({name for r in results for name in r.unpriced_models})
+    summary["unpricedModels"] = unpriced or None
+
+    # 降级次数按阶段分开计。这一项的作用是让"配了但没生效"在**报告里**就读不通：
+    # 一个变体带着非零降级数还宣称与 baseline 相同，那结论是"它没跑"，
+    # 不是"它没用"。两者的处置完全相反——前者去修配置，后者去掉这个技术。
+    stage_counts: dict[str, int] = {}
+    for r in results:
+        for stage in r.degraded_stages:
+            stage_counts[stage] = stage_counts.get(stage, 0) + 1
+    summary["degradedStages"] = (
+        dict(sorted(stage_counts.items())) if stage_counts else None
+    )
+    summary["degradedCases"] = sum(1 for r in results if r.degraded_stages) or None
 
     # 按探针类型拆开看：BM25 应该主要提升 lexical，重排主要提升 ndcg
     by_probe: dict[str, list[float]] = {}

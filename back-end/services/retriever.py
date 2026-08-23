@@ -27,7 +27,7 @@ from services import vector_store
 from services.embedding_service import EmbeddingService
 from services.guardrails import ScanReport, guard, mask_markup
 from services.rerank import RerankError, rerank_client
-from services.telemetry import SpanKind, tracer
+from services.telemetry import SpanKind, current_span, tracer
 from services.retrieval_index import (
     BM25Index,
     VectorIndex,
@@ -68,6 +68,12 @@ def _warn_degraded(stage: str, report, fallback: str) -> None:
     所以这条日志的作用不是排错细节,而是让"我配了但它没生效"这件事**可见**。
     ``budget_exhausted`` 时 structured 层已经喊过一次预算问题,这里补上业务后果:
     哪个阶段降级了、退成了什么。
+
+    2026-08-23 补:光有日志不够。读报告的人不看日志,而**结论在报告里**——
+    ``rerank-api`` 变体因为端点返 429 从未真正执行过,报告里却和 baseline 逐位
+    相同,看起来就是"专用重排没有增益"。所以这里同时往当前 span 写一条属性,
+    让 eval 能把降级次数汇总进 summary。span 是扁平列表且带 attributes 字典,
+    嵌套多深都能被捞到,不需要把 span 一层层传进这四个调用点。
     """
     logger.warning(
         "%s degraded (attempts=%s failures=%s finish_reason=%s) → %s",
@@ -77,6 +83,17 @@ def _warn_degraded(stage: str, report, fallback: str) -> None:
         report.finish_reason,
         fallback,
     )
+    _mark_degraded(stage, fallback)
+
+
+def _mark_degraded(stage: str, fallback: str) -> None:
+    """把"这个阶段降级了"记到埋点上,供 eval 汇总。
+
+    单独一个函数是因为不是所有降级都有 ``StructuredReport``:``mode=api`` 的重排
+    走 HTTP,失败时只有异常类型,没有 attempts/failures/finish_reason。那一条恰恰
+    是最需要被看见的（429 = 账号没开通该项额度，配了等于没配）。
+    """
+    current_span().set(degraded_stage=stage, degraded_fallback=fallback)
 
 
 @dataclass(slots=True)
@@ -464,10 +481,15 @@ class HybridRetriever:
             # 不静默退回 llm：那会让报告里的 rerank=api 与实际跑的东西不一致，
             # 而"api 和 llm 差多少"正是这个变体要量的
             logger.warning("rerank mode=api but the endpoint is not configured")
+            _mark_degraded("rerank_api", "未配置端点，退回融合序")
             return []
         try:
             scored = await rerank_client.rerank(query, snippets)
         except RerankError:
+            # 请求失败(超时/额度/鉴权)。智谱的 /rerank 对未开通额度的账号返
+            # 429/1113,而这条路径静默退回融合序——2026-08-23 之前 rerank-api
+            # 变体就是这样"跑了很多次、一次都没生效"的
+            _mark_degraded("rerank_api", "请求失败，退回融合序")
             return []
         return [candidates[index] for index, _score in scored]
 

@@ -289,6 +289,9 @@ class TurnOutcome:
     completion_tokens: int
     cost: float | None
     currency: str | None
+    # 有 token 但算不出价的模型名。空集才代表成本列是完整的。
+    # 不给默认值:漏传就直接报错,比默认成空集(看起来"没有漏价")安全
+    unpriced_models: set[str]
     latency_ms: int
     # 这一轮触发了几次审批中断。1 = 正常(停一次、裁决一次);
     # ≥2 = 模型收到拒绝之后又把同一件事提交了一遍,那正是 rejection_message
@@ -378,12 +381,18 @@ def preflight_for(tasks: list[AgentTask]) -> list[str]:
     ]
 
 
-def _span_totals(db: Any, message_id: str) -> tuple[int, int, float | None, str | None]:
+def _span_totals(
+    db: Any, message_id: str
+) -> tuple[int, int, float | None, str | None, set[str]]:
     """从 ``trace_spans`` 反查这一轮的 token 与成本。
 
     先 commit 再查：埋点是另一条连接写进去的，而 MySQL 默认的 REPEATABLE READ
     会让当前事务一直看着它开始时的快照。不 commit 就可能一行也查不到，
     然后报告里所有成本都是 0 —— 一个非常难查的"零"。
+
+    第五个返回值是算不出价的模型名集合。这一侧的成本是**埋点写入时**就算好的
+    (``cost``/``currency`` 两列),所以"算不出价"表现为有 token 却 cost 为空。
+    理由同 ``eval/runner._span_totals``:成本列静默变空会让结论只剩单边。
     """
     db.commit()
     rows = db.query(TraceSpan).filter(TraceSpan.message_id == message_id).all()
@@ -391,14 +400,18 @@ def _span_totals(db: Any, message_id: str) -> tuple[int, int, float | None, str 
     completion = sum(row.completion_tokens or 0 for row in rows)
 
     by_currency: dict[str, float] = {}
+    unpriced: set[str] = set()
     for row in rows:
         if row.cost is None or not row.currency:
+            # 没 token 的 span(检索、工具执行)本来就不该有成本,不算漏价
+            if row.prompt_tokens or row.completion_tokens:
+                unpriced.add(row.model or "<unknown>")
             continue
         by_currency[row.currency] = by_currency.get(row.currency, 0.0) + float(row.cost)
     if not by_currency:
-        return prompt, completion, None, None
+        return prompt, completion, None, None, unpriced
     currency = max(by_currency, key=lambda key: by_currency[key])
-    return prompt, completion, by_currency[currency], currency
+    return prompt, completion, by_currency[currency], currency, unpriced
 
 
 def _evidence(db: Any, chat_id: str) -> tuple[str, int]:
@@ -687,7 +700,9 @@ async def _drive_turn(
     # 事件流里没有"作答轮"的标记，这个推算和 turn.set(rounds=...) 是一致的。
     last_tool_round = max((call["round"] for call in calls), default=0)
     rounds = last_tool_round + 1 if last_tool_round else 1
-    prompt_tokens, completion_tokens, cost, currency = _span_totals(db, user_message_id)
+    prompt_tokens, completion_tokens, cost, currency, unpriced = _span_totals(
+        db, user_message_id
+    )
 
     return TurnOutcome(
         question=spec.question,
@@ -727,6 +742,7 @@ async def _drive_turn(
         completion_tokens=completion_tokens,
         cost=cost,
         currency=currency,
+        unpriced_models=unpriced,
         latency_ms=latency_ms,
         approval_requests=approval_requests,
         plan_steps=len(plan),
@@ -1076,6 +1092,8 @@ def summarize(variant: AgentVariant, results: list[TaskResult]) -> dict[str, Any
     ]
     summary["planAdherence"] = metrics.mean(adherence) if adherence else None
 
+    unpriced = sorted({n for _spec, out in pairs for n in out.unpriced_models})
+    summary["unpricedModels"] = unpriced or None
     costs = [out.cost for _spec, out in pairs if out.cost is not None]
     summary["cost"] = sum(costs) if costs else None
     summary["currency"] = next(
