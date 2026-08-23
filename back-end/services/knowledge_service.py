@@ -232,6 +232,18 @@ class KnowledgeService:
                     f"Embedding 数量不匹配：期望 {len(chunks)}，实际 {len(embeddings)}"
                 )
 
+            # 先删掉这篇文档已有的分块,再写新的。少了这一步,重新索引就是
+            # **追加**:分块数翻倍,而 document.chunks 只记本次的数量,于是元数据
+            # 说 7、库里有 14。它不抛异常、不改状态,只让重复分块挤占 top_k——
+            # 2026-08-23 在 eval 语料上实测 6 篇老文档全部翻倍(14/7、10/5),
+            # 喂给重排的 20 条候选里 6 条是重复的。见 tests/test_reindex_duplicates.py
+            #
+            # 放在 embedding 之后:向量化失败时走 except 分支回滚,旧分块还在,
+            # 文档退回 failed 但检索不至于中途变空。
+            db.query(DocumentChunk).filter(
+                DocumentChunk.document_id == document.id
+            ).delete(synchronize_session=False)
+
             for chunk, vector in zip(chunks, embeddings):
                 db.add(
                     DocumentChunk(
@@ -413,8 +425,18 @@ class KnowledgeService:
         self, db: Session, filename: str, content: bytes, workspace_id: str,
         uploader_id: str | None = None,
     ) -> Document:
-        """同步上传：解析、落库、立即索引。上传接口现在走异步路径，这里保留给脚本使用。"""
-        document, _duplicate = await self.create_document(db, filename, content, workspace_id, uploader_id)
+        """同步上传：解析、落库、立即索引。上传接口现在走异步路径，这里保留给脚本使用。
+
+        命中内容去重且已索引好时**不再重建索引**。``create_document`` 的去重只
+        避免了多建一行 Document,如果这里照旧调 ``index_document``,分块仍然会
+        被重算一遍——修好追加问题之后那不再翻倍,但它是一次白花的 embedding
+        调用(``ensure_corpus`` 每次重建对 13 篇全量重传,等于整批白算)。
+        """
+        document, duplicate = await self.create_document(
+            db, filename, content, workspace_id, uploader_id
+        )
+        if duplicate and document.status == "indexed":
+            return document
         await self.index_document(db, document.id)
         db.refresh(document)
         return document
