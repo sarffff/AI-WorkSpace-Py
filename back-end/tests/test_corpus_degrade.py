@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import pytest
 
+from config import settings
 from eval import corpus_degrade as cd
 from services import ingest_clean as ic
 from services.retrieval_index import tokenize
@@ -154,13 +155,23 @@ def test_gbk_bytes_is_recovered_by_sniffing():
 
 
 def test_hard_utf8_decode_destroys_the_sparse_channel():
-    """改动前的行为：errors="replace" 之后 tokenize 返回空 → BM25 建索引时
-    整块跳过 → 稀疏通道彻底看不见这篇文档，而状态还是 indexed。"""
+    """改动前的行为：errors="replace" 之后 tokenize 只剩 ASCII 残留 → BM25 建
+    索引时中文一个字都进不去 → 稀疏通道看不见这篇文档，而状态还是 indexed。
+
+    断言改成对着**配置里的真实门槛**比，而不是写死 0.6：这一篇的 ratio 是
+    0.6011，在旧门槛 0.6 下差 0.0011 通过，于是被判 indexed。写死数字的话
+    "测试红了"和"门槛设得不对"分不开——实际是后者，见 INGEST_MIN_TEXT_RATIO。
+    """
     payload, _suffix = cd.degrade_corpus_file(_SOURCE, "gbk_bytes")
     broken = payload.decode("utf-8", errors="replace")
 
-    assert ic.readable_ratio(broken) < 0.6
+    assert ic.readable_ratio(broken) < settings.INGEST_MIN_TEXT_RATIO
     assert "内部平台" not in broken
+    # 这才是"稀疏通道被毁"的直接证据：分词结果全是 ASCII，没有一个中文 token
+    assert not any(
+        any("一" <= char <= "鿿" for char in token)
+        for token in tokenize(broken)
+    )
 
 
 # ========== noisy_unicode：看不见的损伤 ==========

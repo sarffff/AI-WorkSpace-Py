@@ -326,13 +326,41 @@ def _mark_full_lines(lines: list[_Line]) -> None:
         line.full = line.right >= margin * _FULL_LINE_RATIO
 
 
+# 数字之外还剩多少个"实字"才不算页码。页码是短模板 + 一个变化的数字：
+# ``第 1 页`` 残余 2、``- 5 -`` 残余 0、``Page 12 of 30`` 残余 6。而位置在边缘
+# 但仅数字不同的正文残余明显更长：``各页不同的边缘内容 1`` 是 9、
+# ``表 1 显示了各部门的人员编制情况`` 是 14。取 6 两侧各留 2-3 字符余量。
+_PAGE_NUMBER_RESIDUAL_MAX = 6
+
+# 计算残余时要去掉的装饰字符。页码常写成 ``- 5 -``、``第 3 页 / 共 10 页``，
+# 这些标记不承载语义，算进残余会把短页码误判成正文。
+_DECORATION_RE = re.compile(r"[\s\-—–.,:：、（）()\[\]/|#]")
+
+
+def _digit_residual(text: str) -> int:
+    """去掉数字与装饰字符后还剩几个实字。"""
+    return len(_DECORATION_RE.sub("", _DIGITS_RE.sub("", text)))
+
+
 def _frequency_key(text: str) -> str:
-    """页眉页脚的频率统计键：数字统一折成 ``#``。
+    """页眉页脚的频率统计键。
 
     页码每页都不同，直接按原文统计频率永远只有 1 次、一条都剔不掉。折掉数字之后
     ``第 1 页`` 与 ``第 12 页`` collapse 成同一个键，才数得出"这东西每页都有"。
+
+    但**只在这一行像页码时才折**。无条件折数字会把"位置在边缘、内容各页不同、
+    差异恰好只在数字上"的正文也 collapse 成同一个键——``各页不同的边缘内容
+    1/2/3`` 会变成一个键、计数 3、被当成页脚剔掉。这两个要求（剔页码 / 留正文）
+    在纯数字折叠下是互斥的，判据只能来自别处。
+
+    这里用"数字之外还剩几个实字"：页码是短模板 + 一个变化的数字，正文不是。
+    残余超过阈值就退回精确匹配——那样它只有跨页**逐字重复**才会被剔，
+    而逐字重复的边缘行本来就该当页眉处理（``公司内部资料`` 走的就是这条）。
     """
-    return _DIGITS_RE.sub("#", text.strip())
+    stripped = text.strip()
+    if _digit_residual(stripped) <= _PAGE_NUMBER_RESIDUAL_MAX:
+        return _DIGITS_RE.sub("#", stripped)
+    return stripped
 
 
 def _strip_running_heads(pages: list[list[_Line]], heights: list[float]) -> int:
