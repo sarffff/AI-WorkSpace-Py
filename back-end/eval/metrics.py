@@ -90,17 +90,37 @@ def evaluate_ranking(
     }
 
 
+def _fold(text: str) -> str:
+    """小写 + 去掉全部空白，用于关键词比对。
+
+    去空白是 2026-08-23 加的，它解决的是一个把数据集逼进死角的问题：
+
+    原来是纯子串匹配，于是 ``"3 个工作日"`` 匹配不上模型写的 ``"3个工作日"``——
+    中文数字与量词之间加不加空格纯属排版习惯。为了绕开它，金标只能退化成断言
+    **裸数字** ``"3"``，而裸数字会被同一篇文档里更长的数字命中：``"5"`` 落在
+    ``"15 天"`` 里、``"30"`` 落在 ``"300 元"`` 里、``"6"`` 落在 ``"2026 年"`` 里。
+    后果是**答错也算满分**——问的是结转 5 天，模型答陪产假 15 天，覆盖率仍然 1.0。
+    30 条老题里有 9 条带这个缺陷。
+
+    归一化之后 ``"5 天"`` / ``"30%"`` / ``"6 个月"`` 这类"数字+量词"重新可用：
+    它们既不怕排版差异，也不会被更长的数字整体包含。
+    """
+    return "".join(text.lower().split())
+
+
 def keyword_coverage(answer: str, keywords: list[str]) -> float:
     """答案里出现了多少比例的关键事实。
 
     这是个粗糙但零成本的信号：命中率低几乎肯定有问题，命中率高也不代表答案对
     （数字可能出现在否定句里）。所以它只用来筛出明显失败的样本，
     最终判定交给 LLM-as-judge。
+
+    比对前两侧都做 ``_fold``（小写 + 去空白），原因见那里。
     """
     if not keywords:
         return 1.0
-    lowered = answer.lower()
-    return sum(1 for keyword in keywords if keyword.lower() in lowered) / len(keywords)
+    folded = _fold(answer)
+    return sum(1 for keyword in keywords if _fold(keyword) in folded) / len(keywords)
 
 
 def mean(values: list[float]) -> float | None:
