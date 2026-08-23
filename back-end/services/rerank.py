@@ -132,8 +132,38 @@ class RerankClient:
                 response = await client.post(self.endpoint, headers=headers, json=body)
                 response.raise_for_status()
                 data = response.json()
+        except httpx.HTTPStatusError as exc:
+            # 状态码必须记：401/429/400 指向三种完全不同的处理动作（换 key /
+            # 开额度 / 改模型名），而只记异常类型的话它们在日志里长得一模一样。
+            #
+            # 2026-08-23 就是这么踩的：智谱 /rerank 返 429，被当成"重排没有增益"
+            # 读了很久。诊断靠的是换模型名对比——429/1113 是额度、400/1211 是
+            # 模型不存在。所以这里也把 provider 的 code 带出来（它在响应体里，
+            # 与 Authorization 头无关，不会回显凭证）。
+            status = exc.response.status_code
+            code = None
+            try:
+                payload = exc.response.json()
+                if isinstance(payload, dict):
+                    error = payload.get("error")
+                    if isinstance(error, dict):
+                        code = error.get("code")
+            except Exception:
+                pass
+            hint = {
+                401: "凭证无效——检查 RERANK_API_KEY 是否属于 RERANK_BASE_URL 那一家",
+                403: "凭证无权访问该模型",
+                404: "端点不存在——检查 RERANK_BASE_URL 是否需要 /v1 前缀",
+                429: "额度或频率受限——账号可能没开通该项服务",
+            }.get(status, "")
+            logger.warning(
+                "rerank request failed: HTTP %s provider_code=%s model=%s %s",
+                status, code, settings.RERANK_MODEL, hint,
+            )
+            raise RerankError(f"重排请求失败 (HTTP {status})") from exc
         except Exception as exc:
-            # 不记异常消息：错误体可能回显 Authorization 头或 key
+            # 超时、连接失败、JSON 解析失败等。不记异常消息：这一类的消息里
+            # 可能带上完整请求（含 Authorization 头）。
             logger.warning("rerank request failed: %s", type(exc).__name__)
             raise RerankError("重排请求失败") from exc
 

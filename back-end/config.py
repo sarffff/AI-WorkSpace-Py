@@ -298,13 +298,26 @@ class Settings(BaseSettings):
     # 重排方式: off | llm | api
     #   llm — 现有的 LLM listwise:把候选编号列给通用模型让它排序。留着当对照组,
     #         能量出"专用 cross-encoder 比让通用模型排序好多少"。
-    #   api — 专用 rerank 接口(智谱 /rerank)。query 与 document 拼在一起过一遍
-    #         模型输出标量相关度,这是它比稠密检索准的原因:稠密是 bi-encoder,
-    #         两侧各自独立编码,编码时从未见过对方。
+    #   api — 专用 rerank 接口。query 与 document 拼在一起过一遍模型输出标量
+    #         相关度,这是它比稠密检索准的原因:稠密是 bi-encoder,两侧各自独立
+    #         编码,编码时从未见过对方。
     # 留空则按 RAG_RERANK 布尔量决定(True → llm),保持现有变体与测试不变。
     RAG_RERANK_MODE: str = ""
     RERANK_MODEL: str = "rerank"
-    # 留空回退 LLM_BASE_URL / LLM_API_KEY —— 智谱的 rerank 和对话共用凭证
+    # 留空回退 LLM_BASE_URL / LLM_API_KEY —— 同一家提供商时 rerank 与对话共用凭证。
+    #
+    # ⚠️ 2026-08-23 实测:智谱 /rerank 返 **429 / code 1113**(账号无该项额度),
+    # 而 chat 用同一个 key 是 200。诊断方式是换个模型名对比——`rerank` 报
+    # 429/1113、`rerank-2` 报 400/1211(模型不存在),说明模型名对、是额度问题。
+    # 后果:mode=api 在智谱上等于**静默降级成融合序**,报告里看着就是"专用重排
+    # 没有增益"。rerank-api 变体因此长期从未真正执行过。
+    #
+    # 可用的替代:SiliconFlow 的 BAAI/bge-reranker-v2-m3,非 Pro 层免费。配法是
+    #     RERANK_BASE_URL=https://api.siliconflow.cn/v1
+    #     RERANK_API_KEY=<SiliconFlow key>
+    #     RERANK_MODEL=BAAI/bge-reranker-v2-m3
+    # 不把它写成默认值:默认值指向一个需要另一家凭证的服务,没配 key 的人会从
+    # "不启用重排"变成"启用了但每次请求都 401"。默认仍是同源回退,由 .env 决定。
     RERANK_BASE_URL: str = ""
     RERANK_API_KEY: str = ""
     RERANK_TIMEOUT_SECONDS: float = 10.0
