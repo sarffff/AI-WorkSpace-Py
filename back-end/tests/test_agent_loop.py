@@ -192,9 +192,18 @@ def test_tool_result_budget_truncates_and_forces_final(db, monkeypatch):
     assert adapter.calls[1]["tools"] == []
 
 
-def test_prefetch_injects_context_and_adjusts_system_prompt(db, monkeypatch):
-    """预检索开启时，系统提示词必须告知模型别重复检索，否则就是双通道重复注入。"""
+def test_prefetch_injects_context_and_tells_model_not_to_search_again(db, monkeypatch):
+    """预检索开启时必须告知模型别重复检索，否则就是双通道重复注入。
+
+    这句约束**送到没有**是不变量，**从哪条消息送**取决于
+    ``PROMPT_CACHE_STABLE_PREFIX``：开启时它在用户消息里（系统提示词是缓存前缀的
+    第一条，不能随预检索命中与否翻转，否则每次翻转都作废整段缓存），关闭时它在
+    系统提示词里。这里按默认（开启）断言，下一条测关闭的情形。
+
+    位置本身由 test_prompt_cache 在 ``_system_prompt`` 层单独钉住。
+    """
     monkeypatch.setattr(settings, "RAG_PREFETCH", True)
+    monkeypatch.setattr(settings, "PROMPT_CACHE_STABLE_PREFIX", True)
     knowledge = FakeKnowledgeService(context="【参考 1】来源: notes.md")
     service, adapter = make_service([{"text": "答案"}], knowledge)
 
@@ -203,8 +212,29 @@ def test_prefetch_injects_context_and_adjusts_system_prompt(db, monkeypatch):
     messages = adapter.calls[0]["messages"]
     assert "已预先从本地知识库检索" in messages[-1]["content"]
     assert "预算多少" in messages[-1]["content"]
-    assert "不要重复检索" in messages[0]["content"]
+    # 约束随参考内容一起送达，而不是待在系统提示词里
+    assert "不要重复检索" in messages[-1]["content"]
+    assert "不要重复检索" not in messages[0]["content"]
     assert knowledge.search_queries == ["预算多少"]
+
+
+def test_prefetch_notice_moves_to_system_prompt_without_stable_prefix(db, monkeypatch):
+    """关掉稳定前缀就回到旧行为：约束在系统提示词里。
+
+    留这条是因为 ``no-stable-prefix`` 是个在跑的评估变体——旧路径还活着，
+    就得有测试钉住它，否则哪天它悄悄坏了只会表现为缓存命中率的对照失去意义。
+    """
+    monkeypatch.setattr(settings, "RAG_PREFETCH", True)
+    monkeypatch.setattr(settings, "PROMPT_CACHE_STABLE_PREFIX", False)
+    knowledge = FakeKnowledgeService(context="【参考 1】来源: notes.md")
+    service, adapter = make_service([{"text": "答案"}], knowledge)
+
+    run(collect(service.stream_ai_response(db, "u1", "c1", "预算多少", use_rag=True)))
+
+    messages = adapter.calls[0]["messages"]
+    assert "已预先从本地知识库检索" in messages[-1]["content"]
+    assert "预先检索" in messages[0]["content"]
+    assert "不要重复检索" not in messages[-1]["content"]
 
 
 def test_prefetch_disabled_leaves_prompt_untouched(db, monkeypatch):

@@ -3,7 +3,11 @@ import { useSelector } from "react-redux";
 import { useNavigate } from "react-router-dom";
 import { RootState } from "@/app/providers/store";
 import { apiClient } from "@/shared/api/client";
-import type { UsageSummary, TraceSummary } from "@/shared/types/api.types";
+import type {
+  FeedbackSummary,
+  UsageSummary,
+  TraceSummary,
+} from "@/shared/types/api.types";
 import { fmtCost, fmtInt, fmtMs, spanLabel } from "@/shared/lib/format";
 import { PageHeader } from "@/shared/ui/PageHeader";
 import { CapabilityStrip } from "@/shared/ui/CapabilityStrip";
@@ -16,6 +20,8 @@ import {
   MessageSquare,
   Cpu,
   Sparkles,
+  ThumbsDown,
+  ThumbsUp,
   Zap,
   ShieldCheck,
   BookOpen,
@@ -28,6 +34,15 @@ import { BarRow } from "../components/BarRow";
 import { ShortcutCard } from "../components/ShortcutCard";
 
 const RANGES = [1, 7, 30] as const;
+
+/** 差评原因 -> 展示文案。与后端 feedback_service.REASONS 对应 */
+const DOWN_REASON_LABELS: Record<string, string> = {
+  inaccurate: "内容不准确",
+  no_citation: "缺少引用",
+  off_topic: "答非所问",
+  bad_format: "排版糟糕",
+  other: "其他",
+};
 
 const hour = new Date().getHours();
 const greeting =
@@ -43,17 +58,23 @@ export const DashboardPage: React.FC = () => {
   const [days, setDays] = useState(7);
   const [usage, setUsage] = useState<UsageSummary | null>(null);
   const [traces, setTraces] = useState<TraceSummary[]>([]);
+  const [feedback, setFeedback] = useState<FeedbackSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const toast = useToast();
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    Promise.all([apiClient.getUsage(days), apiClient.getTraces(undefined, 6)])
-      .then(([u, t]) => {
+    Promise.all([
+      apiClient.getUsage(days),
+      apiClient.getTraces(undefined, 6),
+      apiClient.getFeedbackSummary(),
+    ])
+      .then(([u, t, f]) => {
         if (cancelled) return;
         setUsage(u);
         setTraces(t);
+        setFeedback(f);
       })
       .catch((e) => {
         if (!cancelled) toast.error(toastMessageFrom(e, "加载仪表盘数据失败"));
@@ -74,12 +95,36 @@ export const DashboardPage: React.FC = () => {
   const cache = usage?.cache;
   const hitPct =
     cache?.hitRate != null ? Math.round(cache.hitRate * 100) : null;
+  // 提供商侧上下文缓存：语义缓存关着时它是唯一在工作的缓存层
+  const promptHit =
+    usage?.totals.promptCacheHitRate != null
+      ? Math.round(usage.totals.promptCacheHitRate * 100)
+      : null;
+  const cacheCard = cache?.enabled
+    ? {
+        value: hitPct == null ? "待命" : `${hitPct}%`,
+        hint: `语义缓存 · 省 ${fmtInt(cache.tokensSaved)} tok`,
+      }
+    : promptHit != null
+      ? {
+          value: `${promptHit}%`,
+          hint: `上下文缓存 · 省读 ${fmtInt(usage!.totals.cachedTokens)} tok`,
+        }
+      : { value: "暂无数据", hint: undefined };
+
+  const satisfactionPct =
+    feedback?.satisfaction != null
+      ? Math.round(feedback.satisfaction * 100)
+      : null;
+  const maxReasonCount = feedback?.downReasons.length
+    ? Math.max(...feedback.downReasons.map((r) => r.count), 1)
+    : 1;
 
   return (
     <div className="page-shell app-atmosphere transition-colors duration-200">
       <div className="relative z-10 space-y-7 max-w-6xl">
         <PageHeader
-          eyebrow="Workbench"
+          eyebrow="工作台"
           title={`${greeting}${user?.name ? `，${user.name}` : ""}`}
           description="看见模型怎么想——用量、轨迹、缓存与护栏都摊在台面上。"
           actions={
@@ -145,19 +190,9 @@ export const DashboardPage: React.FC = () => {
               />
               <MetricCard
                 label="缓存命中"
-                value={
-                  !cache?.enabled
-                    ? "未启用"
-                    : hitPct == null
-                      ? "尚无查询"
-                      : `${hitPct}%`
-                }
+                value={cacheCard.value}
                 icon={<Zap className="w-3.5 h-3.5" />}
-                hint={
-                  cache?.enabled
-                    ? `省 ${fmtInt(cache.tokensSaved)} tok`
-                    : undefined
-                }
+                hint={cacheCard.hint}
               />
               <MetricCard
                 label="失败片段"
@@ -191,7 +226,11 @@ export const DashboardPage: React.FC = () => {
                   {usage.byModel.map((row, i) => (
                     <BarRow
                       key={row.model ?? "unknown"}
-                      label={row.model ?? "-"}
+                      label={row.model || "未记录模型"}
+                      title={
+                        row.model ||
+                        "工具、检索等本地执行的 span 不经过模型，聚合时没有模型名"
+                      }
                       value={`${fmtInt(row.calls)}次 · ${fmtCost(row.cost, row.currency)}`}
                       pct={row.calls / maxModelCalls}
                       delay={i * 0.06}
@@ -202,6 +241,64 @@ export const DashboardPage: React.FC = () => {
                   )}
                 </div>
               </div>
+            </div>
+
+            <div className="card-surface rounded-2xl p-5 space-y-3 anim-fade-up stagger-3">
+              <div className="flex items-center justify-between">
+                <h3 className="label-eyebrow">回答反馈</h3>
+                {satisfactionPct != null && (
+                  <span className="text-[11px] text-[#918d83]">
+                    满意度 {satisfactionPct}% · 共 {feedback!.rated} 人次评价
+                  </span>
+                )}
+              </div>
+              {!feedback || feedback.rated === 0 ? (
+                <p className="text-xs text-[#918d83]">
+                  还没有人评价回答。在聊天页对任意回答点 👍 / 👎 并写一句期望答案，
+                  差评会变成现成的回归用例。
+                </p>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-5 gap-5">
+                  <div className="md:col-span-2 grid grid-cols-2 gap-3">
+                    <div className="rounded-xl bg-emerald-500/10 px-4 py-3">
+                      <div className="flex items-center gap-1.5 text-emerald-700 dark:text-emerald-400 text-[11px] font-medium">
+                        <ThumbsUp className="w-3.5 h-3.5" /> 点赞
+                      </div>
+                      <div className="text-xl font-semibold text-[#1f1e1d] dark:text-[#edece8] mt-1">
+                        {fmtInt(feedback.up)}
+                      </div>
+                    </div>
+                    <div className="rounded-xl bg-rose-500/10 px-4 py-3">
+                      <div className="flex items-center gap-1.5 text-rose-700 dark:text-rose-400 text-[11px] font-medium">
+                        <ThumbsDown className="w-3.5 h-3.5" /> 点踩
+                      </div>
+                      <div className="text-xl font-semibold text-[#1f1e1d] dark:text-[#edece8] mt-1">
+                        {fmtInt(feedback.down)}
+                      </div>
+                    </div>
+                    {feedback.pendingExport > 0 && (
+                      <p className="col-span-2 text-[11px] text-[#918d83]">
+                        {feedback.pendingExport} 条差评待导出为回归用例
+                      </p>
+                    )}
+                  </div>
+                  <div className="md:col-span-3 space-y-2.5">
+                    <div className="text-[11px] text-[#918d83]">差评原因分布</div>
+                    {feedback.downReasons.map((row, i) => (
+                      <BarRow
+                        key={row.reason}
+                        label={DOWN_REASON_LABELS[row.reason] ?? row.reason}
+                        value={fmtInt(row.count)}
+                        pct={row.count / maxReasonCount}
+                        delay={i * 0.06}
+                      />
+                    ))}
+                    {feedback.down === 0 && (
+                      <p className="text-xs text-[#918d83]">暂无差评</p>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 anim-fade-up stagger-3">
@@ -304,12 +401,14 @@ export const DashboardPage: React.FC = () => {
           <span className="text-[#1f1e1d] dark:text-[#edece8] font-medium">
             {selectedModel}
           </span>
-          {cache?.enabled && (
+          {(cache?.enabled || promptHit != null) && (
             <>
               <span className="text-[#918d83]">·</span>
               <Zap className="w-3.5 h-3.5 text-[#da7756]" />
               <span className="text-[#6e6b63] dark:text-[#a19f96]">
-                语义缓存 {hitPct == null ? "待命" : `${hitPct}%`}
+                {cache?.enabled
+                  ? `语义缓存 ${hitPct == null ? "待命" : `${hitPct}%`}`
+                  : `上下文缓存 ${promptHit}%`}
               </span>
             </>
           )}

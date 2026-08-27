@@ -92,7 +92,8 @@ def test_delete_refused_for_member(db_real, monkeypatch):
     db_real.add(member)
     db_real.commit()
     db_real.refresh(member)
-    workspace_service.join_by_invite_code(db_real, member, workspace.invite_code)
+    member.workspace_id = workspace.id
+    member.role = workspace_service.ROLE_USER
     chat = db_real.query(Chat).filter(Chat.id == "c1").first()
     chat.user_id = member.id
     db_real.commit()

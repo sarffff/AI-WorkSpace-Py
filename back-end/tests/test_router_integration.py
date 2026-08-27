@@ -162,6 +162,187 @@ def test_cross_user_chat_access_returns_404(client, db_session):
     assert own.status_code == 200
 
 
+# ========== 文档的管理可见性(真正的闸口在路由) ==========
+#
+# 服务层的 listable_documents 不判角色:传 include_member_private=True 它就照办。
+# 所以"admin 能看到成员私有文档、普通成员不能"这条规则,唯一的实现点是路由里
+# 那一句 include_member_private=is_admin(current_user)。它必须在真实 HTTP 链路上测,
+# 服务层测试证明不了它——那里 flag 是手传的。
+
+
+def _join(client, token, code):
+    # 请求体是 snake_case(``JoinRequest.invite_code``),而响应里的邀请码是
+    # camelCase(``inviteCode``)。前端 client.ts 两边都对得上,这里跟着它写。
+    response = client.post(
+        "/workspace/join", json={"invite_code": code}, headers=_auth(token)
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _private_document(db_session, *, workspace_id, owner_id, name):
+    from models import Document
+
+    document = Document(
+        name=name,
+        size=10,
+        content="私密内容",
+        workspace_id=workspace_id,
+        user_id=owner_id,
+        visibility="private",
+        status="indexed",
+        chunks=1,
+    )
+    db_session.add(document)
+    db_session.commit()
+    return document
+
+
+def _team_of_two(client, db_session):
+    """alice 是 admin,bob 凭邀请码加入成为 user。返回两人的 token 与 id。"""
+    from models import User
+
+    _register(client, email="alice@example.com", username="alice")
+    _register(client, email="bob@example.com", username="bob")
+    alice_token = _login(client, email="alice@example.com")
+    bob_token = _login(client, email="bob@example.com")
+
+    workspace = client.get("/workspace", headers=_auth(alice_token)).json()
+    _join(client, bob_token, workspace["inviteCode"])
+
+    db_session.expire_all()
+    alice = db_session.query(User).filter(User.email == "alice@example.com").first()
+    bob = db_session.query(User).filter(User.email == "bob@example.com").first()
+    assert bob.workspace_id == workspace["id"] and bob.role == "user"
+    return {
+        "workspace_id": workspace["id"],
+        "alice": alice,
+        "bob": bob,
+        "alice_token": alice_token,
+        "bob_token": bob_token,
+    }
+
+
+def test_admin_sees_member_private_documents_over_http(client, db_session):
+    """admin 的列表里有成员的个人文档,且标着"不参与我的检索"。"""
+    team = _team_of_two(client, db_session)
+    doc = _private_document(
+        db_session,
+        workspace_id=team["workspace_id"],
+        owner_id=team["bob"].id,
+        name="bob-私人.md",
+    )
+
+    listed = client.get("/knowledge/documents", headers=_auth(team["alice_token"]))
+    assert listed.status_code == 200
+    by_id = {item["id"]: item for item in listed.json()}
+    assert doc.id in by_id, "admin 应当看得见成员的个人文档"
+    assert by_id[doc.id]["isOwn"] is False
+    assert by_id[doc.id]["retrievable"] is False, "可见但不进 admin 的检索"
+    assert by_id[doc.id]["ownerName"] == "bob"
+
+
+def test_member_does_not_see_another_members_private_documents_over_http(
+    client, db_session
+):
+    """反过来那一半:普通成员看不到别人的个人文档。
+
+    这一条挂了就是越权,而它只会在路由那一句 flag 写错时挂——服务层全绿。
+    """
+    team = _team_of_two(client, db_session)
+    alice_private = _private_document(
+        db_session,
+        workspace_id=team["workspace_id"],
+        owner_id=team["alice"].id,
+        name="alice-私人.md",
+    )
+
+    listed = client.get("/knowledge/documents", headers=_auth(team["bob_token"]))
+    assert listed.status_code == 200
+    assert alice_private.id not in {item["id"] for item in listed.json()}
+
+
+def test_admin_deleting_a_member_private_document_is_403_not_404(client, db_session):
+    """能看见就该给出诚实的理由。
+
+    那一篇明明在 admin 的列表里,报 404 说"不存在"会让他以为列表坏了;403 带上
+    "这是他人的个人文档"才说清了为什么。而文档必须仍然在库里。
+    """
+    from models import Document
+
+    team = _team_of_two(client, db_session)
+    doc = _private_document(
+        db_session,
+        workspace_id=team["workspace_id"],
+        owner_id=team["bob"].id,
+        name="bob-私人.md",
+    )
+
+    response = client.delete(
+        f"/knowledge/documents/{doc.id}", headers=_auth(team["alice_token"])
+    )
+    assert response.status_code == 403, response.text
+    assert "个人文档" in response.json()["detail"]
+    db_session.expire_all()
+    assert db_session.query(Document).filter(Document.id == doc.id).first() is not None
+
+
+def test_adopted_orphan_becomes_a_deletable_shared_document_over_http(
+    client, db_session
+):
+    """离职者留下的个人文档收编后，admin 能在 HTTP 层真的把它删掉。
+
+    这是这条链路的**终点**：此前那种文档谁都删不掉（``require_can_modify`` 走私有
+    那一支，NULL 不等于任何人的 id），所以只测"能列出来"不够——要测到真的能处置。
+    """
+    from models import Document
+    from services import workspace_service
+
+    team = _team_of_two(client, db_session)
+    orphan = _private_document(
+        db_session,
+        workspace_id=team["workspace_id"],
+        owner_id=None,  # 账号已被删除
+        name="离职者-资料.md",
+    )
+
+    # 收编前：admin 的列表里没有它
+    listed = client.get("/knowledge/documents", headers=_auth(team["alice_token"]))
+    assert orphan.id not in {item["id"] for item in listed.json()}
+
+    assert workspace_service.adopt_orphaned_documents(db_session) == 1
+
+    listed = client.get("/knowledge/documents", headers=_auth(team["alice_token"]))
+    by_id = {item["id"]: item for item in listed.json()}
+    assert orphan.id in by_id
+    assert by_id[orphan.id]["visibility"] == "workspace"
+    assert by_id[orphan.id]["inherited"] is True, "界面要据此打「继承」标记"
+    assert by_id[orphan.id]["retrievable"] is True, "共享文档进检索"
+
+    deleted = client.delete(
+        f"/knowledge/documents/{orphan.id}", headers=_auth(team["alice_token"])
+    )
+    assert deleted.status_code == 200, deleted.text
+    db_session.expire_all()
+    assert db_session.query(Document).filter(Document.id == orphan.id).first() is None
+
+
+def test_member_deleting_an_unseen_private_document_is_404(client, db_session):
+    """看不见的仍然是 404:不该因为"你不是管理员"就承认存在这么一篇文档。"""
+    team = _team_of_two(client, db_session)
+    alice_private = _private_document(
+        db_session,
+        workspace_id=team["workspace_id"],
+        owner_id=team["alice"].id,
+        name="alice-私人.md",
+    )
+
+    response = client.delete(
+        f"/knowledge/documents/{alice_private.id}", headers=_auth(team["bob_token"])
+    )
+    assert response.status_code == 404, response.text
+
+
 # ========== 安全响应头 ==========
 
 

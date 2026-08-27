@@ -35,6 +35,8 @@ from services import agent_roles
 from services import agent_state
 from services import approval
 from services import checkpoint_store
+from services import planner
+from services import retrieval_index
 from services import subagent
 from services import tool_history
 from services import workspace_service
@@ -673,6 +675,10 @@ class ChatService:
                 search_query,
                 scope.workspace_id,
                 top_k=settings.RAG_TOP_K,
+                # 检索范围 = 工作区共享文档 + 这个用户自己的私有文档。
+                # 漏传 viewer_id 的后果是模型永远看不到用户的个人资料,
+                # 而那正是 chat 附件默认存进去的地方。
+                viewer_id=scope.user_id,
             )
             # 工具处理器不能直接产出 SSE 事件,命中的引用先放进 sink,由循环负责发出
             if citation_sink is not None:
@@ -805,7 +811,7 @@ class ChatService:
                 tools=[],
                 model=settings.utility_model,
                 temperature=0.0,
-                max_tokens=256,
+                max_tokens=settings.RAG_CONDENSE_MAX_TOKENS,
                 purpose="query_condense",
             )
         except Exception as exc:
@@ -814,7 +820,19 @@ class ChatService:
         # 长度检查针对整个输出而不是第一行:把整段对话抄一遍的"改写"第一行
         # 可能很短,单看第一行拦不住
         raw = (completion.content or "").strip()
-        if not raw or len(raw) > len(prompt) * 3 + 200:
+        if not raw:
+            # 空输出以前和"改写没必要"共用同一条静默 return。它们不是一回事:
+            # 这一条是故障。原来 max_tokens=256 时它 100% 走这里——推理模型把
+            # 预算花在思考上,一个字都没吐——于是指代消解从未生效,而系统提示词
+            # 仍然告诉模型"已经预检索过了",等于把弱检索包装成"已查过"。
+            logger.warning(
+                "query condense produced no output (finish_reason=%s, max_tokens=%s); "
+                "falling back to the raw follow-up question",
+                completion.finish_reason,
+                settings.RAG_CONDENSE_MAX_TOKENS,
+            )
+            return prompt
+        if len(raw) > len(prompt) * 3 + 200:
             return prompt
         condensed = raw.splitlines()[0].strip().strip('"“”')
         if not condensed:
@@ -822,13 +840,21 @@ class ChatService:
         return condensed
 
     async def _prefetch_rag_context(
-        self, db: Session, workspace_id: str, prompt: str
+        self, db: Session, workspace_id: str, prompt: str, viewer_id: str | None = None
     ) -> tuple[str, list[dict], bool]:
-        """首轮之前的一次性检索。失败时返回空内容并标记 failed,不影响主流程。"""
+        """首轮之前的一次性检索。失败时返回空内容并标记 failed,不影响主流程。
+
+        ``viewer_id`` 决定能不能检索到这个用户的私有文档。默认 None(只查共享)
+        是刻意的收紧方向:漏传只会少检索到东西,反过来是越权。
+        """
         try:
             context, citations = (
                 await self._get_knowledge_service().build_rag_context_with_citations(
-                    db, prompt, workspace_id, top_k=settings.RAG_TOP_K
+                    db,
+                    prompt,
+                    workspace_id,
+                    top_k=settings.RAG_TOP_K,
+                    viewer_id=viewer_id,
                 )
             )
             return context, citations, False
@@ -901,10 +927,21 @@ class ChatService:
                 prompt_version=system_template.ref,
             ) as turn:
                 resolved_model = model or settings.LLM_MODEL
-                # 语义缓存按工作区分桶:同空间的人问同一问题直接命中,
-                # 这正是共享知识库的收益之一
+                # 语义缓存的分桶键。开 RAG 时**必须带上用户**:回答可能引用了这个人的
+                # 私有文档,而按工作区分桶会把它命中给同空间的另一个人——这个模块
+                # 自己的文档第一条就写着"跨用户命中就是数据泄露,不是优化"。
+                # 工作区分桶是共享知识库那一轮加的,私有文档让它的前提不再成立。
+                #
+                # 关 RAG 时仍按工作区分桶:回答不依赖任何文档,跨用户命中是安全的。
+                # 代价是开 RAG 时失去跨用户命中——包括那些其实只引用了共享文档的
+                # 回答。查询时还不知道会检索到什么,所以这里只能按最坏情况取。
+                cache_scope = (
+                    retrieval_index.scope_key(scope.workspace_id, scope.user_id)
+                    if use_rag
+                    else scope.workspace_id
+                )
                 hit = await semantic_cache.lookup(
-                    scope.workspace_id,
+                    cache_scope,
                     prompt,
                     resolved_model,
                     use_rag,
@@ -962,7 +999,8 @@ class ChatService:
                         for span in getattr(trace, "spans", [])
                     )
                     await semantic_cache.store(
-                        scope.workspace_id,
+                        # 和 lookup 用同一个桶键,否则存进去的永远命中不到
+                        cache_scope,
                         prompt,
                         answer,
                         resolved_model,
@@ -1153,6 +1191,10 @@ class ChatService:
         # 「检索知识库...」->「检索知识库完成,正在思考下一步...」状态。
         user_content = prompt
         prefetched = False
+        # 显式初始化而不是只在预检索块里赋值:下面规划那段要读它。靠 prefetched
+        # 短路虽然当前也不会 NameError,但那是个只对"求值顺序"成立的巧合,
+        # 而这两处离得很远。
+        prefetch_context = ""
         # 条件是 use_rag 而不是"有没有工具":workspace 工具打开之后,关掉知识库的
         # 请求也会有非空的 tools,拿它当代理会让预检索在 RAG 关闭时照样触发。
         if use_rag and settings.RAG_PREFETCH:
@@ -1166,7 +1208,9 @@ class ChatService:
             # 护栏埋在检索链路深处,用一个作用域收集器把命中情况带回这里
             with guardrails.collecting() as reports:
                 prefetch_context, prefetch_citations, prefetch_failed = (
-                    await self._prefetch_rag_context(db, scope.workspace_id, search_query)
+                    await self._prefetch_rag_context(
+                        db, scope.workspace_id, search_query, viewer_id=scope.user_id
+                    )
                 )
             prefetch_report = guardrails.summarize(reports)
             yield {
@@ -1251,6 +1295,32 @@ class ChatService:
             *trajectory,
             {"role": "user", "content": self._user_content(user_content, turn, model)},
         ]
+
+        # ---- 显式规划(plan-and-execute) ----
+        # 位置是有讲究的:必须在 messages 拼好之后、进循环之前。
+        #   - 在预检索之后:计划要能看到"资料已经拿到了",否则它会规划一步去查
+        #     已经在眼前的东西(见 prompts/agent_plan/ 里那条规则)
+        #   - 在循环之前:计划是**事前**的全局视野,边跑边规划就退回 ReAct 了
+        # 计划接在用户消息后面而不是塞进系统提示词:它每轮都不同,而系统提示词是
+        # 整个前缀的第一条消息,让它随本轮内容变化就是把提示词缓存整段作废
+        # (同 PROMPT_CACHE_STABLE_PREFIX 那段的理由)。
+        plan: list[dict[str, Any]] = []
+        if planner.enabled() and runtime.schemas:
+            plan = await planner.build_plan(
+                self.model_adapter,
+                question=prompt,
+                context=prefetch_context if prefetched else "",
+                tool_names=[
+                    schema["function"]["name"] for schema in runtime.schemas
+                ],
+            )
+            # 空计划不发事件也不注入:模型判断"直接答就行"是正确输出,给前端推一个
+            # 空计划卡片纯属噪声。步数进埋点,那样"规划到底有没有产出"是可查的
+            # ——0 步和"规划挂了"在这里同形,靠 planner 里那条 warning 区分。
+            turn.set(plan_steps=len(plan) or None)
+            if plan:
+                messages.append({"role": "user", "content": planner.format_steps(plan)})
+                yield {"type": "plan", "steps": plan}
         # ---- 状态与协作者分离 ----
         # state 是能进数据库、能跨请求的那一半;context 是持有会话与客户端的那一半。
         # 改动之前两者混在同一批局部变量里,所以没有任何一个子集是可以存下来的。
@@ -1269,6 +1339,7 @@ class ChatService:
             top_p=top_p,
             prompt_ref=system_template.ref,
             delegation_mode=settings.AGENT_DELEGATION_MODE,
+            plan=plan,
             messages=messages,
             budget_remaining=budget.remaining,
             budget_per_call=settings.TOOL_RESULT_MAX_CHARS,
@@ -1466,7 +1537,36 @@ class ChatService:
                 # 位置是刻意的:在 tool_start 之前。发了 tool_start 再中断,界面上
                 # 会留一个永远等不到 tool_result 的"正在执行",而它其实一步都没跑。
                 call_key = call.id or f"r{round_index}c{call_index}"
+                # 澄清用**轮次限定**的键，不复用 call_key。
+                #
+                # call_key 优先用 call.id，而"provider 的 call id 跨轮唯一"只是个
+                # 假设：测试替身就给每轮的第 0 个调用都发 call-0。审批不受影响
+                # （一次裁决消费掉就终止了），但澄清会在第 2 轮再问一次——那时
+                # 第 1 轮的答案会顶替掉新问题，第二个问题永远问不出来。
+                # 真实 provider 大多确实唯一，但这条路径没有理由依赖它。
+                ask_key = f"r{round_index}c{call_index}"
                 rejected_result: ToolResult | None = None
+                # 用户改过参数的话，在这里把它写回 call。位置是刻意的：
+                # **在校验和执行之前，在闸门判定之前**。
+                #
+                # 写回 ``call.arguments``（字符串）而不是只改下面那个 dict：
+                # ``ToolRuntime.execute`` 校验和执行读的都是这个字符串，只改 dict
+                # 的话跑起来还是模型原来那份参数——而界面上会显示用户改过的值。
+                edited_note: list[str] = []
+                if call_key in state.edited_arguments:
+                    raw_edited = state.edited_arguments[call_key]
+                    try:
+                        parsed_edited = json.loads(raw_edited)
+                    except json.JSONDecodeError:
+                        parsed_edited = None
+                    if isinstance(parsed_edited, dict):
+                        edited_note = sorted(
+                            key
+                            for key in parsed_edited
+                            if parsed_edited.get(key) != arguments.get(key)
+                        )
+                        arguments = parsed_edited
+                        call.arguments = raw_edited
                 if call.name in ctx.gated:
                     if call_key in state.rejected_call_ids:
                         rejected_result = ToolResult(
@@ -1608,20 +1708,85 @@ class ChatService:
                     run_id=state.run_id,
                 )
 
-                # 澄清工具:回合在这里终止,等用户回答。结果不回灌 messages——
-                # 没有下一轮了,回灌只会污染历史;budget 也不需要为它记账。
+                # 澄清工具:回合在这里停下,等用户回答。
                 # 非 OK 状态(参数校验不过)走正常回灌路径,让模型自己改。
-                if call.name == "ask_user" and result.status is ToolStatus.OK:
+                if (
+                    call.name == "ask_user"
+                    and result.status is ToolStatus.OK
+                    # 已经答过的那次不再挂起：否则恢复时又停在同一个问题上，
+                    # 永远走不到下一轮。答案在下面以 role=tool 回灌。
+                    and ask_key not in state.clarification_answers
+                ):
                     turn.set(clarification=True)
+                    question = result.content.strip()
+                    # 开了 checkpoint 就**挂起**,等答案回来接着这一轮跑;
+                    # 没开就只能像原来那样收尾——没有快照,答案回来时无处可接,
+                    # 用户那句话只能变成全新一轮(前面几轮的工具结果全丢)。
+                    if checkpoint_store.enabled():
+                        ctx.sync_to(state)
+                        state.phase = "waiting_input"
+                        state.status = "waiting_input"
+                        state.pending_index = call_index
+                        state.emitted_any = emitted_any
+                        state.force_final = force_final
+                        request = agent_state.InterruptRequest(
+                            kind="user_input",
+                            tool=call.name,
+                            arguments={"question": question},
+                            call_index=call_index,
+                            tool_call_id=call.id,
+                            reason=question,
+                        )
+                        state.interrupt = request.to_dict()
+                        seq = checkpoint_store.put(
+                            db, state, interrupt=state.interrupt
+                        )
+                        checkpoint_store.update_run(
+                            db,
+                            state.run_id,
+                            status="waiting_input",
+                            rounds=round_index,
+                            bump_interrupts=True,
+                        )
+                        turn.set(interrupted="user_input")
+                        yield {
+                            "type": "clarification",
+                            "runId": state.run_id,
+                            "question": question,
+                            "round": round_index,
+                            "checkpoint": seq,
+                            # 告诉前端这次是可续的。缺这个键的 clarification 事件
+                            # 是旧行为(答案变成新一轮),前端据此决定走哪条路
+                            "resumable": True,
+                        }
+                        return
                     self._finish_run(db, state, status="done", rounds=round_index)
                     yield {
                         "type": "clarification",
-                        "question": result.content.strip(),
+                        "question": question,
                         "round": round_index,
                     }
                     return
 
+                # 澄清的答案顶替工具结果本身。ask_user 的"结果"是它自己那句问题,
+                # 回灌问题毫无意义——模型要的是答案。
+                if ask_key in state.clarification_answers:
+                    result = ToolResult(
+                        f"用户回答：{state.clarification_answers[ask_key]}",
+                        ToolStatus.OK,
+                    )
                 content = budget.take(result.content)
+                # 参数被人改过就在结果前面说清楚。不说的话模型会照自己原来那份参数
+                # 向用户复述——用户刚把标题改成"Q3 复盘"，模型还在说"已保存《季度
+                # 总结草稿》"。放在结果**前面**是因为后面那段可能被预算裁掉。
+                if edited_note and result.status is ToolStatus.OK:
+                    content = (
+                        approval.edit_message(
+                            call.name, edited_note, state.interrupt_note
+                        )
+                        + "\n"
+                        + content
+                    )
                 if state.uses_text_protocol:
                     state.text_results.append(f"工具 {call.name} 的结果：\n{content}")
                 else:
@@ -1711,6 +1876,83 @@ class ChatService:
             finished=True,
         )
 
+    async def answer_clarification(
+        self,
+        db: Session,
+        user_id: str,
+        run_id: str,
+        *,
+        answer: str,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """带着用户的回答，从 ``ask_user`` 处**接着这一轮**跑下去。
+
+        和审批恢复共用全部机制（快照、重建工具面、拨回余额），区别只有一处：
+        回灌的东西不是"执行了/没执行"，而是用户写的那句话，且它必须以
+        ``role=tool`` 接在模型那次 ask_user 调用后面。
+
+        ## 为什么不能让答案变成新一轮
+
+        改动之前 ask_user 是终止回合的：模型问完，run 落 ``done``，用户的回答
+        作为新消息开一轮全新的。后果是**前面几轮的工具结果全部丢掉**——模型
+        检索了三次、读了两个文档，然后问了一句"你要哪个季度的"，用户答完
+        它得从零再来。对话历史里还留着那些内容，但工具结果不在历史里，
+        它们活在上一轮的 ``messages`` 里，而那个列表已经跟着生成器一起没了。
+
+        接着跑的话，答案落在原来那批 ``messages`` 的末尾，模型手里还有它刚
+        检索到的一切。这是"问清楚再动手"和"猜错了重来"的区别。
+        """
+        run = checkpoint_store.get_run(db, run_id)
+        if run is None or run.user_id != user_id:
+            yield {"type": "error", "error": "找不到这次执行，或它不属于当前用户。"}
+            return
+        if run.status != "waiting_input":
+            yield {
+                "type": "error",
+                "error": f"这次执行当前状态是 {run.status}，不在等待回答。",
+            }
+            return
+
+        state = checkpoint_store.latest(db, run_id)
+        if state is None or state.interrupt is None:
+            yield {"type": "error", "error": "这次执行的状态快照已不可用，无法恢复。"}
+            return
+        request = state.interrupt_request
+        if request is None or request.kind != "user_input":
+            yield {"type": "error", "error": "中断请求已损坏，无法恢复。"}
+            return
+
+        cleaned = answer.strip()
+        if not cleaned:
+            # 空回答不该消耗这次中断：run 留在 waiting_input，用户可以再答一次。
+            # 放过去的话模型收到一条空的 tool 消息，只能再问一遍或者开始猜。
+            yield {"type": "error", "error": "回答不能为空。"}
+            return
+
+        # 用户的原话要过 mask_markup 再进 messages。它会以 role=tool 的身份出现，
+        # 而模型对 tool 内容的信任度比 user 更高——这个位置更值得防注入，
+        # 不是更不值得。
+        # 键必须和循环里的 ``ask_key`` 一致：轮次 + 下标，不用 tool_call_id
+        # （理由见那边的注释）。
+        state.clarification_answers = {
+            **state.clarification_answers,
+            f"r{state.round_index}c{request.call_index}": (
+                guardrails.mask_markup(cleaned)[: settings.TOOL_RESULT_MAX_CHARS]
+            ),
+        }
+        state.interrupt = None
+        state.phase = "pre_tools"
+        state.status = "running"
+        checkpoint_store.update_run(db, run_id, status="running")
+
+        yield {
+            "type": "clarification_answered",
+            "runId": run_id,
+            "round": state.round_index,
+        }
+
+        async for event in self._resume_loop(db, state, request, True):
+            yield event
+
     async def resume_turn(
         self,
         db: Session,
@@ -1719,6 +1961,7 @@ class ChatService:
         *,
         approved: bool,
         note: str = "",
+        edited_arguments: dict[str, Any] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """从审批中断处恢复一次执行。
 
@@ -1762,6 +2005,26 @@ class ChatService:
         # 裁决只对**这一次调用**生效。用 call_id（缺失时用轮次+下标）而不是工具名：
         # 按工具名放行等于"以后这个工具都不用问了"，那审批就只剩第一次有意义。
         call_key = request.tool_call_id or f"r{state.round_index}c{request.call_index}"
+        changed_keys: list[str] = []
+        if approved and edited_arguments is not None:
+            # 只能改**这次调用的参数**，工具名不可改。放开工具名等于让审批弹窗
+            # 变成越权通道：用户看到并同意的是"保存到知识库"，改成"删除文档"
+            # 就成了拿一次同意换另一件事。
+            merged, error = approval.validate_edit(request.arguments, edited_arguments)
+            if merged is None:
+                yield {"type": "error", "error": f"参数修改无效：{error}"}
+                return
+            changed_keys = sorted(
+                key
+                for key in merged
+                if merged.get(key) != request.arguments.get(key)
+            )
+            state.edited_arguments = {
+                **state.edited_arguments,
+                call_key: json.dumps(merged, ensure_ascii=False),
+            }
+            # 改完的参数**不再回到闸门**。人刚刚亲手写了这些值，再弹一次让他确认
+            # 自己写的东西，是在训练无脑点确认——而那正是审批失效的方式。
         if approved:
             state.approved_call_ids = [*state.approved_call_ids, call_key]
         else:
@@ -1772,13 +2035,18 @@ class ChatService:
         state.status = "running"
         checkpoint_store.update_run(db, run_id, status="running")
 
-        yield {
+        resolved: dict[str, Any] = {
             "type": "approval_resolved",
             "runId": run_id,
             "tool": request.tool,
             "approved": approved,
             "round": state.round_index,
         }
+        # 只在真的改过时才带这个键：空列表和"没编辑"在界面上是两件事，
+        # 而恒在的 "edited": [] 会被读成"编辑过但什么都没改"。
+        if changed_keys:
+            resolved["edited"] = changed_keys
+        yield resolved
 
         async for event in self._resume_loop(db, state, request, approved):
             yield event

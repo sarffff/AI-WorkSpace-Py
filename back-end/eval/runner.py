@@ -48,6 +48,17 @@ DATASET_PATH = os.path.join(_EVAL_DIR, "datasets", "rag_golden.jsonl")
 # 评估语料挂在这个固定的伪用户下，和真实用户数据完全隔离
 EVAL_USER_ID = "eval-harness"
 
+# 生成被评回答那一次调用的输出预算。
+#
+# 原来是写死的 800，而 2026-08-22 加上 finish_reason 之后立刻看到它在真实运行里
+# 返回**空串**:推理模型先花预算思考，800 不够时一个字都不吐。后果比别处更严重
+# ——空答案会被裁判判成失败，于是报告上呈现为"这个变体答不出来"，而模型其实
+# 从没得到过说话的机会。尺子自己坏在了最不容易怀疑的地方。
+#
+# 给得比 _JUDGE_MAX_TOKENS 小一点是有意的:回答要的是几百字散文，裁判要的是
+# 一个带 reason 的 JSON，后者更容易被思考挤掉。
+_ANSWER_MAX_TOKENS = 3072
+
 
 def ensure_eval_user(session: Any) -> None:
     """确保评估用的伪用户在 ``users`` 表里存在。
@@ -115,8 +126,15 @@ class QuestionResult:
     completion_tokens: int
     cost: float | None
     currency: str | None
+    # 有 token 但价目表命中不了的模型名。空集才代表成本列是完整的。
+    unpriced_models: set[str]
+    # 降级了的检索增强阶段，同一阶段多次降级就出现多次。
+    degraded_stages: list[str]
     latency_ms: int
     retrieval_ms: int
+    # 每次降级的原因，形如 ``rerank:truncated``。带默认值所以放在末尾——
+    # dataclass 不允许有默认值的字段排在没默认值的前面。
+    degraded_reasons: list[str] = field(default_factory=list)
 
 
 def load_cases(
@@ -144,6 +162,31 @@ def load_cases(
     return cases[:limit] if limit else cases
 
 
+def _corpus_digest() -> str:
+    """语料文件名 + 内容的摘要。
+
+    改一篇语料的正文而不动任何配置，是完全正常的操作（拆一节、补一句、修个
+    错别字）。但 ``ensure_corpus`` 的早退条件只看"篇数对上了、没有陈旧文档"，
+    于是这种改动**不会**触发重新索引：库里躺着改动前的分块，报告出来的数字属于
+    旧语料，而且没有任何迹象说明这一点。
+
+    2026-08-23 把 ``## 账号与口令`` 拆成两节时踩到：拆分本身让 rerank 分从
+    0.0142 涨到 0.2124，但只改文件的话 eval 一个字都不会变。
+
+    并进指纹后，语料内容变了就自动表现为"另一批文档"，走和换分块配置同一条
+    重建路径。代价是改一篇要重嵌全部——分块级增量需要按篇存指纹，那是另一层
+    设计，而全量重嵌当前只有 92 个分块。
+    """
+    digest = hashlib.sha256()
+    for name in sorted(os.listdir(CORPUS_DIR)):
+        if not name.endswith(".md"):
+            continue
+        digest.update(name.encode("utf-8"))
+        with open(os.path.join(CORPUS_DIR, name), "rb") as handle:
+            digest.update(handle.read())
+    return digest.hexdigest()
+
+
 def _chunking_fingerprint() -> str:
     """分块结果只由这几个设置决定；它们不变就不必重新索引。
 
@@ -163,6 +206,9 @@ def _chunking_fingerprint() -> str:
             # 同一份脏语料,但清洗后落库的正文完全不同
             "clean": settings.INGEST_CLEAN,
             "pdf_structure": settings.INGEST_PDF_STRUCTURE,
+            # 语料正文本身。见 _corpus_digest：改语料不改配置是常规操作，
+            # 而漏掉它会让 eval 静默地测旧索引。
+            "corpus": _corpus_digest(),
         },
         sort_keys=True,
     )
@@ -251,34 +297,99 @@ def _document_label(name: str) -> str:
     召回率集体归零，看起来像检索坏了。
     """
     base = name.split("#", 1)[0]
-    for suffix in (".txt", ".pdf"):
+    # 后缀表必须和 degrade_corpus_file 的返回值保持一致。漏一个的症状是
+    # **那个降级模式的召回集体归零**，看起来像检索坏了——而实际上只是标签没剥掉。
+    # test_corpus_degrade 里有一条断言按 DEGRADATIONS 全量核对这张表。
+    for suffix in (".txt", ".pdf", ".docx", ".xlsx"):
         if base.endswith(suffix) and base.count(".") > 1:
             return base[: -len(suffix)]
     return base
 
 
-def _span_totals(trace: Any) -> tuple[int, int, float | None, str | None]:
-    """把一棵 trace 的 token 与成本加总。成本按币种分别累加，混币时不合并。"""
+def _degraded_stages(trace: Any) -> list[str]:
+    """这一题里哪些检索增强阶段降级了。
+
+    ``services/retriever._mark_degraded`` 往当前 span 写 ``degraded_stage``，
+    这里把整棵 trace 扫一遍收集起来。之所以要汇总进报告：降级只写日志的话，
+    报告上呈现的是"这个技术没有增益"，与"这个技术根本没跑"**长得一模一样**。
+    ``rerank-api`` 就是这样一直被读成前者的（端点返 429/1113）。
+
+    返回列表而不是集合：同一题里同一阶段可能降级多次（多查询下每路一次），
+    次数本身是信息——偶发失败和 100% 失效是两回事。
+    """
     if trace is None:
-        return 0, 0, None, None
+        return []
+    return [
+        stage
+        for span in trace.spans
+        if (stage := span.attributes.get("degraded_stage"))
+    ]
+
+
+def _degraded_reasons(trace: Any) -> list[str]:
+    """这一题里每次降级的原因，形如 ``rerank:truncated``。
+
+    单独一个函数而不是把原因塞进 ``_degraded_stages``：那个函数的返回值被
+    ``degradedStages`` 按阶段计数用，混进原因会让"同一阶段不同原因"变成两个阶段。
+
+    为什么原因必须进报告：**修法完全取决于原因。** ``truncated`` 要加
+    ``RAG_RERANK_MAX_TOKENS``、``no_json`` 要换提示词或模型、``http_429_1113``
+    是额度没开通得换端点。一个没有原因的次数（"rerank 降级 10 次"）只能靠猜，
+    或者去翻日志——而这个项目反复踩的正是"结论在报告里、细节在日志里"这个割裂。
+    """
+    if trace is None:
+        return []
+    reasons: list[str] = []
+    for span in trace.spans:
+        stage = span.attributes.get("degraded_stage")
+        if not stage:
+            continue
+        reason = span.attributes.get("degraded_reason")
+        # 没有原因的降级也要计数,只是归到 unknown:少算一次会让
+        # degradedCases 和原因数对不上,而对不上比缺信息更难查
+        reasons.append(f"{stage}:{reason or 'unknown'}")
+    return reasons
+
+
+def _span_totals(
+    trace: Any,
+) -> tuple[int, int, float | None, str | None, set[str]]:
+    """把一棵 trace 的 token 与成本加总。成本按币种分别累加，混币时不合并。
+
+    第五个返回值是**算不出价的模型名集合**。价目表命中不了时 ``estimate_cost``
+    返回 ``None``，这是有意的("宁可承认不知道")，但光是跳过它就让成本列可以
+    静默变空:2026-08-23 查出 ``model_prices.json`` 从来没建过,于是历史上**所有**
+    报告的 ``cost`` 都是 ``None``,而 25 个变体的结论全是单边的——只有准确度,
+    没有代价。换个模型名、改个渠道都会重演一次。
+
+    所以把"谁没算出价"一路带到 summary 里。成本列为空时报告本身就能说出原因,
+    而不是让读的人以为这套 eval 不测成本。
+    """
+    if trace is None:
+        return 0, 0, None, None, set()
     prompt = sum(span.prompt_tokens or 0 for span in trace.spans)
     completion = sum(span.completion_tokens or 0 for span in trace.spans)
 
     by_currency: dict[str, float] = {}
+    unpriced: set[str] = set()
     for span in trace.spans:
+        # 没有 token 的 span 不算漏价:检索、工具执行这些本来就没有 token
+        if not (span.prompt_tokens or span.completion_tokens):
+            continue
         cost = estimate_cost(
             span.model, span.prompt_tokens, span.completion_tokens, span.cached_tokens
         )
         if cost is None:
+            unpriced.add(span.model or "<unknown>")
             continue
         by_currency[cost.currency] = by_currency.get(cost.currency, 0.0) + float(
             cost.amount
         )
     if not by_currency:
-        return prompt, completion, None, None
+        return prompt, completion, None, None, unpriced
     # 单币种是常态；真出现多币种就只报最大的那个并在报告里注明局限
     currency = max(by_currency, key=lambda key: by_currency[key])
-    return prompt, completion, by_currency[currency], currency
+    return prompt, completion, by_currency[currency], currency, unpriced
 
 
 async def _run_case(
@@ -318,7 +429,7 @@ async def _run_case(
                     tools=[],
                     model=settings.LLM_MODEL,
                     temperature=0.0,
-                    max_tokens=800,
+                    max_tokens=_ANSWER_MAX_TOKENS,
                     purpose="eval_answer",
                 )
                 answer = completion.content or ""
@@ -335,7 +446,9 @@ async def _run_case(
             )
             latency_ms = int((time.perf_counter() - started) * 1000)
 
-        prompt_tokens, completion_tokens, cost, currency = _span_totals(trace)
+        prompt_tokens, completion_tokens, cost, currency, unpriced = _span_totals(trace)
+        degraded = _degraded_stages(trace)
+        degraded_reasons = _degraded_reasons(trace)
         return QuestionResult(
             case=case,
             retrieved_documents=ranked,
@@ -350,6 +463,9 @@ async def _run_case(
             completion_tokens=completion_tokens,
             cost=cost,
             currency=currency,
+            unpriced_models=unpriced,
+            degraded_stages=degraded,
+            degraded_reasons=degraded_reasons,
             latency_ms=latency_ms,
             retrieval_ms=retrieval_ms,
         )
@@ -377,6 +493,17 @@ def summarize(variant: Variant, results: list[QuestionResult]) -> dict[str, Any]
         f"recall@{top_k}": metrics.mean(
             [r.retrieval[f"recall@{top_k}"] for r in ranked_cases]
         ),
+        # precision 每条 case 一直在算(metrics.py:87),但从没汇总过——又是"记录了
+        # 没冒泡"。它现在是这套 eval 里**唯一还没饱和的检索指标**:2026-08-25 实测
+        # baseline recall@5 = 1.0000 而 precision@5 = 0.3852。recall 到顶之后
+        # "混合召回 vs 纯稠密""重排开 vs 关"在报告上长得一样,不是没差别,
+        # 是那把尺子量不出差别;precision 还有 0.6 的量程。
+        #
+        # 它量的是"top_k 里有多少是真该在的"。重排的作用恰好是把噪声挤出前 k,
+        # 所以这一列才是重排类变体该看的主指标。
+        f"precision@{top_k}": metrics.mean(
+            [r.retrieval[f"precision@{top_k}"] for r in ranked_cases]
+        ),
         f"ndcg@{top_k}": metrics.mean(
             [r.retrieval[f"ndcg@{top_k}"] for r in ranked_cases]
         ),
@@ -391,6 +518,12 @@ def summarize(variant: Variant, results: list[QuestionResult]) -> dict[str, Any]
         "abstentionRate": metrics.mean(
             [1.0 if r.verdict.abstained else 0.0 for r in abstention_graded]
         ),
+        # 拒答率的分母。变体之间可以不同(裁判在某个变体上多失败一次),而
+        # 1.000 vs 0.667 里那个 0.667 是 6/9 不是 6.67/10——不写出来就没人知道
+        # 两列的分母其实不一样
+        "abstentionGraded": len(abstention_graded),
+        # 裁判自己的理由与 abstained 矛盾的条数。见 structured.AbstentionVerdict
+        "judgeInconsistent": sum(1 for r in results if r.verdict.inconsistent),
         "judgeFailures": sum(1 for r in results if r.verdict.failed),
         "promptTokens": sum(r.prompt_tokens for r in results),
         "completionTokens": sum(r.completion_tokens for r in results),
@@ -401,6 +534,36 @@ def summarize(variant: Variant, results: list[QuestionResult]) -> dict[str, Any]
     costs = [r.cost for r in results if r.cost is not None]
     summary["cost"] = sum(costs) if costs else None
     summary["currency"] = next((r.currency for r in results if r.currency), None)
+    # 算不出价的模型。非空就说明成本列不完整——此时 cost 是**下界**而不是总额,
+    # 拿它去比"哪个变体更划算"会偏向漏价多的那个。空列表才允许直接比。
+    unpriced = sorted({name for r in results for name in r.unpriced_models})
+    summary["unpricedModels"] = unpriced or None
+
+    # 降级次数按阶段分开计。这一项的作用是让"配了但没生效"在**报告里**就读不通：
+    # 一个变体带着非零降级数还宣称与 baseline 相同，那结论是"它没跑"，
+    # 不是"它没用"。两者的处置完全相反——前者去修配置，后者去掉这个技术。
+    stage_counts: dict[str, int] = {}
+    for r in results:
+        for stage in r.degraded_stages:
+            stage_counts[stage] = stage_counts.get(stage, 0) + 1
+    summary["degradedStages"] = (
+        dict(sorted(stage_counts.items())) if stage_counts else None
+    )
+    # **不要写成 ``or None``。** 那样"一次都没降级"和"根本没统计过"会序列化成
+    # 同一个值，而报告把它渲染成 `0/54`——读起来是"测过了，很干净"。
+    # 这一列存在的全部意义就是分开这两件事：`0` 去信任它的指标，
+    # "没统计过"先去修埋点。2026-08-27 那份报告里 rerank-api 明明有重排环节，
+    # 这里却和无增强的 baseline 一样是 None。
+    summary["degradedCases"] = sum(1 for r in results if r.degraded_stages)
+    # 原因分布。次数说明"生效了没有",原因说明"该改哪里"——只有次数的话
+    # 下一步只能靠猜(rerank 那 10 次是预算不够还是模型不输出 JSON?)
+    reason_counts: dict[str, int] = {}
+    for r in results:
+        for reason in r.degraded_reasons:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    summary["degradedReasons"] = (
+        dict(sorted(reason_counts.items())) if reason_counts else None
+    )
 
     # 按探针类型拆开看：BM25 应该主要提升 lexical，重排主要提升 ndcg
     by_probe: dict[str, list[float]] = {}
@@ -412,13 +575,34 @@ def summarize(variant: Variant, results: list[QuestionResult]) -> dict[str, Any]
         probe: metrics.mean(values) for probe, values in sorted(by_probe.items())
     }
 
-    # 注入抵抗率单独一档：只统计带 must_avoid 的样本，其它样本没有可判定的标的。
-    # 这个数字是"当前提示词 + 护栏"的联合表现,不能只归因于任何一方。
-    injection = [r for r in results if r.case.must_avoid]
+    # 注入抵抗率单独一档。这个数字是"当前提示词 + 护栏"的联合表现,
+    # 不能只归因于任何一方。
+    #
+    # 判据是 ``probe == "injection"``,**不是**"有没有标 must_avoid"。
+    # must_avoid 是个通用的"不该出现的字符串"机制:2026-08-25 加的 absent 硬负例
+    # 拿它抓编造的数字(问丧假几天,回答里不该出现"3 天"),那些样本混进分母会把
+    # 注入抗性算高——一个从不被注入带走、但会编数字的系统会拿到虚高的分。
+    # agent_runner 早先踩过同一个坑并改成按 probe 判,这里跟上。
+    # 非注入样本的 must_avoid 命中另计在 fabricationRate 里。
+    injection = [r for r in results if r.case.probe == "injection"]
     summary["injectionCases"] = len(injection)
     summary["injectionResistRate"] = (
         metrics.mean([1.0 if r.avoid_hits == 0 else 0.0 for r in injection])
         if injection
+        else None
+    )
+
+    # 编造率:非注入样本里 must_avoid 命中的比例。
+    #
+    # 这一项冲着"拒答率高但拒得不干净"那种情况:模型说了"资料里没写",紧接着
+    # 又补一句"一般是 3 天"。拒答率判的是**有没有承认不知道**,而这里判的是
+    # **有没有在承认之后接着编**。两者可以同时为高,那正是最难查的一种失败——
+    # 读起来像个诚实的回答,里面却带着一个凭空的数字。
+    fabrication = [r for r in results if r.case.must_avoid and r.case.probe != "injection"]
+    summary["fabricationCases"] = len(fabrication)
+    summary["fabricationRate"] = (
+        metrics.mean([1.0 if r.avoid_hits else 0.0 for r in fabrication])
+        if fabrication
         else None
     )
     return summary
@@ -497,6 +681,7 @@ async def run(
                 "faithfulness": result.verdict.faithfulness,
                 "relevance": result.verdict.relevance,
                 "abstained": result.verdict.abstained,
+                "judgeInconsistent": result.verdict.inconsistent,
                 "judgeReason": result.verdict.reason,
                 "judgeFailed": result.verdict.failed,
                 "answer": result.answer,

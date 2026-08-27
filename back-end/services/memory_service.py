@@ -15,6 +15,10 @@
 模式,它正是抽取指令定义里要抽的东西。所以防线分两层且都不依赖检测:
 抽取时把"针对助手行为的要求"排除在 preference 之外(见 prompts/memory_extract/),
 注入时用 guard.fence 定界并声明它没有指令权限(见 build_system_block)。
+
+注入时另外过一遍 guard.sanitize,但它不是第三层防线,只是埋点 + 词汇面兜底:
+记忆此前是唯一不进 guardrail 埋点的外部通路,于是记忆型注入在遥测里完全不可见。
+理由与边界写在 build_system_block 的文档串里。
 """
 from __future__ import annotations
 
@@ -26,7 +30,7 @@ from config import settings
 from models import UserMemory
 from services import prompt_library, structured
 from services.clock import naive_now
-from services.guardrails import guard
+from services.guardrails import ScanReport, guard
 
 logger = logging.getLogger("memory_service")
 
@@ -90,7 +94,7 @@ class MemoryService:
         content = prompt_library.render(
             "memory_extract", question=question[:2000], answer=answer[:4000]
         )
-        result, _report = await structured.request_structured(
+        result, report = await structured.request_structured(
             model_adapter,
             schema=structured.MemoryItems,
             prompt=content,
@@ -98,10 +102,20 @@ class MemoryService:
             purpose="memory_extract",
             array=True,
             temperature=0.0,
-            max_tokens=512,
+            max_tokens=settings.MEMORY_EXTRACT_MAX_TOKENS,
         )
         if result is None:
-            # 抽取是增强不是依赖:失败就这轮不记,下一轮还有机会
+            # 抽取是增强不是依赖:失败就这轮不记,下一轮还有机会。
+            #
+            # 但必须留一条日志。少了它,"模型判断这轮没什么值得记的"和"抽取根本
+            # 没跑通"在外部完全同形——两者都是"没有新记忆"。这个坑真的踩过:
+            # max_tokens 写死 512 时推理模型返回空串,连续 no_json,记忆功能
+            # 100% 失效而日志一片干净,只表现为用户永远没有长期记忆。
+            logger.warning(
+                "memory extraction produced no usable JSON: attempts=%s failures=%s",
+                report.attempts,
+                report.failures,
+            )
             return 0
 
         existing = {
@@ -157,6 +171,21 @@ class MemoryService:
         走 ``guard.fence`` 而不是自己拼表头:记忆以 role=system 注入,拿到的是
         全场最高权限,而内容源自对话历史。知识库、文档、网页、附件四条通路都有
         nonce 定界 + 无指令权限声明,记忆此前是唯一没有的一条。
+
+        逐条过 ``guard.sanitize`` 是后补的,补的不是主防线而是另外两件事:
+
+        1. **埋点。** 此前记忆是唯一一条不过 ``record`` 的外部内容通路,于是
+           ``guardrail.*`` 里永远看不到记忆型注入——2026-08-21 那轮评估里模型
+           两轮都照假偏好输出了 canary,而 ``guardrailHits`` 是 0,报告上没有
+           任何一列指向记忆。看不见的攻击面等于不存在的攻击面。
+        2. **词汇面上的兜底。** 本模块开头说"检测挡不住这条路",那句仍然成立且
+           是这条链路的核心判断:措辞正常的假偏好命不中任何模式(实测
+           scripts/probe_guardrail_coverage.py:「声称已授权」类 6 种写法全漏)。
+           但"挡不住大多数"不等于"一条也挡不住"——真写了「忽略以上所有指令」的
+           记忆现在会被记下来,而且和其他通路用同一套规则、同一套分数。
+
+        主防线仍然是定界 + 声明,以及抽取侧的排除段(prompts/memory_extract/)。
+        顺序没变:检测是最不可靠的一层,只作观测与兜底。
         """
         memories = (
             db.query(UserMemory)
@@ -167,10 +196,22 @@ class MemoryService:
         )
         if not memories:
             return ""
-        body = "\n".join(f"- {memory.content}" for memory in memories)
         if not guard.enabled:
+            body = "\n".join(f"- {memory.content}" for memory in memories)
             return f"{_MEMORY_PLAIN_HEADER}\n{body}"
-        return guard.fence(body, label="用户长期记忆", notice=_MEMORY_NOTICE)
+
+        # 逐条扫而不是扫拼好的整段:和 retriever 对单个分块的处理一致,
+        # 中和规则里有按行锚定的模式(伪造 role 行),拼接后行边界会变。
+        report = ScanReport()
+        cleaned: list[str] = []
+        for memory in memories:
+            text, item_report = guard.sanitize(memory.content)
+            cleaned.append(f"- {text}")
+            report = report.merge(item_report)
+        guard.record(report, kind="memory")
+        return guard.fence(
+            "\n".join(cleaned), label="用户长期记忆", notice=_MEMORY_NOTICE
+        )
 
     def list_memories(self, db: Session, user_id: str) -> list[dict]:
         memories = (

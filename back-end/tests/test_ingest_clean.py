@@ -259,7 +259,11 @@ def test_page_numbers_are_removed_by_digit_folding():
 
     assert removed == 6  # 3 页 × (页眉 + 页脚)
     assert "公司内部资料" not in rendered
-    assert "第 1 页" not in rendered
+    # 按**整行**判断页码是否剔掉,不能用子串:保留下来的正文是"这是第 1 页的正文
+    # 内容。",它本身就含「第 1 页」。原来写成 `"第 1 页" not in rendered` 于是
+    # 恒假——功能一直是对的,红的是断言。
+    lines = [line.strip() for line in rendered.splitlines()]
+    assert not any(line == f"第 {number} 页" for number in (1, 2, 3) for line in lines)
     assert "这是第 1 页的正文内容。" in rendered
 
 
@@ -278,13 +282,55 @@ def test_below_threshold_keeps_everything(monkeypatch):
 
 
 def test_body_text_in_margin_zone_survives():
-    """只有跨页重复的才剔。位置在边缘但内容各页不同的,是正文。"""
+    """只有跨页重复的才剔。位置在边缘但内容各页不同的,是正文。
+
+    这条与 ``test_page_numbers_are_removed_by_digit_folding`` 在纯数字折叠下是
+    **互斥**的:``各页不同的边缘内容 1/2/3`` 折完是一个键、计数 3,与页码无从区分。
+    判据因此不能只看"折完是否重复",还要看这一行像不像页码——见
+    ``_frequency_key`` 与下面几条残余判据的测试。
+    """
     pages, heights = [], []
     for number in (1, 2, 3):
         pages.append(ic._group_lines([_word(f"各页不同的边缘内容 {number}", 20.0, size=8.0)]))
         heights.append(800.0)
 
     assert ic._strip_running_heads(pages, heights) == 0
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["第 1 页", "- 5 -", "5", "Page 12 of 30", "第 3 页 / 共 10 页"],
+)
+def test_page_number_shapes_get_digits_folded(text):
+    """页码形状:数字之外只剩极短模板,应当折叠成 # 才数得出跨页重复。"""
+    assert "#" in ic._frequency_key(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "各页不同的边缘内容 1",
+        "这是第 1 页的正文内容。",
+        "2026 年第三季度营收同比增长 18%",
+        "表 1 显示了各部门的人员编制情况",
+    ],
+)
+def test_body_shapes_keep_their_digits(text):
+    """正文形状:残余太长,不折叠——于是只有逐字重复才会被当页眉剔掉。"""
+    assert ic._frequency_key(text) == text.strip()
+
+
+def test_exact_repeats_are_still_stripped_without_folding():
+    """不含数字的页眉照旧靠精确重复剔除,残余判据不影响它。"""
+    key = ic._frequency_key("Acme 科技内部资料 — 未经许可不得外传")
+    assert key == "Acme 科技内部资料 — 未经许可不得外传"
+    pages, heights = [], []
+    for _ in range(3):
+        pages.append(
+            ic._group_lines([_word("Acme 科技内部资料 — 未经许可不得外传", 20.0, size=8.0)])
+        )
+        heights.append(800.0)
+    assert ic._strip_running_heads(pages, heights) == 3
 
 
 # ========== 段落合并 ==========

@@ -24,7 +24,7 @@ from auth import (
 )
 from config import settings
 from database import get_db
-from models import User, Workspace
+from models import User
 from services import workspace_service
 
 # 限流器
@@ -41,9 +41,6 @@ class RegisterRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=50, pattern="^[a-zA-Z0-9_-]+$")
     password: str = Field(..., min_length=8, max_length=100)
     name: Optional[str] = Field(None, max_length=100)
-    # 邀请码(可选):填了就加入对应工作区成为 member(共享知识库);
-    # 不填则自动创建自己的个人空间并成为其 admin
-    invite_code: Optional[str] = Field(None, max_length=16)
 
     @field_validator("password")
     @classmethod
@@ -135,21 +132,6 @@ async def register(
             detail="用户名已被占用"
         )
 
-    # 邀请码预校验放在创建用户之前:无效码在这里就报错,而不是等用户
-    # 创建完再加入失败——后者会让用户重试注册时撞上"邮箱已被注册"
-    invite_workspace = None
-    if body.invite_code and body.invite_code.strip():
-        invite_workspace = (
-            db.query(Workspace)
-            .filter(Workspace.invite_code == body.invite_code.strip().upper())
-            .first()
-        )
-        if invite_workspace is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="邀请码无效",
-            )
-
     # 创建新用户
     hashed_password = get_password_hash(body.password)
     new_user = User(
@@ -166,15 +148,8 @@ async def register(
     db.commit()
     db.refresh(new_user)
 
-    # 工作区初始化:凭邀请码加入(member),或自建个人空间(admin)。
-    # 邀请码已在上文预校验,这里按 id 直接加入,不再有失败分支
-    if invite_workspace is not None:
-        new_user.workspace_id = invite_workspace.id
-        new_user.role = workspace_service.ROLE_MEMBER
-        db.commit()
-        db.refresh(new_user)
-    else:
-        workspace_service.resolve_for_user(db, new_user)
+    # 工作区初始化:自建个人空间并成为其 admin
+    workspace_service.resolve_for_user(db, new_user)
 
     # 生成 access token + refresh token
     access_token = create_access_token(data={"sub": new_user.id})

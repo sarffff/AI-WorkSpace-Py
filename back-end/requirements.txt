@@ -23,6 +23,16 @@ pdfplumber>=0.11.0
 # 编码嗅探。GBK 文档按 utf-8 硬解成一串 U+FFFD 之后 BM25 会整块跳过,
 # 文档状态却还是 indexed——这是最贵的一种静默失败
 charset-normalizer>=3.3.0
+# .docx 解析。企业知识库里 Word 是主力格式,而在这之前上传 .docx 会直接
+# "不支持的文件格式"——用户旅程的第一步就断了。
+# 选它而不是 unstructured/pandoc:后两者要拖进一大堆传递依赖或一个外部二进制,
+# 而这里要的只是"段落 + 表格 + 标题层级",python-docx 直接读 OOXML 就够。
+# 标题层级在段落样式名里是显式的(Heading 1..9),所以不需要 PDF 那套字号启发式。
+python-docx>=1.1.2
+# .xlsx 解析。理由同 docx:企业知识库里报销标准、额度表这类东西就是 Excel。
+# read_only + data_only 两个模式都要:前者让几万行的表不至于把整个工作簿读进内存,
+# 后者取公式的**缓存值**而不是 "=SUM(B2:B9)" 这个字符串。
+openpyxl>=3.1.5
 numpy>=1.26.0
 faiss-cpu>=1.7.4
 # 向量库。只在 VECTOR_STORE=qdrant 时用到(见 docker-compose.qdrant.yml);

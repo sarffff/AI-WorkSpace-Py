@@ -111,6 +111,49 @@ def describe_mode() -> str:
     return f"{settings.AGENT_APPROVAL_MODE} ({tools})"
 
 
+def validate_edit(
+    original: dict[str, Any], edited: dict[str, Any]
+) -> tuple[dict[str, Any] | None, str]:
+    """校验用户改过的参数，返回 ``(可用参数, 错误说明)``。
+
+    只允许**改已有键的值**，不允许增键、删键。理由是这一层没有工具 schema：
+    真正的 schema 校验在 ``ToolRuntime._validate``（执行前一定会走），这里挡的是
+    另一类东西——凭空多出来的键说明客户端在拼一个模型从没提议过的调用形状，
+    而用户在弹窗里看到并同意的是**模型那次调用**。
+
+    这不是防御恶意客户端的最后一道门（那道门是 schema 校验 + 工具自身的权限
+    检查），是让"越权改写"和"手滑打错字"在报错信息上分得开。
+    """
+    if not isinstance(edited, dict):
+        return None, "参数必须是一个对象。"
+    extra = set(edited) - set(original)
+    if extra:
+        return None, f"不能新增参数：{'、'.join(sorted(extra))}。"
+    missing = set(original) - set(edited)
+    if missing:
+        return None, f"不能删除参数：{'、'.join(sorted(missing))}。"
+    return {**original, **edited}, ""
+
+
+def edit_message(tool_name: str, changed: list[str], note: str = "") -> str:
+    """用户改参数后放行时，回灌给模型的说明。
+
+    必须让模型知道"执行了，但参数被人改过"，而不是让它以为自己那次调用原样跑了。
+    否则它会照自己原来的参数向用户复述结果——用户刚把标题改掉，模型还在说旧标题。
+    列出**改了哪些键**而不是新旧值全文：值可能是几千字的正文，塞进对话历史挤掉的是
+    后面几轮的预算。
+    """
+    keys = "、".join(changed) if changed else "无"
+    base = (
+        f"操作已执行，但参数被用户修改过：{tool_name}。"
+        f"被修改的参数：{keys}。"
+        "向用户复述结果时请依据修改后的参数，不要引用你原来提议的值。"
+    )
+    if note.strip():
+        return f"{base}\n用户补充说明：{mask_markup(note.strip())[:500]}"
+    return base
+
+
 def rejection_message(tool_name: str, note: str = "") -> str:
     """用户拒绝之后回灌给模型的工具结果。
 
@@ -131,9 +174,11 @@ def rejection_message(tool_name: str, note: str = "") -> str:
 __all__ = [
     "build_preview",
     "describe_mode",
+    "edit_message",
     "enabled",
     "gated_tools",
     "reason_for",
     "rejection_message",
     "requires_approval",
+    "validate_edit",
 ]

@@ -2,6 +2,9 @@
 
 Agent 循环的价值在于编排逻辑本身，所以这里把模型、知识库、数据库全部替换成
 可脚本化的替身：测试不触网、不连库，只断言"给定模型行为，循环怎么走"。
+
+功能开关一律由 ``_pin_feature_flags`` 钉死，不继承本地 ``.env``——见那个 fixture
+的说明。
 """
 from __future__ import annotations
 
@@ -11,12 +14,66 @@ from typing import Any, AsyncGenerator
 
 import pytest
 
+from config import settings
 from services.model_adapter import (
     ModelAdapter,
     ModelCompletion,
     StreamChunk,
     ToolCall,
 )
+
+# 需要钉住的开关，以及测试假定的值。
+#
+# 为什么必须钉：``settings`` 是从 .env 读的，测试进程会继承开发机上的真实配置。
+# 开了 AGENT_APPROVAL_MODE=write 之后，写知识库的三条测试立刻失败——工具调用停在
+# 审批门前，断言看到的是"没有写入"，而报错信息是 `assert 0 == 1`，完全没提审批。
+# 这和评估里 _BASE 必须钉 AGENT_APPROVAL_MODE 是同一个坑的两个入口：功能开关
+# 默认关闭时没人发现，一旦有人在本地打开，测试就开始报与改动无关的失败。
+#
+# 需要测另一个取值的测试自己 monkeypatch——那样意图写在测试里，而不是隐含在
+# 谁的 .env 里。
+_PINNED_FLAGS = {
+    # 审批门会让工具调用在 tool_start 之前中断，断言"工具执行了什么"的测试全部受影响
+    "AGENT_APPROVAL_MODE": "off",
+    # 检查点会额外落库，且 resume 路径有自己的测试
+    "AGENT_CHECKPOINT_ENABLED": False,
+    # 全部钉成 config.py 里的代码默认值，而不是"测试想要的值"。
+    #
+    # 这一条踩过：先按"写知识库的测试需要它"钉成 True，结果
+    # test_new_tools_not_registered_by_default 挂了——那条断言的恰恰是"没开开关
+    # 就不注册"，把开关钉开等于把它要测的前提抹掉。真正需要工具面的测试自己
+    # monkeypatch（见 test_service_security._enable_save_tool），它们缺的只是
+    # 上面那个审批开关。
+    "TOOL_WRITE_KNOWLEDGE_ENABLED": False,
+    # 2026-08-24 补这两个：本地 .env 把它们打开之后，三条与工具面无关的测试开始红
+    # （test_plain_chat_runs_one_round_without_tools 断言 tools == []、
+    # test_unknown_tool_is_invalid_arguments_and_loop_continues、
+    # test_new_tools_not_registered_by_default 断言注册表为空）。
+    # 症状与上面 AGENT_APPROVAL_MODE 那条一模一样，也就是这个 fixture 的文档开头
+    # 描述的那个坑本身——只是当时漏钉了这两个开关。同样钉成 config.py 的代码默认值。
+    "TOOL_CALCULATE_ENABLED": False,
+    "TOOL_WEB_SEARCH_ENABLED": False,
+    # 提示词版本。空串 = 走代码里的默认版本；.env 里设成 v4-workspace 之后，
+    # 断言系统提示词内容的测试会挂在与改动无关的地方（v4 里没有"不要重复检索"
+    # 那句，它属于 v2/v3-lean）。提示词版本和工具面是耦合的，一旦本地为了试新
+    # 工具切了版本，这类断言就全部漂移。
+    "PROMPT_CHAT_SYSTEM_VERSION": "",
+    # 护栏按"开启但不拦截"测，拦截行为由 test_guardrails 自己 monkeypatch 阈值
+    "GUARDRAIL_ENABLED": True,
+    "GUARDRAIL_BLOCK_SCORE": 0,
+}
+
+
+@pytest.fixture(autouse=True)
+def _pin_feature_flags(monkeypatch):
+    """把功能开关钉到测试假定的值，隔离本地 .env。
+
+    autouse：漏掉一个测试就会重新引入"结果取决于谁的 .env"这件事。
+    只钉 ``_PINNED_FLAGS`` 里列出的键，其余配置照旧从环境读。
+    """
+    for name, value in _PINNED_FLAGS.items():
+        if hasattr(settings, name):
+            monkeypatch.setattr(settings, name, value)
 
 
 def run(coro):
@@ -38,6 +95,10 @@ class ScriptedAdapter(ModelAdapter):
     - ``protocol_error``: 直接返回协议错误
     - ``raise``: 流式阶段抛异常
     - ``raise_after_text``: 先流出 ``text`` 再抛异常（模拟回答说到一半断流）
+    - ``finish_reason``: 提供商回传的终止原因。省略时按有无文本推断
+      ``stop``——只有要造"撞到 max_tokens"的场景才需要显式写 ``"length"``，
+      而 ``{"text": "", "finish_reason": "length"}`` 就是推理模型把预算花在
+      思考上、一个字都没吐的那个形状（记忆抽取曾经 100% 落在这里）。
     """
 
     def __init__(self, rounds: list[dict[str, Any]]) -> None:
@@ -61,7 +122,15 @@ class ScriptedAdapter(ModelAdapter):
         chunks = [
             chunk
             async for chunk in self.stream_completion(
-                messages=messages, tools=tools, model=model
+                messages=messages,
+                tools=tools,
+                model=model,
+                temperature=temperature,
+                # 必须往下传：不传的话 stream_completion 记下的是它自己的默认值，
+                # 而"调用方给了多少输出预算"是能量出真问题的——记忆抽取就因为
+                # 这个数写死得太小而 100% 静默失效过。
+                max_tokens=max_tokens,
+                top_p=top_p,
             )
         ]
         completion = chunks[-1].completion
@@ -83,6 +152,8 @@ class ScriptedAdapter(ModelAdapter):
             {
                 "tools": [tool["function"]["name"] for tool in tools],
                 "messages": [dict(message) for message in messages],
+                "max_tokens": max_tokens,
+                "temperature": temperature,
             }
         )
         assert self._rounds, "脚本已用尽：Agent 循环没有按预期终止"
@@ -119,6 +190,7 @@ class ScriptedAdapter(ModelAdapter):
             )
             for index, (name, arguments) in enumerate(spec.get("tool_calls", []))
         ]
+        finish_reason = spec.get("finish_reason", "stop")
         if spec.get("text_protocol"):
             yield StreamChunk(
                 completion=ModelCompletion(
@@ -126,13 +198,17 @@ class ScriptedAdapter(ModelAdapter):
                     tool_calls=calls,
                     raw_content=text,
                     uses_text_tool_protocol=True,
+                    finish_reason=finish_reason,
                 )
             )
             return
 
         yield StreamChunk(
             completion=ModelCompletion(
-                content=text, tool_calls=calls, streamed_length=streamed
+                content=text,
+                tool_calls=calls,
+                streamed_length=streamed,
+                finish_reason=finish_reason,
             )
         )
 
@@ -152,22 +228,31 @@ class FakeKnowledgeService:
         self.search_fails = search_fails
         self.citations = citations if citations is not None else []
         self.search_queries: list[str] = []
+        # 每次检索传进来的 viewer_id。None 表示"只查共享文档"，
+        # 而在真实 chat 链路上它应当**总是**当前用户 id。
+        self.viewer_ids: list[str | None] = []
 
+    # viewer_id 收下并记下来：真实实现用它决定"能不能检索到这个人的私有文档"，
+    # 而漏传它是个静默的功能缺失（模型永远看不见用户的个人资料）。
+    # 替身把它记进 viewer_ids，于是想断言"链路有没有把它传下去"的测试有东西可断。
     async def build_rag_context_with_citations(
-        self, db, query, user_id, top_k=5
+        self, db, query, workspace_id, top_k=5, viewer_id=None
     ) -> tuple[str, list[dict[str, Any]]]:
         self.search_queries.append(query)
+        self.viewer_ids.append(viewer_id)
         if self.search_fails:
             raise RuntimeError("embedding api down")
         return self.context, list(self.citations)
 
-    async def build_rag_context(self, db, query, user_id, top_k=5) -> str:
+    async def build_rag_context(
+        self, db, query, workspace_id, top_k=5, viewer_id=None
+    ) -> str:
         context, _citations = await self.build_rag_context_with_citations(
-            db, query, user_id, top_k
+            db, query, workspace_id, top_k, viewer_id=viewer_id
         )
         return context
 
-    async def get_documents(self, db, user_id) -> list[dict[str, Any]]:
+    async def get_documents(self, db, workspace_id, viewer_id=None) -> list[dict[str, Any]]:
         return self.documents
 
     async def read_chunks(self, db, user_id, document_id, chunk_index, window=1):

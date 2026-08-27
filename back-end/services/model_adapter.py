@@ -67,6 +67,21 @@ class ModelCompletion:
     protocol_error: str | None = None
     # content 中已在流式阶段透出给用户的前缀长度,调用方据此避免重复输出。
     streamed_length: int = 0
+    # 提供商回传的终止原因(stop / length / tool_calls / ...)。
+    #
+    # 为什么必须带出来:混合推理模型会先花 max_tokens 思考,预算不够时返回的
+    # content 是**空串**,而不是截断到一半的正文。没有这个字段,"模型没什么要说"
+    # 和"预算被思考吃光了"在调用方看来完全同形——两者都是 content 为空。
+    # 2026-08-22 实测全库 7 个辅助调用点有 5 个栽在这上面(见
+    # scripts/probe_structured_budgets.py),其中记忆抽取 100% 失效了很久。
+    #
+    # None 表示提供商没给(老端点或非标准实现),不等于 "stop"。
+    finish_reason: str | None = None
+
+    @property
+    def truncated(self) -> bool:
+        """输出是否因为撞到 max_tokens 而中止。"""
+        return self.finish_reason == "length"
 
     def as_assistant_message(self) -> dict[str, Any]:
         """返回该轮次对应的正确继续消息。"""
@@ -250,10 +265,27 @@ class OpenAICompatibleAdapter(ModelAdapter):
             streaming=False,
             tools=len(tools) or None,
         ) as span:
-            response = await self._client.chat.completions.create(
-                **self._build_request(
-                    messages, tools, model, temperature, max_tokens, top_p
+            client = self._client
+            # 辅助调用（重排 / HyDE / 改写 / 摘要）单独设更短的超时与更少的重试。
+            #
+            # 判据是 ``purpose != "chat"``：辅助调用**全都有降级路径**，为一个
+            # 可以放弃的增强等 SDK 默认的 600s×3 是纯亏。实测 rerank 变体 p90
+            # 延迟 255 秒、最大 336 秒（baseline 37 秒），那个 336 就是重试链，
+            # 而 eval 里 10/54 的降级正是耗尽重试的那些。
+            #
+            # ``with_options`` 返回一个浅拷贝，共用底层连接池，所以这里不会因为
+            # 每次调用都造新客户端而丢掉 keep-alive。
+            if purpose != "chat":
+                client = client.with_options(
+                    timeout=settings.LLM_AUXILIARY_TIMEOUT_SECONDS,
+                    max_retries=settings.LLM_AUXILIARY_MAX_RETRIES,
                 )
+                span.set(auxiliary_timeout=settings.LLM_AUXILIARY_TIMEOUT_SECONDS)
+            request = self._build_request(
+                messages, tools, model, temperature, max_tokens, top_p
+            )
+            response = await self._create_completion(
+                client, request, auxiliary=purpose != "chat", span=span
             )
             if not response.choices:
                 span.set(empty_response=True)
@@ -263,6 +295,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
 
             message = response.choices[0].message
             content = message.content if isinstance(message.content, str) else ""
+            finish_reason = getattr(response.choices[0], "finish_reason", None)
             standard_calls = [
                 ToolCall(
                     id=call.id,
@@ -275,7 +308,38 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 span, getattr(response, "usage", None), messages, content, model
             )
             span.set(tool_calls=len(standard_calls) or None)
-            return self._build_completion(content, standard_calls)
+            self._record_truncation(span, finish_reason, content, max_tokens, purpose)
+            return self._build_completion(
+                content, standard_calls, finish_reason=finish_reason
+            )
+
+    @staticmethod
+    def _record_truncation(
+        span: Any,
+        finish_reason: str | None,
+        content: str,
+        max_tokens: int,
+        purpose: str,
+    ) -> None:
+        """撞到 max_tokens 时留下痕迹——埋点一条,空输出再加一条日志。
+
+        分两级是有意的:``finish_reason=length`` 而正文非空是常见的"答长了",
+        属于成本项,记进 span 供事后统计就够;而 **正文为空** 的截断是故障,
+        意味着预算全被思考吃掉、调用方拿到的是空串,它会走静默降级路径,
+        所以必须当场喊出来。这正是记忆抽取失效很久没人发现的原因。
+        """
+        if finish_reason != "length":
+            return
+        span.set(truncated=True)
+        if content.strip():
+            return
+        logger.warning(
+            "llm.%s returned empty content and finish_reason=length: "
+            "max_tokens=%s was fully consumed (reasoning models spend it on thinking "
+            "before emitting any text) — raise the budget for this call site",
+            purpose,
+            max_tokens,
+        )
 
     @staticmethod
     def _cached_tokens(usage: Any) -> int | None:
@@ -362,6 +426,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
         content: str,
         standard_calls: list[ToolCall],
         streamed_length: int = 0,
+        finish_reason: str | None = None,
     ) -> ModelCompletion:
         """把原始内容与已装配的工具调用归一化为 ModelCompletion。
 
@@ -373,6 +438,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 content=content,
                 tool_calls=standard_calls,
                 streamed_length=streamed_length,
+                finish_reason=finish_reason,
             )
 
         text_calls = cls.parse_text_tool_calls(content)
@@ -382,6 +448,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 tool_calls=text_calls,
                 raw_content=content,
                 uses_text_tool_protocol=True,
+                finish_reason=finish_reason,
             )
 
         if "<function=call>" in content.lower():
@@ -389,14 +456,54 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 content="",
                 tool_calls=[],
                 protocol_error="模型返回了无法解析的工具调用格式",
+                finish_reason=finish_reason,
             )
 
         return ModelCompletion(
-            content=content, tool_calls=[], streamed_length=streamed_length
+            content=content,
+            tool_calls=[],
+            streamed_length=streamed_length,
+            finish_reason=finish_reason,
         )
 
     # 部分 OpenAI 兼容端点不认 stream_options。被拒一次就记住，不再重复试探。
     _stream_usage_supported = True
+    # 同一个套路:辅助调用尝试关掉思考链,端点不认就记住并不再试探。
+    #
+    # 为什么值得关:实测 20 候选的 listwise 重排,开思考 20.3 秒 / 1011 输出 token,
+    # 关掉 0.4 秒 / 7 token——**快 50 倍**,而且排序结果更好(开着时那 1011 token
+    # 想了半天只吐出 [10],关掉给出 [10, 20])。排序不需要思考链,而思考链的代价
+    # 恰恰是这个调用点唯一的瓶颈。
+    #
+    # 只对辅助调用做。主回答那次的思考链是有价值的,不能顺手关掉。
+    _thinking_opt_out_supported = True
+
+    async def _create_completion(
+        self, client: Any, request: dict[str, Any], *, auxiliary: bool, span: Any
+    ) -> Any:
+        """发一次非流式请求。辅助调用先试着关掉思考链。
+
+        被端点拒绝时**只回退一次并记住**,而不是每次调用都白试一遍——和
+        ``_stream_usage_supported`` 同一个套路。只认 400 类错误(``_is_bad_request``):
+        超时或限流不代表端点不支持这个参数,那种情况下记住会让后续调用永远吃不到
+        这个优化。
+        """
+        if auxiliary and self._thinking_opt_out_supported:
+            try:
+                result = await client.chat.completions.create(
+                    **request, extra_body={"thinking": {"type": "disabled"}}
+                )
+                span.set(thinking_disabled=True)
+                return result
+            except Exception as exc:
+                if not _is_bad_request(exc):
+                    raise
+                type(self)._thinking_opt_out_supported = False
+                logger.info(
+                    "Provider rejected thinking opt-out; auxiliary calls will "
+                    "keep the reasoning chain (slower)."
+                )
+        return await client.chat.completions.create(**request)
 
     async def _open_stream(self, request: dict[str, Any]) -> Any:
         """开流。尽量带上 include_usage，被提供商拒绝则降级为本地估算。"""
@@ -453,12 +560,17 @@ class OpenAICompatibleAdapter(ModelAdapter):
             blocked = False
             usage = None
             first_token_ms: int | None = None
+            finish_reason: str | None = None
 
             async for chunk in stream:
                 # include_usage 生效时,用量在最后一个不含 choices 的分片里到达
                 usage = getattr(chunk, "usage", None) or usage
                 if not chunk.choices:
                     continue
+                # 终止原因只出现在最后一个带 choices 的分片上,前面的分片是 None
+                finish_reason = (
+                    getattr(chunk.choices[0], "finish_reason", None) or finish_reason
+                )
                 delta = chunk.choices[0].delta
 
                 for raw_call in getattr(delta, "tool_calls", None) or []:
@@ -521,8 +633,9 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 first_token_ms=first_token_ms,
                 tool_calls=len(standard_calls) or None,
             )
+            self._record_truncation(span, finish_reason, content, max_tokens, purpose)
             yield StreamChunk(
                 completion=self._build_completion(
-                    content, standard_calls, streamed_length
+                    content, standard_calls, streamed_length, finish_reason
                 )
             )

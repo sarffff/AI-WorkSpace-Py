@@ -70,6 +70,21 @@ _BASE: dict[str, Any] = {
     # ---- 结构化输出 ----
     # 重试会多花一次辅助模型调用,进成本列。写死避免本地配置影响成本对比。
     "STRUCTURED_OUTPUT_RETRIES": 1,
+    # ---- 人工审批 ----
+    # 审批会在 tool_start 之前拦下 gated 工具那次调用，也就直接改变工具调用
+    # 序列——按本节开头的规矩必须写死。
+    #
+    # 必须是 off:这套评估直接驱动 chat_service,没有任何人会在**另一个请求**里
+    # 点同意,所以开着它 write 类任务永远跑不完。而失败方式是静默的——审批门在
+    # tool_start 之前,于是 calls 里没有 save_to_knowledge_base（召回 0）、
+    # answer 是空的、errors 也是空的,报告上看起来像"模型被明确要求保存却没保存"。
+    # 真实原因是评估框架自己把它拦了。
+    #
+    # 想评审批本身要的是另一种东西:一次被拒绝之后模型会不会改方案
+    # （见 approval.rejection_message）。那已经做了,但**不是**把这里打开——
+    # ``agent_runner._approval_gate`` 按任务临时开闸,只对声明了 ``approval``
+    # 的那几条用例生效,退出即还原。按变体开会把其余 20 多条用例一起废掉。
+    "AGENT_APPROVAL_MODE": "off",
     # ---- 检索 ----
     "RAG_PREFETCH": True,
     "RAG_HYBRID": True,
@@ -98,6 +113,12 @@ _BASE: dict[str, Any] = {
     # 而报告上看不出任何异常。这正是本文件开头那条"关键开关全部写全"要防的事。
     "AGENT_DELEGATION_MODE": "off",
     "AGENT_MAX_DELEGATIONS": 3,
+    # ---- 显式规划 ----
+    # 必须显式写 off,理由和上面委派那条完全一样:规划是进循环之前多一次辅助模型
+    # 调用,而且它会往 messages 里多塞一条消息——轮次、成本、工具选择全都会变。
+    # 本地 .env 打开它的话每个变体都会静默带上规划跑,报告上看不出任何异常。
+    "AGENT_PLAN_MODE": "off",
+    "AGENT_PLAN_MAX_STEPS": 5,
     # ---- 提示词 ----
     "PROMPT_CHAT_SYSTEM_VERSION": "v4-workspace",
     # ---- 语义缓存：必须关 ----
@@ -233,6 +254,27 @@ AGENT_VARIANTS: dict[str, AgentVariant] = {
             "那本身就是有用的信息:说明这几处的输出一直是干净的,重试是白配的保险"
         ),
         overrides={**_BASE, "STRUCTURED_OUTPUT_RETRIES": 0},
+    ),
+    # 显式规划。和 delegation-* 同一处境:上线即无数字支持,所以先量再说。
+    #
+    # 该盯的三个数,顺序不能反:
+    #   1. planSteps      规划到底有没有产出。0 步意味着要么模型判断不用分步
+    #                     (合法),要么规划调用静默失效了(故障)——两者在指标上
+    #                     同形,靠 planner 那条 warning 区分。**这一列是 0 的话
+    #                     下面两个数都不用看**。
+    #   2. planAdherence  计划点名的工具实际调了几成。低说明计划是装饰。
+    #   3. keywordCoverage / avgRounds / 成本
+    #      规划想换来的是"少绕路、少漏半边"。multi_domain 那几条第二轮现在有
+    #      0.5 的关键词命中,那就是它该补上的余量;而它一定会多花一次调用,
+    #      所以成本必然上升。成功率不动而成本上去,就说明这些任务不需要规划。
+    "plan-execute": AgentVariant(
+        name="plan-execute",
+        description=(
+            "进执行循环之前先让辅助模型把问题拆成有序步骤，计划作为一条指引注入。"
+            "要看的是关键词命中（少漏半边）与轮次成本这笔交易，以及 planSteps "
+            "非零——为零就说明规划压根没产出，那时后面的数字都不用读"
+        ),
+        overrides={**_BASE, "AGENT_PLAN_MODE": "plan_execute"},
     ),
 }
 

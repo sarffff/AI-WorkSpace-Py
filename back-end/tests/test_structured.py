@@ -270,3 +270,95 @@ def test_abstention_requires_boolean():
 
     assert result is None
     assert report.failures == ["invalid"]
+
+
+# ========== 预算耗尽 ==========
+#
+# 这一组钉住的是这个仓库里代价最大的一次故障:混合推理模型先花 max_tokens 思考,
+# 预算不够时返回**空串**(不是截断的 JSON)。空串解析不出 JSON,而每个调用方都
+# 合理地"这是增强不是依赖"静默降级。全库 7 个辅助调用点有 5 个长期落在这里,
+# 其中 4 个恰好是 eval 的变体——报告上读作"这个技术没有增益"。
+#
+# 判据是 finish_reason=length **且正文为空**。两个条件都必要:
+# 只看 finish_reason 会把"答长了被截断"也算进来(那种还有内容可以 rescue);
+# 只看空串会把"模型主动啥也不说"算进来(那不是预算问题)。
+
+
+def _exhausted() -> dict:
+    return {"text": "", "finish_reason": "length"}
+
+
+def test_budget_exhaustion_gets_its_own_failure_label():
+    """``truncated`` 与 ``no_json`` 一起出现——两者的修法完全不同。
+
+    ``no_json`` 会让人去改提示词,而这里该改的是 max_tokens。混在一个标签里
+    等于没有信息。
+    """
+    adapter = Adapter([_exhausted()])
+
+    result, report = _ask(adapter, structured.QueryVariants, array=True, retries=0)
+
+    assert result is None
+    assert report.failures == ["no_json", "truncated"]
+    assert report.budget_exhausted
+    assert report.finish_reason == "length"
+
+
+def test_budget_exhaustion_skips_retry():
+    """和 call_failed 同理:重试解决不了预算问题,只会白花一次调用。
+
+    而且更糟——回灌的 assistant 空消息加纠正说明会占掉输入,下一次思考的
+    余地只会更小。
+    """
+    adapter = Adapter([_exhausted(), {"text": '["报销标准"]'}])
+
+    result, report = _ask(adapter, structured.QueryVariants, array=True, retries=1)
+
+    assert result is None
+    assert report.attempts == 1
+    assert len(adapter.calls) == 1, "预算耗尽时不该重试"
+
+
+def test_truncated_but_non_empty_still_retries():
+    """答长了被截断是另一回事:内容还在,重试(或 rescue)有意义。
+
+    分不清这两种就会走错路——把"输出太长"当成预算不足去加 max_tokens 是浪费,
+    把"预算被思考吃光"当成格式问题去改提示词是白改。
+    """
+    adapter = Adapter(
+        [
+            {"text": '["报销标', "finish_reason": "length"},
+            {"text": '["报销标准"]'},
+        ]
+    )
+
+    result, report = _ask(adapter, structured.QueryVariants, array=True, retries=1)
+
+    assert result is not None
+    assert report.attempts == 2
+    assert not report.budget_exhausted
+    assert "truncated" not in report.failures
+
+
+def test_budget_exhaustion_is_logged(caplog):
+    """必须留日志:静默降级是这类故障能藏这么久的唯一原因。"""
+    import logging
+
+    adapter = Adapter([_exhausted()])
+
+    with caplog.at_level(logging.WARNING, logger="structured"):
+        _ask(adapter, structured.QueryVariants, array=True, retries=0)
+
+    assert any("exhausted" in record.message for record in caplog.records)
+
+
+def test_default_max_tokens_is_not_on_the_failing_side():
+    """默认值只对**下一个**调用方生效,所以它必须站在安全的一侧。
+
+    原来是 512,而 512 实测正好落在"返回空串"那一侧
+    (见 scripts/probe_structured_budgets.py)。
+    """
+    import inspect
+
+    signature = inspect.signature(structured.request_structured)
+    assert signature.parameters["max_tokens"].default >= 1024

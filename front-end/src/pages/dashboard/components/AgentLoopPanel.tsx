@@ -62,7 +62,7 @@ export const AgentLoopPanel: React.FC<{
                 className={`relative inline-flex rounded-full h-2 w-2 ${online ? "bg-emerald-500" : "bg-amber-500"}`}
               />
             </span>
-            <span className="label-eyebrow">Agent loop</span>
+            <span className="label-eyebrow">Agent 循环</span>
             <span className="chip text-[9px] px-1.5 py-0.5">
               {online ? "可运行" : "等待服务"}
             </span>
@@ -104,7 +104,7 @@ export const AgentLoopPanel: React.FC<{
         </div>
 
         <div className="hidden shrink-0 border-l border-[#e6e2d8] pl-4 text-right dark:border-[#2a2926] lg:block">
-          <div className="label-eyebrow mb-1">Active context</div>
+          <div className="label-eyebrow mb-1">当前上下文</div>
           <div className="font-mono text-sm font-semibold text-[#1f1e1d] dark:text-[#edece8]">
             {sessionCount}
           </div>

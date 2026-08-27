@@ -18,6 +18,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, defer
 
 from config import settings
@@ -27,13 +28,14 @@ from services import vector_store
 from services.embedding_service import EmbeddingService
 from services.guardrails import ScanReport, guard, mask_markup
 from services.rerank import RerankError, rerank_client
-from services.telemetry import SpanKind, tracer
+from services.telemetry import SpanKind, current_span, tracer
 from services.retrieval_index import (
     BM25Index,
     VectorIndex,
     get_scope_indexes,
     indexes_fresh,
     reciprocal_rank_fusion,
+    scope_key,
     signature_from_ids,
 )
 
@@ -55,6 +57,79 @@ def rerank_mode() -> str:
     if mode in ("off", "llm", "api"):
         return mode
     return "llm" if settings.RAG_RERANK else "off"
+
+
+def _warn_degraded(stage: str, report, fallback: str) -> None:
+    """检索增强降级时留一条日志。
+
+    这四处(路由/HyDE/多查询/重排)的降级路径本身是对的——增强失败不该让回答
+    失败。问题在于**降级是无声的**:``result is None`` 就静默走 fallback,报告里
+    只看到"这个技术没有增益"。2026-08-22 实测四处全部 100% 降级(预算被思考
+    吃光),而 eval 里对应的变体与 baseline 逐位相同,持续了很久没人发现。
+
+    所以这条日志的作用不是排错细节,而是让"我配了但它没生效"这件事**可见**。
+    ``budget_exhausted`` 时 structured 层已经喊过一次预算问题,这里补上业务后果:
+    哪个阶段降级了、退成了什么。
+
+    2026-08-23 补:光有日志不够。读报告的人不看日志,而**结论在报告里**——
+    ``rerank-api`` 变体因为端点返 429 从未真正执行过,报告里却和 baseline 逐位
+    相同,看起来就是"专用重排没有增益"。所以这里同时往当前 span 写一条属性,
+    让 eval 能把降级次数汇总进 summary。span 是扁平列表且带 attributes 字典,
+    嵌套多深都能被捞到,不需要把 span 一层层传进这四个调用点。
+    """
+    logger.warning(
+        "%s degraded (attempts=%s failures=%s finish_reason=%s) → %s",
+        stage,
+        report.attempts,
+        report.failures,
+        report.finish_reason,
+        fallback,
+    )
+    # 失败原因也要进 span。2026-08-27 补:此前只写阶段名,于是报告能说出
+    # "rerank 降级了 10 次"却说不出**为什么**——而修法完全取决于原因:
+    # truncated 要加 max_tokens、no_json 要换提示词或模型、call_failed 要看端点。
+    # 拿着一个没有原因的次数,下一步只能靠猜或者去翻日志,而"结论在报告里、
+    # 细节在日志里"这个割裂正是这个项目反复踩的坑。
+    _mark_degraded(
+        stage,
+        fallback,
+        reason=(
+            # 最后一次失败最能说明问题:前面几次可能是重试路上的不同原因
+            report.failures[-1]
+            if report.failures
+            else (f"finish_{report.finish_reason}" if report.finish_reason else None)
+        ),
+    )
+
+
+def _mark_degraded(stage: str, fallback: str, *, reason: str | None = None) -> None:
+    """把"这个阶段降级了"记到埋点上,供 eval 汇总。
+
+    单独一个函数是因为不是所有降级都有 ``StructuredReport``:``mode=api`` 的重排
+    走 HTTP,失败时只有异常类型,没有 attempts/failures/finish_reason。那一条恰恰
+    是最需要被看见的（429 = 账号没开通该项额度，配了等于没配）。
+    """
+    current_span().set(
+        degraded_stage=stage,
+        degraded_fallback=fallback,
+        # 没有原因时不写这个键,而不是写 "unknown":缺失和"确实不知道"在
+        # 汇总时该分得开(HTTP 那条路径只有异常类型,由调用方自己传)
+        **({"degraded_reason": reason} if reason else {}),
+    )
+
+
+def _stable_key(chunk_id: str, by_id: dict[str, Any]) -> tuple[str, int, str]:
+    """跨重建稳定的排序键，用于打破 RRF 的结构性并列。
+
+    ``(文档名, 块序号)`` 在重新索引后不变，而 ``chunk_id`` 会变（UUID 重新生成）。
+    末尾仍带 ``chunk_id``：候选可能来自 ``by_id`` 之外（多查询改写的通道会召回
+    本次未加载的块），拿不到元数据时至少保证排序是全序而不是抛异常。
+    """
+    row = by_id.get(chunk_id)
+    if row is None:
+        return ("", 0, chunk_id)
+    chunk, document = row
+    return (document.name, chunk.chunk_index, chunk_id)
 
 
 @dataclass(slots=True)
@@ -122,25 +197,99 @@ class HybridRetriever:
         return self._model_adapter
 
     @staticmethod
-    def _load_chunk_ids(db: Session, workspace_id: str) -> list[str]:
+    def _retrievable_by(workspace_id: str, viewer_id: str | None):
+        """**检索作用域**:当前工作区的共享文档 + 查看者自己的私有文档(**不限工作区**)。
+
+        ## admin 在这里没有特权
+
+        名字叫 ``_retrievable_by`` 而不是 ``_visible_to``,是因为"可见"从 2026-08-24
+        起分成了两件事:管理列表的那一份在 ``workspace_service.listable_documents``,
+        admin 在**那里**能看到全体成员的私有文档。这个函数不接受任何角色参数,
+        所以那条特权进不到检索里——admin 的回答不会引用同事的私有草稿,
+        而这正是上传界面对用户的承诺("只有你能检索到")。
+
+        想让 admin 也能检索全员私有文档,不要往这里加 flag,先回答一个产品问题:
+        上传时那句承诺改成什么。
+
+        ## workspace_id 只约束共享那一支
+
+        这是"私有文档跟人走"的实现点,也是这个条件唯一容易写错的地方。把
+        ``workspace_id`` 放在外层当 AND 条件(改动前就是那样)会顺带把私有文档也
+        锁进当前空间,于是换一次工作区就再也搜不到自己传过的东西——而
+        ``User.workspace_id`` 是单值外键,加入等于离开,所以那不是边缘情况。
+
+        个人文档的归属是**人**,不是空间。代价说清楚:一个人带着他的私有文档
+        进入新工作区,那些文档会在新环境里被索引(只有他自己搜得到,
+        但确实躺在这台服务器上),而新工作区的 admin 看不到也删不掉它们。
+        这是开发期选定的语义(2026-08-24);企业环境里更安全的默认是把私有文档
+        留在原空间,那时把 ``workspace_id`` 加回私有那一支即可。
+
+        ## 在 SQL 这一层挡住,不在结果里过滤
+
+        检索链路后面的每一步都吃这批行——BM25 词表、RRF 的候选席位、重排的输入。
+        放到后面过滤有两个后果:别人的私有分块会进 BM25 的词表(隔离就押在一个
+        后置判断上),而且它们会占掉 per-channel 的候选名额,把本来该出现的结果
+        挤下去。
+
+        ## 两个方向性的规矩
+
+        ``viewer_id`` 为 None 表示"只要共享文档",不是"什么都能看"。离线评估与
+        脚本走这条路。这个方向必须是收紧而不是放开——None 当成"不过滤"是这类
+        代码最典型的越权 bug。
+
+        私有文档要求 ``user_id`` 非空且等于查看者。``user_id`` 为 NULL 的私有
+        文档(删用户时 ondelete="SET NULL" 造出来的)因此**谁都检索不到**,
+        这是有意的:离职者留下的私有资料不该自动变成全员可见。
+        """
+        shared = (Document.visibility == "workspace") & (
+            Document.workspace_id == workspace_id
+        )
+        if not viewer_id:
+            return shared
+        return or_(
+            shared,
+            # 注意这一支**没有** workspace_id 条件,见上面第一节
+            (Document.visibility == "private") & (Document.user_id == viewer_id),
+        )
+
+    @classmethod
+    def _load_chunk_ids(
+        cls, db: Session, workspace_id: str, viewer_id: str | None = None
+    ) -> list[str]:
         """只查 id 列的轻量查询,用于算索引签名判断是否需要重建。"""
         rows = (
             db.query(DocumentChunk.id)
             .join(Document, DocumentChunk.document_id == Document.id)
-            .filter(Document.workspace_id == workspace_id, Document.status == "indexed")
+            .filter(
+                # workspace_id **不在这里**:它现在只约束共享文档那一支,
+                # 由 _retrievable_by 内部处理。放回来会把私有文档也锁进当前空间,
+                # 那样"私有文档跟人走"就静默失效了——而症状只是"换空间后
+                # 搜不到自己的东西",不报任何错。
+                Document.status == "indexed",
+                cls._retrievable_by(workspace_id, viewer_id),
+            )
             .order_by(DocumentChunk.id.asc())
             .all()
         )
         return [row[0] for row in rows]
 
-    @staticmethod
+    @classmethod
     def _load_rows(
-        db: Session, workspace_id: str, *, with_embeddings: bool
+        cls,
+        db: Session,
+        workspace_id: str,
+        *,
+        with_embeddings: bool,
+        viewer_id: str | None = None,
     ) -> list[tuple[DocumentChunk, Document]]:
         query = (
             db.query(DocumentChunk, Document)
             .join(Document, DocumentChunk.document_id == Document.id)
-            .filter(Document.workspace_id == workspace_id, Document.status == "indexed")
+            .filter(
+                # 同 _load_chunk_ids:workspace_id 只在 _retrievable_by 内部约束共享那一支
+                Document.status == "indexed",
+                cls._retrievable_by(workspace_id, viewer_id),
+            )
             .order_by(DocumentChunk.id.asc())
         )
         if not with_embeddings:
@@ -150,12 +299,21 @@ class HybridRetriever:
         return query.all()
 
     async def retrieve(
-        self, db: Session, workspace_id: str, query: str, top_k: int = 5
+        self,
+        db: Session,
+        workspace_id: str,
+        query: str,
+        top_k: int = 5,
+        viewer_id: str | None = None,
     ) -> list[RetrievedChunk]:
         """检索入口。埋点记下本次用的是哪套开关组合与命中情况。
 
         这些属性就是配置扫描能落地的前提：同一批问题跑不同变体，
         事后按 span 的 hybrid / rerank / multi_query 分组对比即可。
+
+        ``viewer_id`` 决定能看到哪些私有文档；不传就只检索工作区共享文档。
+        默认收紧而不是放开：漏传的后果是"少检索到自己的私有文档"（能被投诉），
+        而反过来是越权（不会被投诉，只会泄露）。
         """
         async with tracer.span(
             "retrieval.hybrid" if settings.RAG_HYBRID else "retrieval.dense",
@@ -168,7 +326,9 @@ class HybridRetriever:
             query_route=settings.RAG_QUERY_ROUTE,
             context_window=settings.RAG_CONTEXT_WINDOW,
         ) as span:
-            results = await self._retrieve(db, workspace_id, query, top_k, span)
+            results = await self._retrieve(
+                db, workspace_id, query, top_k, span, viewer_id=viewer_id
+            )
             span.set(
                 hits=len(results),
                 channels=sorted({c for r in results for c in r.channels}) or None,
@@ -186,25 +346,35 @@ class HybridRetriever:
         query: str,
         top_k: int = 5,
         span: Any = None,
+        viewer_id: str | None = None,
     ) -> list[RetrievedChunk]:
+        # 索引按(工作区, 查看者)分桶:能检索到什么因人而异,共用一份索引会让
+        # 别人的私有分块进 BM25 词表并占掉候选席位。代价见 scope_key 的说明。
+        scope = scope_key(workspace_id, viewer_id)
         # 先用 id 集合签名判断索引是否新鲜:新鲜则跳过 embedding 大字段的
         # 拉取与重建,热路径的检索成本不再随库规模线性增长
-        chunk_ids = self._load_chunk_ids(db, workspace_id)
+        chunk_ids = self._load_chunk_ids(db, workspace_id, viewer_id)
         if not chunk_ids:
             return []
         signature = signature_from_ids(chunk_ids)
-        fresh = indexes_fresh(workspace_id, signature)
+        fresh = indexes_fresh(scope, signature)
         # Qdrant 后端下稠密通道不再需要 embedding 列——向量在 Qdrant 里,MySQL 这份
         # 只是给回填脚本用的。BM25 只要 content,所以整个热路径都不必碰那个大字段。
         store = vector_store.get_store()
         on_qdrant = vector_store.uses_qdrant()
         rows = self._load_rows(
-            db, workspace_id, with_embeddings=not fresh and not on_qdrant
+            db,
+            workspace_id,
+            with_embeddings=not fresh and not on_qdrant,
+            viewer_id=viewer_id,
         )
 
         chunks = [chunk for chunk, _document in rows]
+        # by_id 同时是**隔离的第二道防线**:Qdrant 侧的 filter 只按 workspace 过滤,
+        # 所以它可能命中别人的私有分块;而 _retrieve 末尾 RRF 之后有一句
+        # `if chunk_id in by_id`,不在这批可见行里的一律丢掉。
         by_id = {chunk.id: (chunk, document) for chunk, document in rows}
-        indexes = get_scope_indexes(workspace_id)
+        indexes = get_scope_indexes(scope)
         if not on_qdrant:
             indexes.vector.build_if_stale(chunks, signature)
         if settings.RAG_HYBRID:
@@ -257,9 +427,15 @@ class HybridRetriever:
         if not rankings:
             return []
 
+        # 并列按"文档名 + 块序号"打破，而不是按 chunk_id。RRF 的并列是结构性的
+        # （两个块在两路里相邻互换 ⇒ 融合分位位相等），而 chunk_id 是每次重新索引
+        # 都会重新生成的 UUID——不给稳定键的话，同一份语料重建一次 top-1 就可能换人。
+        # 详见 reciprocal_rank_fusion 的说明。
         fused = [
             (chunk_id, score)
-            for chunk_id, score in reciprocal_rank_fusion(rankings, weights=weights)
+            for chunk_id, score in reciprocal_rank_fusion(
+                rankings, weights=weights, tiebreak=lambda cid: _stable_key(cid, by_id)
+            )
             if chunk_id in by_id
         ]
         if not fused:
@@ -282,7 +458,7 @@ class HybridRetriever:
             '格式：{"intent": "lexical"}，不要任何解释。\n\n'
             f"问题：{query}"
         )
-        result, _report = await structured.request_structured(
+        result, report = await structured.request_structured(
             self._get_model_adapter(),
             schema=structured.QueryRoute,
             prompt=prompt,
@@ -290,8 +466,10 @@ class HybridRetriever:
             purpose="query_route",
             array=False,
             temperature=0.0,
-            max_tokens=32,
+            max_tokens=settings.RAG_ROUTE_MAX_TOKENS,
         )
+        if result is None:
+            _warn_degraded("query_route", report, "两路 RRF 权重都用默认值")
         return result
 
     async def _hyde_query(self, query: str) -> str:
@@ -312,7 +490,7 @@ class HybridRetriever:
             '只输出 JSON：{"answer": "..."}，不要任何解释。\n\n'
             f"问题：{query}"
         )
-        result, _report = await structured.request_structured(
+        result, report = await structured.request_structured(
             self._get_model_adapter(),
             schema=structured.HypotheticalAnswer,
             prompt=prompt,
@@ -323,6 +501,7 @@ class HybridRetriever:
             max_tokens=settings.RAG_HYDE_MAX_TOKENS,
         )
         if result is None:
+            _warn_degraded("hyde", report, "稠密通道用原查询")
             return query
         # 原查询拼在前面而不是整个替换掉：假答案可能整段跑偏，留着原查询
         # 至少保证向量里还有用户真正问的那件事
@@ -372,7 +551,7 @@ class HybridRetriever:
             '只输出 JSON 字符串数组，例如 ["查询1", "查询2"]，不要任何解释。\n\n'
             f"问题：{query}"
         )
-        result, _report = await structured.request_structured(
+        result, report = await structured.request_structured(
             self._get_model_adapter(),
             schema=structured.QueryVariants,
             prompt=prompt,
@@ -380,10 +559,11 @@ class HybridRetriever:
             purpose="query_rewrite",
             array=True,
             temperature=0.3,
-            max_tokens=256,
+            max_tokens=settings.RAG_MULTI_QUERY_MAX_TOKENS,
         )
         if result is None:
             # 改写是增强不是依赖:失败就用原查询单路召回
+            _warn_degraded("query_rewrite", report, "退回单路召回")
             return [query]
 
         variants = [item for item in result.items if item != query]
@@ -438,10 +618,22 @@ class HybridRetriever:
             # 不静默退回 llm：那会让报告里的 rerank=api 与实际跑的东西不一致，
             # 而"api 和 llm 差多少"正是这个变体要量的
             logger.warning("rerank mode=api but the endpoint is not configured")
+            _mark_degraded("rerank_api", "未配置端点，退回融合序", reason="unconfigured")
             return []
         try:
             scored = await rerank_client.rerank(query, snippets)
-        except RerankError:
+        except RerankError as error:
+            # 请求失败(超时/额度/鉴权)。智谱的 /rerank 对未开通额度的账号返
+            # 429/1113,而这条路径静默退回融合序——2026-08-23 之前 rerank-api
+            # 变体就是这样"跑了很多次、一次都没生效"的
+            #
+            # 原因带上状态码与 provider code:"429/1113"(额度没开通,换端点)和
+            # "timeout"(网络,重试)的修法完全不同,只记"请求失败"分不出来。
+            _mark_degraded(
+                "rerank_api",
+                "请求失败，退回融合序",
+                reason=getattr(error, "code", None) or type(error).__name__,
+            )
             return []
         return [candidates[index] for index, _score in scored]
 
@@ -460,7 +652,7 @@ class HybridRetriever:
             "例如 [3, 1, 5]，不要任何解释。\n\n"
             f"问题：{query}\n\n" + "\n\n".join(passages)
         )
-        result, _report = await structured.request_structured(
+        result, report = await structured.request_structured(
             self._get_model_adapter(),
             schema=structured.RerankOrder,
             prompt=prompt,
@@ -468,9 +660,10 @@ class HybridRetriever:
             purpose="rerank",
             array=True,
             temperature=0.0,
-            max_tokens=256,
+            max_tokens=settings.RAG_RERANK_MAX_TOKENS,
         )
         if result is None:
+            _warn_degraded("rerank", report, "退回融合序")
             return []
 
         seen: set[str] = set()

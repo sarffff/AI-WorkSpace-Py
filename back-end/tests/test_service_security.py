@@ -38,7 +38,7 @@ class RecordingKnowledge(GuardingKnowledge):
 
 
 def _seed_workspace(db_real):
-    """管理员 u1 + 通过邀请码加入的成员 u2，u2 的会话 c1。"""
+    """管理员 u1 + 同工作区成员 u2，u2 的会话 c1。"""
     from services.clock import naive_now as now
 
     admin = User(email="admin@example.com", username="admin", role="admin")
@@ -48,8 +48,10 @@ def _seed_workspace(db_real):
     db_real.refresh(admin)
     db_real.refresh(member)
     workspace = workspace_service.resolve_for_user(db_real, admin)
-    workspace_service.join_by_invite_code(db_real, member, workspace.invite_code)
-    assert member.role == workspace_service.ROLE_MEMBER
+    member.workspace_id = workspace.id
+    member.role = workspace_service.ROLE_USER
+    db_real.commit()
+    assert member.role == workspace_service.ROLE_USER
     chat = Chat(id="c1", user_id=member.id, title="测试", created_at=now(), updated_at=now())
     db_real.add(chat)
     db_real.commit()
@@ -199,7 +201,7 @@ def test_blocked_retrieval_never_reaches_main_model(db, monkeypatch):
 
     main_messages = adapter.calls[0]["messages"]
     joined = "".join(message.get("content", "") for message in main_messages)
-    assert "这段检索结果因包含疑似提示注入内容而未被注入" in joined
+    assert "这段外部内容因包含疑似提示注入内容而未被注入" in joined
     assert canary not in joined
 
 

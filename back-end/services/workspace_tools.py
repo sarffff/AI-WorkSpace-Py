@@ -42,6 +42,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from config import settings
+from services import file_types
 from services import knowledge_service as knowledge_module
 from services.guardrails import guard
 from services.tool_runtime import ToolDefinition
@@ -49,8 +50,10 @@ from services.web_search import WebSearchError, web_search_client
 
 logger = logging.getLogger("workspace_tools")
 
-# 图片不走文本解析。它们由 services/vision.py 转成 image_url 内容块
-_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp"}
+# 图片不走文本解析。它们由 services/vision.py 转成 image_url 内容块。
+# 从 file_types 派生:这里问的是"哪些扩展名是图片",和上传白名单问的是同一个问题,
+# 各留一份的话 read_attachment 会对某种图片给出"解析失败"而不是那句解释。
+_IMAGE_EXTENSIONS = file_types.IMAGE
 
 # Agent 自己写进知识库的文档带这个前缀，于是它在 list_knowledge_documents 与
 # 引用列表里一眼可辨。混在用户上传的资料里分不出来，是"模型自问自答"的温床。

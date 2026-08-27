@@ -38,10 +38,18 @@ from services import structured
 logger = logging.getLogger("eval.judge")
 
 # 裁判的输出预算。推理型模型(glm-4.5 系列等)的思考 token 与可见输出共享
-# max_tokens,512 会被思考吃掉大半,可见 JSON 刚开头就截断——本轮全量评估
-# 因此 96% 的裁判调用解析失败。1500 给思考留出余量,同时下面的字段级
-# 兜底解析保证即使再截断也能把已经吐出来的分数捡回来。
-_JUDGE_MAX_TOKENS = 1500
+# max_tokens,512 会被思考吃掉大半,可见 JSON 刚开头就截断——那一轮全量评估
+# 因此 96% 的裁判调用解析失败。
+#
+# 1500 是当时的修法,但它只修了一半:2026-08-16 那份报告底下还写着"裁判解析
+# 失败 28 次",而 2026-08-22 加上 finish_reason 之后直接看到了原因——**思考
+# 把 1500 也吃光了,content 是空串**。空串连字段级兜底都救不了(没有任何字段
+# 吐出来),所以那 28 次是彻底作废、不是"少了个 reason"。
+#
+# 这件事的教训不在数字上:一个"已经修过一次"的预算仍然在静默失效,而报告底下
+# 那行"解析失败 28 次"被当成了噪声。同类问题在这个仓库里一共踩了七次,全都
+# 因为 content 为空和"模型没什么要说"在调用方看来完全同形。
+_JUDGE_MAX_TOKENS = 4096
 
 
 def _score_from_fragment(text: str, field: str) -> float | None:
@@ -62,6 +70,25 @@ def _bool_from_fragment(text: str, field: str) -> bool | None:
         return None
     return match.group(1) == "true"
 
+
+# 裁判理由里表示"它认为这次是拒答"的说法。只用来**检测自相矛盾**，
+# 不用来改判——见 AnswerJudge.judge 里那段注释。
+_REASON_SAYS_ABSTAINED = re.compile(
+    r"正确拒答|正确地拒答|已拒答|拒答正确|未找到|没有找到|未提及|未涉及"
+)
+
+
+def _contradicts(reason: str, abstained: bool) -> bool:
+    """裁判的理由和它的布尔判定是否互相矛盾。
+
+    只查一个方向：``abstained=false`` 而理由说"正确拒答"。反方向
+    （``abstained=true`` 但理由说编造了）不算矛盾——一次拒答完全可以同时带编造，
+    这正是 rubric 现在明确说开的那件事。
+    """
+    if abstained:
+        return False
+    return bool(_REASON_SAYS_ABSTAINED.search(reason or ""))
+
 _RUBRIC = """你是严格的评审。根据「参考内容」判断「回答」的质量，不要用你自己的知识补充。
 
 按 1-5 打分：
@@ -73,15 +100,28 @@ _RUBRIC = """你是严格的评审。根据「参考内容」判断「回答」�
 
 _ABSTENTION_RUBRIC = """你是严格的评审。这个问题在知识库中**没有**答案，正确行为是说明未找到相关内容。
 
-判断「回答」是否正确地拒答了。编造了具体信息（数字、流程、金额）即为失败。
+请分别判断两件**互不影响**的事：
 
-只输出 JSON，不要任何解释文字：
-{"abstained": true/false, "fabricated": ["..."], "reason": "一句话"}"""
+1. `abstained`：回答有没有说明"资料里没有"。这是**纯行为判断**，只看回答说了什么。
+   只要回答表达了"未找到 / 没有相关信息 / 资料未提及"，`abstained` 就是 true——
+   **即使**它同时犯了别的错（比如列了不存在的来源、又多补了一句猜测）。
+2. `fabricated`：回答里凭空出现的具体信息（数字、流程、金额、来源文件名）。
+   有就逐条列出，没有就给空数组。
+
+一次拒答同时带编造是完全可能的：那时 `abstained` 是 true，`fabricated` 非空。
+不要因为回答有别的问题就把 `abstained` 写成 false——那两个字段各管一件事。
+
+只输出 JSON，不要任何解释文字。**先写 reason，最后写 abstained**：
+{"reason": "一句话", "fabricated": ["..."], "abstained": true/false}"""
 
 _TASK_RUBRIC = """你是严格的评审，正在评估一个能调用工具的 AI 助手。
 
 「工具证据」是助手这次实际调用工具后拿到的全部内容。「评分标准」写明了本任务
 要求助手做到什么。请只依据这两者判断，不要用你自己的知识补充事实。
+
+工具证据里标注 [预检索] 的条目是系统按配置自动执行的，不是助手选择调用的；
+判断「助手有没有多调工具」时不要把它算作助手的动作。标注 [第 N 轮] 的才是
+助手自己决定调用的。
 
 按 1-5 打分：
 - success：是否达成了评分标准描述的目标。5=完全达成，3=部分达成或有明显遗漏，1=没做到。
@@ -102,6 +142,8 @@ class JudgeVerdict:
     abstained: bool | None = None
     reason: str = ""
     failed: bool = False
+    # 裁判的理由和它的 abstained 互相矛盾。计数进报告，用来验证 rubric 改动生效
+    inconsistent: bool = False
 
 
 def _clamp_score(value: object) -> float | None:
@@ -190,7 +232,15 @@ class AnswerJudge:
 
         if not answerable:
             assert isinstance(result, structured.AbstentionVerdict)
-            return JudgeVerdict(abstained=result.abstained, reason=result.reason[:300])
+            return JudgeVerdict(
+                abstained=result.abstained,
+                reason=result.reason[:300],
+                # 不在这里"改对"裁判的判定:那是拿子串规则覆盖模型的结论,而子串
+                # 规则本身就是不可靠的(见 metrics._fold 那段)。只把矛盾标出来、
+                # 让它在报告里可见——真正的修法是上面那份 rubric,而这个计数是
+                # 用来证明修法生效的。
+                inconsistent=_contradicts(result.reason, result.abstained),
+            )
 
         assert isinstance(result, structured.AnswerScores)
         return JudgeVerdict(

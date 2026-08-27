@@ -87,3 +87,11 @@ back-end/eval/datasets/feedback_regression.jsonl
 
 # 真实价目表（示例见 model_prices.example.json）
 back-end/model_prices.json
+
+# 运行时上传的文件。文件名是随机 hash，内容是谁在本地点过"上传"的产物，
+# 对别人一律没有意义——之前混进版本库的是两张 1.33 MB 的同图 PNG、一份
+# security-policy.md 的手工上传副本和一个两行的 probe.md，都无人引用。
+# eval 的附件是真夹具（agent_stubs.py 直接按路径读它），单独放行。
+back-end/uploads/
+!back-end/uploads/eval/
+!back-end/uploads/eval/**

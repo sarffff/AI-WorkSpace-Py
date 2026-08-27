@@ -1,4 +1,4 @@
-import React, {
+﻿import React, {
   useState,
   useRef,
   useEffect,
@@ -166,9 +166,16 @@ export const ChatPage: React.FC = () => {
     pendingInput,
     promptVersion,
   } = useSelector((state: RootState) => state.chat);
-  const messages = currentChatId
-    ? (messagesBySession[currentChatId] ?? [])
-    : [];
+  /**
+   * 当前会话的消息。用 useMemo 而不是直接算：没有会话、或者这个会话还没拉到
+   * 消息时，三元表达式每次 render 都会产出一个**新的** `[]`，于是所有把
+   * `messages` 列进依赖的 hook 都会跟着每次 render 重跑一遍——包括下面跟随
+   * 滚动那个 effect，正好抵掉给它加依赖数组的意义。
+   */
+  const messages = useMemo(
+    () => (currentChatId ? (messagesBySession[currentChatId] ?? []) : []),
+    [currentChatId, messagesBySession],
+  );
   const [input, setInput] = useState("");
   const [useRag, setUseRag] = useState(false);
   const [showThinking, setShowThinking] = useState(false);
@@ -247,38 +254,31 @@ export const ChatPage: React.FC = () => {
     }
   }, [pendingInput, dispatch]);
 
-  // 可在浏览器直接以文本读取的扩展名
-  const TEXT_EXTENSIONS = new Set([
-    "txt",
-    "md",
-    "py",
-    "js",
-    "ts",
-    "tsx",
-    "jsx",
-    "json",
-    "xml",
-    "yaml",
-    "yml",
-    "css",
-    "html",
-    "csv",
-    "log",
-    "sh",
-    "java",
-    "go",
-    "rs",
-    "c",
-    "cpp",
-  ]);
-  const IMAGE_EXTENSIONS = new Set([
-    "png",
-    "jpg",
-    "jpeg",
-    "gif",
-    "webp",
-    "svg",
-  ]);
+  /**
+   * 扩展名清单来自后端 `capabilities.fileTypes`，前端不再自己维护。
+   *
+   * 之前这里各写一份的后果是实打实的：`.html` 在这个集合里、后端两处白名单都
+   * 没有（附件走"尽力而为"退化成内联，知识库上传直接 400）；`.svg` 在
+   * IMAGE_EXTENSIONS 里、后端出于安全故意排除，而图片分支没有兜底路径，
+   * 所以选中一个 .svg 必然弹"图片上传失败"。判据见后端 services/file_types.py。
+   *
+   * fileTypes 缺失时给空集合而不是硬编码一份兜底：兜底就是第七份副本，
+   * 而它一旦和后端不一致，症状还是同一批莫名其妙的上传失败。
+   * 附件按钮会因此禁用，那是个显式的、能问出原因的状态。
+   */
+  const fileTypes = capabilities?.fileTypes ?? null;
+  const TEXT_EXTENSIONS = useMemo(
+    () => new Set(fileTypes?.text ?? []),
+    [fileTypes],
+  );
+  const IMAGE_EXTENSIONS = useMemo(
+    () => new Set(fileTypes?.image ?? []),
+    [fileTypes],
+  );
+  const DOCUMENT_EXTENSIONS = useMemo(
+    () => new Set(fileTypes?.document ?? []),
+    [fileTypes],
+  );
 
   const handleAttachClick = () => {
     attachInputRef.current?.click();
@@ -359,14 +359,20 @@ export const ChatPage: React.FC = () => {
       return;
     }
 
-    // PDF：直接进入当前用户知识库，并自动启用 RAG。
+    // 二进制文档（目前只有 PDF）：直接进知识库，并自动启用 RAG。
+    // 判据用后端给的 document 类别而不是写死 "pdf"：加格式时后端一处即可，
+    // 这里不必再改——而"前端漏改一处"正是 .html / .svg 那两个 bug 的成因。
     setAttaching(true);
     setAttachError(null);
     try {
-      if (ext !== "pdf") {
+      if (!DOCUMENT_EXTENSIONS.has(ext)) {
         throw new Error("该文件类型暂不支持直接分析");
       }
-      const res = await apiClient.uploadDocument(file);
+      // **私有**：在对话里附一份文件只是想问句话，不该等于向整个团队发布它。
+      // 改动之前这里走的是默认的 workspace，于是一份合同、一份报价单附上去
+      // 就进了工作区共享知识库，全员可见、永久留存，而界面上没有任何提示。
+      // 顺带修掉一个 403：共享文档要 admin，所以非管理员此前根本附不上 PDF。
+      const res = await apiClient.uploadDocument(file, "private");
       setUseRag(true);
       setAttachments((prev) => [
         ...prev,
@@ -639,8 +645,43 @@ export const ChatPage: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    if (!isNearBottom()) scrollToBottom();
-  });
+    if (isNearBottom()) scrollToBottom(false);
+  }, [messages, toolStatus, pendingApproval, isNearBottom, scrollToBottom]);
+
+  /**
+   * 进入会话时平滑滚动到最新消息。
+   *
+   * 上面的跟随滚动只在"用户已在底部附近"才生效，而切入一个历史会话时消息是
+   * 整批异步到位的：内容一次性撑高、scrollTop 还停在 0，isNearBottom() 为假，
+   * 于是永远停在顶部——这正是要修的场景。按会话记一次"已滚"标记，消息就绪后
+   * 用 behavior:"smooth" 过渡滚到底。一次性动作不存在流式跟随时平滑滚动互相
+   * 重定向的抖动问题，可以放心用平滑；图片、代码块这类晚于首帧渲染的内容会把
+   * 高度再撑一截，动画结束时未必真到底，所以收尾后再瞬时校正一次——若用户已经
+   * 往上翻（isNearBottom 为假）则不打扰。
+   */
+  const lastScrolledChatRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!currentChatId) {
+      // 离开会话时清掉标记：回到同一个会话仍应滚到底
+      lastScrolledChatRef.current = null;
+      return;
+    }
+    if (!messages.length || lastScrolledChatRef.current === currentChatId)
+      return;
+    lastScrolledChatRef.current = currentChatId;
+
+    let settleTimer: ReturnType<typeof setTimeout> | null = null;
+    const frame = requestAnimationFrame(() => {
+      scrollToBottom(true);
+      settleTimer = setTimeout(() => {
+        if (isNearBottom()) scrollToBottom(false);
+      }, 500);
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      if (settleTimer) clearTimeout(settleTimer);
+    };
+  }, [currentChatId, messages, isNearBottom, scrollToBottom]);
 
   /**
    * 核心：把用户消息发给后端并流式渲染 AI 回复。
@@ -883,7 +924,9 @@ export const ChatPage: React.FC = () => {
             const agentRound = chunk.agentRound ?? 1;
             const round = chunk.round ?? 0;
             if (chunk.phase === "tool_start") {
-              setToolStatus(`${agentLabel(agent)} · ${toolLabel(chunk.tool)}...`);
+              setToolStatus(
+                `${agentLabel(agent)} · ${toolLabel(chunk.tool)}...`,
+              );
               setInsightEvents((prev) => [
                 ...prev,
                 {
@@ -900,7 +943,10 @@ export const ChatPage: React.FC = () => {
                     ...existing,
                     {
                       round,
-                      callIndex: 10_000 + existing.filter((step) => step.agentRole === agent).length,
+                      callIndex:
+                        10_000 +
+                        existing.filter((step) => step.agentRole === agent)
+                          .length,
                       tool: chunk.tool ?? "",
                       input: chunk.input,
                       agentRole: agent,
@@ -1085,15 +1131,15 @@ export const ChatPage: React.FC = () => {
               if (target < 0) return prev;
               const next = [...steps];
               next[target] = {
-                  ...next[target],
-                  status:
-                    chunk.status === "ok" ||
-                    chunk.status === "invalid_arguments" ||
-                    chunk.status === "unavailable" ||
-                    chunk.status === "error"
-                      ? chunk.status
-                      : "ok",
-                };
+                ...next[target],
+                status:
+                  chunk.status === "ok" ||
+                  chunk.status === "invalid_arguments" ||
+                  chunk.status === "unavailable" ||
+                  chunk.status === "error"
+                    ? chunk.status
+                    : "ok",
+              };
               return { ...prev, [userMessageId]: next };
             });
             continue;
@@ -1332,6 +1378,11 @@ export const ChatPage: React.FC = () => {
         }),
       );
 
+      // 自己发出的消息一定要能看见,哪怕此刻正翻在历史里——上面那个跟随用的
+      // effect 只在"已经贴着底部"时才滚,不覆盖这一下。这里是离散跳转,
+      // 用平滑动画正合适(它不会像流式跟随那样每 60ms 被重发一次)。
+      requestAnimationFrame(() => scrollToBottom(true));
+
       await runCompletion(sessionId, apiPrompt, userMessageId);
     },
     [
@@ -1345,6 +1396,7 @@ export const ChatPage: React.FC = () => {
       capabilities,
       runCompletion,
       toast,
+      scrollToBottom,
     ],
   );
 
@@ -1445,7 +1497,7 @@ export const ChatPage: React.FC = () => {
                 <div className="absolute inset-0 rounded-[22px] bg-[#da7756] blur-2xl opacity-25" />
                 <BrandMark size={56} className="relative !rounded-[18px]" />
               </div>
-              <p className="label-eyebrow mb-2">Studio</p>
+              <p className="label-eyebrow mb-2">工作台</p>
               <h2 className="font-display text-[26px] font-semibold text-[#1f1e1d] dark:text-[#edece8] mb-2">
                 工作台已就绪
               </h2>
@@ -1862,9 +1914,13 @@ export const ChatPage: React.FC = () => {
               <button
                 type="button"
                 onClick={handleAttachClick}
-                disabled={attaching}
+                disabled={attaching || !fileTypes}
                 className="p-2 text-[#6e6b63] dark:text-[#a19f96] hover:text-[#1f1e1d] dark:hover:text-[#edece8] hover:bg-[#f3f0e6] dark:hover:bg-[#262522] rounded-xl transition-colors disabled:opacity-50"
-                title="附加文本文件到消息"
+                title={
+                  fileTypes
+                    ? "附加文件到消息"
+                    : "正在获取服务端支持的文件类型…"
+                }
               >
                 <Paperclip className="w-4 h-4" />
               </button>
@@ -1872,7 +1928,7 @@ export const ChatPage: React.FC = () => {
                 ref={attachInputRef}
                 type="file"
                 className="hidden"
-                accept=".txt,.md,.py,.js,.ts,.tsx,.jsx,.json,.xml,.yaml,.yml,.css,.html,.csv,.log,.sh,.java,.go,.rs,.c,.cpp,.png,.jpg,.jpeg,.gif,.webp,.svg,.pdf"
+                accept={fileTypes?.attachmentAccept}
                 onChange={handleAttachFile}
               />
               <textarea

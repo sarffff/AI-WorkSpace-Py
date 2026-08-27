@@ -89,8 +89,11 @@ def test_knowledge_search_scoped_to_workspace_id(db_real, monkeypatch):
             super().__init__(context="预算文档内容")
             self.scope_ids: list = []
 
-        async def build_rag_context_with_citations(self, db, query, user_id, top_k=5):
-            self.scope_ids.append(user_id)
+        async def build_rag_context_with_citations(
+            self, db, query, workspace_id, top_k=5, viewer_id=None
+        ):
+            self.scope_ids.append(workspace_id)
+            self.viewer_ids.append(viewer_id)
             return self.context, []
 
     knowledge = ScopedKnowledge()

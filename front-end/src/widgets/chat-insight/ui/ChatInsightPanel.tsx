@@ -63,7 +63,7 @@ export const ChatInsightPanel: React.FC<Props> = ({
     <div className="w-72 border-l border-[#e6e2d8] dark:border-[#282724] bg-[#f3f0e6]/40 dark:bg-[#1a1917]/40 backdrop-blur-sm flex flex-col h-full overflow-y-auto">
       <div className="flex items-center justify-between px-4 py-3 border-b border-[#e6e2d8] dark:border-[#282724]">
         <div>
-          <div className="label-eyebrow">Insight</div>
+          <div className="label-eyebrow">实时洞察</div>
           <span className="text-xs font-semibold text-[#1f1e1d] dark:text-[#edece8]">
             运行洞察
           </span>

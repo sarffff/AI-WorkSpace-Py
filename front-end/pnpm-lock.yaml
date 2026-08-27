@@ -4,6 +4,8 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+pnpmfileChecksum: sha256-T1dhlWQrfhv6Rkpu5doN88OF4P9ZaVpcwjgDsEg46gU=
+
 importers:
 
   .:
@@ -3318,7 +3320,7 @@ snapshots:
 
   '@types/minimatch@6.0.0':
     dependencies:
-      minimatch: 9.0.9
+      minimatch: 10.2.6
     optional: true
 
   '@types/ms@2.1.0': {}

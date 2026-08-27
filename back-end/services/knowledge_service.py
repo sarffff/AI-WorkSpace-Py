@@ -14,23 +14,29 @@ from dataclasses import dataclass, field
 from sqlalchemy.orm import Session
 
 from config import settings
-from models import Document, DocumentChunk
+from models import Document, DocumentChunk, User
+from services import file_types
+from services import workspace_service
+from services.workspace_service import VISIBILITY_WORKSPACE
 from services import ingest_clean
 from services import chunking
 from services import vector_store
 from services.chunking import Chunk, split_document
 from services.embedding_service import EmbeddingService
-from services.retrieval_index import invalidate_scope_indexes
+from services.retrieval_index import (
+    invalidate_scope_indexes,
+    invalidate_viewer_indexes,
+)
 from services.semantic_cache import semantic_cache
 from services.retriever import HybridRetriever, RetrievedChunk, format_context
 from services.token_budget import get_token_counter
 
 logger = logging.getLogger("knowledge_service")
 
-TEXT_EXTENSIONS = {
-    "txt", "md", "js", "ts", "tsx", "jsx", "json", "xml", "yaml", "yml",
-    "css", "csv", "log", "sh", "java", "go", "rs", "c", "cpp", "py",
-}
+# 从 file_types 派生而不是自己列一份：这份清单此前有六处副本且已互相矛盾，
+# 理由与代价见 services/file_types.py 的模块文档。保留这个名字是因为
+# parse_document 用它做分派，改名对调用方没有收益。
+TEXT_EXTENSIONS = file_types.TEXT
 
 
 @dataclass(slots=True)
@@ -86,6 +92,21 @@ def parse_document(filename: str, content: bytes) -> ParsedDocument:
             warnings=list(extraction.warnings),
         )
 
+    if extension in ("docx", "xlsx"):
+        # 和 PDF 走同一个返回类型与同一套 warning 词汇，所以这里只是转形状。
+        # 没有 INGEST_* 开关对照组：PDF 那个开关存在是因为"结构恢复"是启发式的
+        # （字号猜层级），需要一个能关掉的对照。docx 的层级在样式名里是显式的，
+        # 没有什么可对照的——加一个恒定更差的分支只会多一条没人跑的路径。
+        if extension == "docx":
+            extraction = ingest_clean.extract_docx(content)
+        else:
+            extraction = ingest_clean.extract_xlsx(content)
+        return ParsedDocument(
+            text=extraction.text,
+            backend=extraction.backend,
+            warnings=list(extraction.warnings),
+        )
+
     raise ValueError(f"不支持的文件格式: .{extension}")
 
 
@@ -120,13 +141,42 @@ class KnowledgeService:
         self.embedding = EmbeddingService()
         self.retriever = retriever or HybridRetriever(embedding=self.embedding)
 
-    async def get_documents(self, db: Session, workspace_id: str) -> list[dict]:
-        documents = (
-            db.query(Document)
-            .filter(Document.workspace_id == workspace_id)
+    async def get_documents(
+        self,
+        db: Session,
+        workspace_id: str,
+        viewer_id: str | None = None,
+        *,
+        include_member_private: bool = False,
+    ) -> list[dict]:
+        """列出可见文档：工作区共享 + 自己的私有（+ admin 看到成员的私有）。
+
+        这是**管理列表**,范围由 ``workspace_service.listable_documents`` 定义,而它
+        和检索作用域(``HybridRetriever._retrievable_by``)从 2026-08-24 起有意不同:
+        ``include_member_private=True`` 时 admin 会多列出成员的私有文档,那些文档
+        **不进他的检索**。所以每一行都带 ``retrievable``,让界面能把"看得见"和
+        "会被引用"分开说——两者混在一起时,admin 看到一堆文档却问不出内容,
+        只会以为检索坏了。
+
+        ``include_member_private`` 默认 False:漏传只是 admin 少看几篇,反过来则是
+        把私有文档列给普通成员。调用方按 ``workspace_service.is_admin(user)`` 传。
+        """
+        query = (
+            db.query(Document, User.name, User.username, User.email)
+            # outerjoin 而不是 join:``user_id`` 可空(旧数据、以及删用户时
+            # ondelete="SET NULL"),内连接会把那些文档整行从列表里吃掉——
+            # 而共享文档丢失一行比拿不到上传者名字严重得多。
+            .outerjoin(User, Document.user_id == User.id)
+            .filter(
+                workspace_service.listable_documents(
+                    workspace_id,
+                    viewer_id,
+                    include_member_private=include_member_private,
+                )
+            )
             .order_by(Document.created_at.desc())
-            .all()
         )
+        rows = query.all()
         return [
             {
                 "id": document.id,
@@ -134,18 +184,41 @@ class KnowledgeService:
                 "size": document.size,
                 "chunks": document.chunks,
                 "status": document.status,
+                # 可见性与归属:界面要据此显示"共享/个人"标记,并决定删除按钮
+                # 给不给点。isOwn 由后端算而不是前端比 user_id——前端手上不一定
+                # 有当前用户 id,而这个判断错了就是一个能点但会 403 的按钮。
+                "visibility": document.visibility,
+                "isOwn": bool(viewer_id) and document.user_id == viewer_id,
+                # 上传者显示名。工作区成员列表里本来就有全体成员的名字,所以这
+                # 不是新泄露的信息;它的用处是 admin 在列表里看到一篇别人的私有
+                # 文档时,知道该找谁,而不是只看到一个不能删的文件名。
+                "ownerName": name or username or email,
+                # 原上传者的账号已被删除,这篇是被收编成共享的
+                # (workspace_service.adopt_orphaned_documents)。判据是"共享但没有
+                # 上传者"——正常上传总会带 uploader_id,所以这个组合只可能来自收编。
+                # 界面据此打「继承」标记:admin 需要知道这不是团队有意发布的资料,
+                # 而是某个离开的人留下的,值得看一眼再决定删或留。
+                "inherited": document.visibility == VISIBILITY_WORKSPACE
+                and document.user_id is None,
+                # 这一篇会不会进**当前查看者**的检索。admin 列表里成员的私有文档
+                # 是 False——它可见但不参与他的回答。判据必须和
+                # HybridRetriever._retrievable_by 一致,test_document_visibility
+                # 里有一条断言拿真实检索结果把它对上。
+                "retrievable": document.visibility == VISIBILITY_WORKSPACE
+                or (bool(viewer_id) and document.user_id == viewer_id),
                 # 解析后端与告警一起返回:一篇 failed 的文档光看状态说不清是编码坏了、
                 # 是扫描件还是 embedding 挂了,而这三者的处理办法完全不同
                 "parseBackend": document.parse_backend,
                 "parseWarnings": _load_warnings(document.parse_warnings),
                 "createdAt": document.created_at.isoformat(),
             }
-            for document in documents
+            for document, name, username, email in rows
         ]
 
     async def create_document(
         self, db: Session, filename: str, content: bytes, workspace_id: str,
         uploader_id: str | None = None,
+        visibility: str = "workspace",
     ) -> tuple[Document, bool]:
         """解析并落库，状态置 processing。分块与向量化交给 index_document。
 
@@ -153,18 +226,23 @@ class KnowledgeService:
         重复上传同一内容时返回已有文档,不再多建一套 chunk——重复文档会在
         检索时占据 top_k 的多个席位,把其他文档挤出去。唯一例外是已有文档
         状态为 failed:那说明上次索引没建成,删掉重建等于给了重试入口。
+
+        **去重范围含可见性作用域**:共享文档按整个工作区去重,私有文档按上传者
+        本人去重。只按 (工作区, 哈希) 去重会让第二个人上传同一份文件时拿到
+        **第一个人的私有文档**——既是越权也是错误的复用。而共享与私有之间不去重:
+        同一份内容既是团队资产又是某人的私有副本,是两篇不同归属的文档。
         """
         parsed = parse_document(filename, content)
         content_hash = hashlib.sha256(parsed.text.encode("utf-8")).hexdigest()
 
-        existing = (
-            db.query(Document)
-            .filter(
-                Document.workspace_id == workspace_id,
-                Document.content_hash == content_hash,
-            )
-            .first()
+        duplicate_query = db.query(Document).filter(
+            Document.workspace_id == workspace_id,
+            Document.content_hash == content_hash,
+            Document.visibility == visibility,
         )
+        if visibility == "private":
+            duplicate_query = duplicate_query.filter(Document.user_id == uploader_id)
+        existing = duplicate_query.first()
         if existing is not None:
             if existing.status != "failed":
                 return existing, True
@@ -178,6 +256,7 @@ class KnowledgeService:
             content=parsed.text,
             workspace_id=workspace_id,
             user_id=uploader_id,
+            visibility=visibility,
             status="processing",
             content_hash=content_hash,
             parse_backend=parsed.backend[:32],
@@ -232,6 +311,18 @@ class KnowledgeService:
                     f"Embedding 数量不匹配：期望 {len(chunks)}，实际 {len(embeddings)}"
                 )
 
+            # 先删掉这篇文档已有的分块,再写新的。少了这一步,重新索引就是
+            # **追加**:分块数翻倍,而 document.chunks 只记本次的数量,于是元数据
+            # 说 7、库里有 14。它不抛异常、不改状态,只让重复分块挤占 top_k——
+            # 2026-08-23 在 eval 语料上实测 6 篇老文档全部翻倍(14/7、10/5),
+            # 喂给重排的 20 条候选里 6 条是重复的。见 tests/test_reindex_duplicates.py
+            #
+            # 放在 embedding 之后:向量化失败时走 except 分支回滚,旧分块还在,
+            # 文档退回 failed 但检索不至于中途变空。
+            db.query(DocumentChunk).filter(
+                DocumentChunk.document_id == document.id
+            ).delete(synchronize_session=False)
+
             for chunk, vector in zip(chunks, embeddings):
                 db.add(
                     DocumentChunk(
@@ -248,9 +339,15 @@ class KnowledgeService:
             document.parse_warnings = _dump_warnings(warnings)
             db.commit()
             # 知识库变了，旧答案可能已经错了：整桶清掉而不是逐条判断。
-            # 作用域是工作区:一个成员上传,全体成员的缓存都要失效
+            # 作用域是工作区:一个成员上传共享文档,全体成员的缓存都要失效
             invalidate_scope_indexes(document.workspace_id)
             semantic_cache.invalidate_user(document.workspace_id)
+            # 私有文档还要按**人**清一次:它跟着人走,而这个人此刻所在的工作区
+            # 未必是文档的 workspace_id(可能是他在上一个空间里传的)。
+            # 漏掉的症状是刚传完的个人文档搜不到,而它明明 indexed 了。
+            if document.visibility == "private" and document.user_id:
+                invalidate_viewer_indexes(document.user_id)
+                semantic_cache.invalidate_viewer(document.user_id)
 
             # 向量库是**持久态**,必须在这里同步写。进程内索引是派生态、丢了重建
             # 就行,而 Qdrant 里少一批点就是真的少了——靠下一次检索去兜是兜不住的,
@@ -412,30 +509,51 @@ class KnowledgeService:
     async def upload_document(
         self, db: Session, filename: str, content: bytes, workspace_id: str,
         uploader_id: str | None = None,
+        visibility: str = "workspace",
     ) -> Document:
-        """同步上传：解析、落库、立即索引。上传接口现在走异步路径，这里保留给脚本使用。"""
-        document, _duplicate = await self.create_document(db, filename, content, workspace_id, uploader_id)
+        """同步上传：解析、落库、立即索引。上传接口现在走异步路径，这里保留给脚本使用。
+
+        命中内容去重且已索引好时**不再重建索引**。``create_document`` 的去重只
+        避免了多建一行 Document,如果这里照旧调 ``index_document``,分块仍然会
+        被重算一遍——修好追加问题之后那不再翻倍,但它是一次白花的 embedding
+        调用(``ensure_corpus`` 每次重建对 13 篇全量重传,等于整批白算)。
+        """
+        document, duplicate = await self.create_document(
+            db, filename, content, workspace_id, uploader_id, visibility=visibility
+        )
+        if duplicate and document.status == "indexed":
+            return document
         await self.index_document(db, document.id)
         db.refresh(document)
         return document
 
     async def retrieve(
-        self, db: Session, query: str, workspace_id: str, top_k: int = 5
+        self, db: Session, query: str, workspace_id: str, top_k: int = 5,
+        viewer_id: str | None = None,
     ) -> list[RetrievedChunk]:
-        return await self.retriever.retrieve(db, workspace_id, query, top_k=top_k)
+        """``viewer_id`` 决定能看到哪些私有文档；不传只检索共享文档。
+
+        默认收紧的理由见 ``HybridRetriever.retrieve``：漏传是"少检索到自己的东西"，
+        反过来是越权。
+        """
+        return await self.retriever.retrieve(
+            db, workspace_id, query, top_k=top_k, viewer_id=viewer_id
+        )
 
     async def search(
-        self, db: Session, query: str, workspace_id: str, top_k: int = 5
+        self, db: Session, query: str, workspace_id: str, top_k: int = 5,
+        viewer_id: str | None = None,
     ) -> list[dict]:
         """检索接口，返回可直接 JSON 序列化的结果。"""
-        chunks = await self.retrieve(db, query, workspace_id, top_k)
+        chunks = await self.retrieve(db, query, workspace_id, top_k, viewer_id=viewer_id)
         return [chunk.as_dict() for chunk in chunks]
 
     async def build_rag_context_with_citations(
-        self, db: Session, query: str, workspace_id: str, top_k: int = 5
+        self, db: Session, query: str, workspace_id: str, top_k: int = 5,
+        viewer_id: str | None = None,
     ) -> tuple[str, list[dict]]:
         """返回 (喂给模型的参考内容, 结构化引用列表)。"""
-        chunks = await self.retrieve(db, query, workspace_id, top_k)
+        chunks = await self.retrieve(db, query, workspace_id, top_k, viewer_id=viewer_id)
         return format_context(chunks), [chunk.as_dict() for chunk in chunks]
 
     async def build_rag_context(
@@ -482,19 +600,75 @@ class KnowledgeService:
             for chunk in chunks
         ]
 
-    async def delete_document(self, db: Session, doc_id: str, workspace_id: str) -> bool:
-        """删除文档及其所有分块（cascade），并让该工作区的索引失效。"""
-        document = (
+    async def find_document(
+        self,
+        db: Session,
+        doc_id: str,
+        workspace_id: str,
+        viewer_id: str | None = None,
+        *,
+        include_member_private: bool = False,
+    ) -> Document | None:
+        """按 id 取一篇**这个人看得见的**文档。
+
+        单独一个方法是为了让路由能在删除**之前**拿到文档做权限判断
+        （``workspace_service.require_can_modify`` 需要 ``visibility`` 与 ``user_id``）。
+        把权限判断塞进 ``delete_document`` 会让服务层依赖"当前用户"这个概念，
+        而它现在只依赖工作区——那条边界值得保留。
+
+        可见范围和 ``get_documents`` 共用 ``listable_documents``，两处不一致就会出现
+        **能看见但删不掉**：私有文档跟人走，一个人换工作区之后旧空间里的私有文档
+        仍然列得出来，而这里只按当前 ``workspace_id`` 查就找不到它，删除报 404。
+
+        ``include_member_private=True`` 时 admin 也能取到成员的私有文档。**这不是
+        给他删除权**——``require_can_modify`` 仍然会拒。让他取得到只是为了错误码
+        诚实：那一篇明明在他的列表里，报 404 说"不存在"是撒谎，403 说"这是他人的
+        个人文档"才是真话。
+        """
+        return (
             db.query(Document)
-            .filter(Document.id == doc_id, Document.workspace_id == workspace_id)
+            .filter(
+                Document.id == doc_id,
+                workspace_service.listable_documents(
+                    workspace_id,
+                    viewer_id,
+                    include_member_private=include_member_private,
+                ),
+            )
             .first()
         )
+
+    async def delete_document(
+        self, db: Session, doc_id: str, workspace_id: str, viewer_id: str | None = None
+    ) -> bool:
+        """删除文档及其所有分块（cascade），并让相关索引失效。
+
+        **不做权限判断**——调用方必须先过 ``require_can_modify``。这里只保证
+        "看不见的删不掉"。放在这里会让服务层需要知道当前用户是谁，见 ``find_document``。
+
+        失效要清两处，因为私有文档跟人走：文档**自己所属**的工作区（共享文档的
+        读者都在那里），以及**所有者本人**的桶（他可能正在另一个工作区里检索）。
+        只清一处的症状是删了还能搜到，而这恰好是最不该留的残留。
+        """
+        # 刻意**不**传 include_member_private:这一层的职责是"看不见的删不掉",
+        # 而删除的可见范围就该是最窄的那个。路由为了给出诚实的 403 会带上 admin
+        # 的管理可见性,但那只影响它自己那次查询;真要有人绕过 require_can_modify
+        # 直接调到这里,成员的私有文档在这一句就查不出来,删除返回 False。
+        document = await self.find_document(db, doc_id, workspace_id, viewer_id)
         if not document:
             return False
+        owner_id = document.user_id
+        document_workspace = document.workspace_id or workspace_id
         db.delete(document)
         db.commit()
-        invalidate_scope_indexes(workspace_id)
-        semantic_cache.invalidate_user(workspace_id)
+        for scope in {document_workspace, workspace_id}:
+            invalidate_scope_indexes(scope)
+            semantic_cache.invalidate_user(scope)
+        if owner_id:
+            # 按用户清：这个人的桶键是 ``<他当前所在工作区>|<他>``，而那个工作区
+            # 未必是文档所属的那个。invalidate_by_viewer 扫的是键的后半段。
+            invalidate_viewer_indexes(owner_id)
+            semantic_cache.invalidate_viewer(owner_id)
         # MySQL 那边是 ON DELETE CASCADE，Qdrant 没有外键，所以这一步必须显式做。
         # 漏掉的后果是删掉的文档还能被召回，而 retriever 的 `if chunk_id in by_id`
         # 会把它静默丢掉——表现是 top_k 少了几条，没有任何报错。

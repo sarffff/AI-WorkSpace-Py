@@ -39,7 +39,19 @@ MAX_CHARS = 4096
 
 
 class RerankError(RuntimeError):
-    """重排通道故障。调用方应当退回融合序，而不是让整次检索失败。"""
+    """重排通道故障。调用方应当退回融合序，而不是让整次检索失败。
+
+    ``code`` 是给**机器**看的简短分类（``http_429`` / ``timeout`` /
+    ``unconfigured``…），消息是给人看的。分开是因为 eval 要把降级原因汇总进报告，
+    而按消息文本分组等于拿人类可读的句子当枚举用——改一个字就把历史数据割开了。
+
+    不要把 provider 返回的原始消息塞进 ``code``：那一类消息里可能带上完整请求
+    （含 Authorization 头），而 ``code`` 会进报告和埋点。
+    """
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _clip(text: str) -> str:
@@ -132,10 +144,45 @@ class RerankClient:
                 response = await client.post(self.endpoint, headers=headers, json=body)
                 response.raise_for_status()
                 data = response.json()
+        except httpx.HTTPStatusError as exc:
+            # 状态码必须记：401/429/400 指向三种完全不同的处理动作（换 key /
+            # 开额度 / 改模型名），而只记异常类型的话它们在日志里长得一模一样。
+            #
+            # 2026-08-23 就是这么踩的：智谱 /rerank 返 429，被当成"重排没有增益"
+            # 读了很久。诊断靠的是换模型名对比——429/1113 是额度、400/1211 是
+            # 模型不存在。所以这里也把 provider 的 code 带出来（它在响应体里，
+            # 与 Authorization 头无关，不会回显凭证）。
+            status = exc.response.status_code
+            code = None
+            try:
+                payload = exc.response.json()
+                if isinstance(payload, dict):
+                    error = payload.get("error")
+                    if isinstance(error, dict):
+                        code = error.get("code")
+            except Exception:
+                pass
+            hint = {
+                401: "凭证无效——检查 RERANK_API_KEY 是否属于 RERANK_BASE_URL 那一家",
+                403: "凭证无权访问该模型",
+                404: "端点不存在——检查 RERANK_BASE_URL 是否需要 /v1 前缀",
+                429: "额度或频率受限——账号可能没开通该项服务",
+            }.get(status, "")
+            logger.warning(
+                "rerank request failed: HTTP %s provider_code=%s model=%s %s",
+                status, code, settings.RERANK_MODEL, hint,
+            )
+            # code 里带上 provider code：429/1113(额度没开通)和 429/普通限流
+            # 的处理动作不同,前者换端点、后者重试
+            raise RerankError(
+                f"重排请求失败 (HTTP {status})",
+                code=f"http_{status}" + (f"_{code}" if code else ""),
+            ) from exc
         except Exception as exc:
-            # 不记异常消息：错误体可能回显 Authorization 头或 key
+            # 超时、连接失败、JSON 解析失败等。不记异常消息：这一类的消息里
+            # 可能带上完整请求（含 Authorization 头）。
             logger.warning("rerank request failed: %s", type(exc).__name__)
-            raise RerankError("重排请求失败") from exc
+            raise RerankError("重排请求失败", code=type(exc).__name__) from exc
 
         if not isinstance(data, dict):
             raise RerankError("重排返回了无法解析的响应")

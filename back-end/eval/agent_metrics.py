@@ -105,3 +105,29 @@ def repeated_calls(calls: list[tuple[str, str]]) -> int:
     那种情况该由 ``forbidden_hits`` 或裁判抓，不该混进这里当成同一件事。
     """
     return len(calls) - len(set(calls))
+
+
+def plan_adherence(planned_tools: list[str], actual: list[str]) -> float | None:
+    """计划里点名的工具，实际调了几成。
+
+    没开规划、或者计划里一个工具都没点名（纯推理步骤）时返回 ``None`` 而不是
+    0 或 1：那种情况下这个指标没有标的，填任何数字都会污染均值。这和
+    ``tool_precision`` 对"什么都没调"返回 None 是同一条规矩。
+
+    为什么用"点名的工具调没调"而不是"步骤完成没完成"：**没有可靠信号说明一个
+    步骤完成了。** 一轮里可能并行调三个工具，也可能一轮什么都没做完，所以按轮次
+    推一个 step 游标只会得到一个看起来精确的假数字（同 ``round_efficiency`` 把
+    ``min_rounds`` 标大之后的情形：错了也看不出来）。而"计划说要用 X，事件流里
+    有没有 X"是从已经在收集的数据里就能算出来的事实。
+
+    按集合算而不是按次数：计划说"用 search_knowledge_base 查报销时限"，模型查了
+    三次不同的查询词，那是执行细节，不是更遵守计划。重复的浪费由
+    ``repeated_calls`` 负责。
+
+    读法上要和 ``planSteps`` 一起看：0 步的时候这里是 None，而 0 步既可能是
+    "模型判断不用分步"（正确），也可能是"规划调用静默失效了"（故障）。
+    """
+    wanted = {name for name in planned_tools if name}
+    if not wanted:
+        return None
+    return len(wanted & set(actual)) / len(wanted)

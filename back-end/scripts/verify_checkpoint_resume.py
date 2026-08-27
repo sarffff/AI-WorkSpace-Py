@@ -146,7 +146,7 @@ def fresh_db():
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine, future=True)()
     now = naive_now()
-    workspace = Workspace(id="w1", name="验证空间", invite_code="VERIFY01", created_at=now)
+    workspace = Workspace(id="w1", name="验证空间", created_at=now)
     session.add(workspace)
     session.add(
         User(

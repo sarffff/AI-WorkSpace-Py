@@ -1,0 +1,6 @@
+{
+  "approvedBuilds": [
+    "electron",
+    "esbuild"
+  ]
+}

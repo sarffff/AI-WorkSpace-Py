@@ -256,6 +256,20 @@ VARIANTS: dict[str, Variant] = {
             "INGEST_CLEAN": True,
         },
     ),
+    # C) format-docx——既不是"脏"也不是"清洗"，量的是**我们的解析器保真吗**。
+    #    和 dirty-pdf-like 正好相反：那个刻意丢结构，这个刻意保留结构。
+    "format-docx": Variant(
+        name="format-docx",
+        description=(
+            "语料转成真 .docx 上传（标题→Heading 样式、Markdown 表格→Word 表格），"
+            "走 services/ingest_clean.extract_docx 读回来。md→docx→解析是一条近乎"
+            "恒等的往返，所以**预期贴着 baseline**；掉下来就是解析器丢了真东西"
+            "（标题层级没识别、表格被搬到文末、单元格换行没压平），而这些症状在"
+            "单元测试里都表现为「能读出文字」所以全绿。"
+            "重点看 recallByProbe 的 table_lookup：6 条金标里 5 条的答案在表格里"
+        ),
+        overrides={**_BASE, "EVAL_CORPUS_DEGRADE": "docx"},
+    ),
     "dirty-scanned": Variant(
         name="dirty-scanned",
         description=(

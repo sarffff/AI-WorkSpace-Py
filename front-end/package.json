@@ -53,7 +53,7 @@
   },
   "build": {
     "appId": "com.ai-workspace.desktop",
-    "productName": "AI Workspace",
+    "productName": "有据工作台",
     "directories": {
       "output": "release"
     },
