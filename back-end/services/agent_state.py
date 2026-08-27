@@ -39,12 +39,27 @@ Phase = Literal[
     "pre_tools",
     # 卡在某个需要审批的工具之前，等用户裁决
     "waiting_approval",
+    # 卡在 ask_user 之后，等用户回答那个澄清问题
+    "waiting_input",
     # 本轮工具全部执行完，即将进入下一轮模型调用
     "post_tools",
 ]
 
-# 运行状态。``waiting_approval`` 是唯一一个"进程里没有它、但它还活着"的状态
-RunStatus = Literal["running", "waiting_approval", "done", "failed", "abandoned"]
+# 运行状态。``waiting_approval`` / ``waiting_input`` 是"进程里没有它、但它还活着"
+# 的两个状态——都靠快照跨过 HTTP 请求边界。
+#
+# 两者的区别在于**回灌什么**：审批回灌的是"这次执行了/没执行"，澄清回灌的是
+# 用户写的那句话，它要以 ``role=tool`` 的身份接在模型那次 ask_user 调用后面。
+# 走 role=user 的话模型看到的是"有人插了句话"，而不是"我问的问题有答案了"，
+# 它会倾向于重新组织整个回答，而不是拿着答案接着做原来那件事。
+RunStatus = Literal[
+    "running",
+    "waiting_approval",
+    "waiting_input",
+    "done",
+    "failed",
+    "abandoned",
+]
 
 
 @dataclass(slots=True)
@@ -56,9 +71,16 @@ class InterruptRequest:
     内容多了一个展示位。
     """
 
-    kind: Literal["tool_approval"]
+    # ``tool_approval``：等一次裁决（同意/改了再同意/拒绝）。
+    # ``user_input``：等一句回答（模型调了 ask_user）。
+    #
+    # 用同一个 dataclass 承载两种中断，是因为它们要的机制完全一样：落快照、
+    # 跨 HTTP 请求、恢复时重建工具面并拨回余额。分成两个类会让 checkpoint_store
+    # 和 resume 路径各写两遍。差别只在恢复时回灌什么，那是 resume 的事。
+    kind: Literal["tool_approval", "user_input"]
     tool: str
-    # 完整参数，审批界面据此展示"到底要写什么/删什么"
+    # 完整参数，审批界面据此展示"到底要写什么/删什么"；
+    # ``user_input`` 时这里是 {"question": "..."}
     arguments: dict[str, Any]
     # 这次调用在本轮 pending_calls 里的下标。恢复时要从这里接着跑
     call_index: int
@@ -164,6 +186,20 @@ class TurnState:
     # 而不是把整个回合的授权都打开
     approved_call_ids: list[str] = field(default_factory=list)
     rejected_call_ids: list[str] = field(default_factory=list)
+    # 用户改过的参数，call_key -> JSON 字符串。
+    #
+    # 为什么必须存在这里，而不是就地改 messages 里那条 tool_calls：主循环每一轮
+    # 都从 ``call.arguments`` 重新 ``json.loads``（见 chat_service 的闸门），所以
+    # 改 dict 是留不住的——恢复时读到的还是模型原来那份。
+    #
+    # 为什么存字符串而不是 dict：``ToolRuntime.execute`` 校验的是
+    # ``call.arguments`` 这个**字符串**。存字符串、执行前写回 ``call.arguments``，
+    # 用户改过的参数就和模型写的走**同一条校验路径**。存 dict 再绕过校验塞进去，
+    # 等于给客户端开了一条免检写入通道。
+    edited_arguments: dict[str, str] = field(default_factory=dict)
+    # ask_user 的回答，call_key -> 用户原话（已过 mask_markup）。
+    # 和 edited_arguments 同一个思路：主循环每轮重跑，答案不能只活在闭包里。
+    clarification_answers: dict[str, str] = field(default_factory=dict)
     # 用户拒绝时留下的话。会随拒绝结果回灌给模型——那通常正好是它需要的
     # 修改方向（"别写进知识库，先给我看看"）
     interrupt_note: str = ""

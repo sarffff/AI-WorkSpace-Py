@@ -28,6 +28,8 @@ import logging
 import re
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import date, datetime
+from typing import Any
 
 from config import settings
 
@@ -569,5 +571,312 @@ def extract_pdf_plain(content: bytes, warnings: list[str]) -> PdfExtraction:
         text=clean_text(text) if settings.INGEST_CLEAN else text,
         pages=pages,
         backend="pypdf2",
+        warnings=warnings,
+    )
+
+
+# ========== .docx ==========
+# 渲染成 Markdown，而不是新开一条结构路径。
+#
+# 理由是 chunking 那边已经有两套机制吃 Markdown 标题：给每块加标题路径
+# （contextual chunk）、以及章节边界优先于填满 max_tokens。而
+# ``_looks_like_markdown`` 在扩展名不匹配时会回退扫前 200 行找 `#`，所以一份
+# 渲染出标题的 .docx 会自动走上那条路——不需要给 chunking 传任何新参数。
+#
+# 这也和 PDF 那条路径一致：``extract_pdf`` 同样是从字号恢复层级、发出 `#` 标题。
+# docx 反而更简单，层级在段落样式名里是显式的，不必猜。
+
+# Word 的标题样式名。中文版 Word 存的是本地化名字，两种都认——只认英文的话
+# 一份中文 Word 文档会一个标题都识别不出来，然后静默退化成"无标题的长文本"，
+# 症状就是 heading_path 恒为空、章节边界优先不生效。
+_DOCX_HEADING_STYLES = ("heading", "标题")
+
+
+def _docx_heading_level(style_name: str) -> int:
+    """从段落样式名取标题层级。0 表示正文。
+
+    形状是 ``Heading 1`` / ``标题 1``。``Title`` 与 ``Subtitle`` 不在内：
+    它们是封面元素，映射成 h1 会让整篇文档挂在一个"标题"下面，等于没有层级。
+    """
+    lowered = (style_name or "").strip().lower()
+    for prefix in _DOCX_HEADING_STYLES:
+        if lowered.startswith(prefix):
+            tail = lowered[len(prefix):].strip()
+            if tail.isdigit():
+                return min(6, max(1, int(tail)))
+    return 0
+
+
+def _docx_render_table(table: Any) -> str:
+    """把表格渲染成 Markdown 表格。
+
+    保留表格形状而不是拉平成句子：表头是**每一行都需要的上下文**，拉平之后
+    "30 天" 这种单元格会脱离它的列名，检索命中了也答不出来。Markdown 表格能让
+    表头和数据行留在同一个块里（分块按行不按字符切），也让模型看得懂列关系。
+
+    xlsx 会走另一套（每行渲染成 `列名: 值`），那是块 4 的事：Excel 的一张表
+    动辄几百行，Markdown 表格会被 max_tokens 拦腰截断，反而丢掉表头。
+    """
+    rows: list[list[str]] = []
+    for row in table.rows:
+        cells = [" ".join(cell.text.split()) for cell in row.cells]
+        if any(cells):
+            rows.append(cells)
+    if not rows:
+        return ""
+
+    width = max(len(row) for row in rows)
+    rows = [row + [""] * (width - len(row)) for row in rows]
+    lines = ["| " + " | ".join(rows[0]) + " |"]
+    lines.append("| " + " | ".join("---" for _ in range(width)) + " |")
+    for row in rows[1:]:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+def extract_docx(content: bytes) -> PdfExtraction:
+    """抽取 .docx：段落 + 表格，标题渲染成 Markdown。
+
+    复用 ``PdfExtraction`` 而不是新建一个 dataclass：字段需求完全一致
+    （text / backend / warnings），而 ``pages`` 对 docx 没有意义所以留 0——
+    Word 的分页是渲染期决定的，文件里没有这个信息。为此加一个几乎相同的
+    类型，只会让 ``parse_document`` 里多一条分支去合并两种返回值。
+
+    ``warnings`` 沿用 PDF 那套词汇（``headings_recovered:N`` /
+    ``no_headings_detected``），这样入库自检和界面不必分格式各写一套判断。
+    """
+    warnings: list[str] = []
+    try:
+        import docx
+    except ImportError:
+        raise ValueError("Word 文档解析需要安装 python-docx 库")
+
+    try:
+        document = docx.Document(io.BytesIO(content))
+    except Exception as exc:
+        # 同 extract_pdf_plain：抛 ValueError 让路由转 400。
+        # "这不是一个有效的 docx"是用户错误，不是服务错误。
+        # 典型输入是把 .doc（老二进制格式）改名成 .docx——那读不了，
+        # 而错误文案必须说清楚，否则用户会反复重传同一个文件。
+        logger.warning("docx extraction failed: %s", type(exc).__name__)
+        raise ValueError(
+            "无法解析该 Word 文档。请确认它是 .docx（Word 2007 以后的格式）；"
+            "老的 .doc 需要先另存为 .docx"
+        ) from exc
+
+    blocks: list[str] = []
+    headings = 0
+    tables = 0
+
+    # 按文档流顺序遍历 body，而不是先 paragraphs 再 tables。
+    # python-docx 的 ``document.paragraphs`` 与 ``document.tables`` 是两个独立
+    # 列表，分别遍历会把所有表格搬到文末——表格于是脱离了它所属的小节，
+    # 而标题路径正是按出现顺序算的。那样"报销标准"那张表会挂到最后一个标题下面。
+    for child in document.element.body.iterchildren():
+        tag = child.tag.split("}")[-1]
+        if tag == "p":
+            paragraph = docx.text.paragraph.Paragraph(child, document)
+            text = paragraph.text.strip()
+            if not text:
+                continue
+            level = _docx_heading_level(
+                paragraph.style.name if paragraph.style is not None else ""
+            )
+            if level:
+                headings += 1
+                blocks.append("#" * level + " " + text)
+            else:
+                blocks.append(text)
+        elif tag == "tbl":
+            table = docx.table.Table(child, document)
+            rendered = _docx_render_table(table)
+            if rendered:
+                tables += 1
+                blocks.append(rendered)
+
+    if headings:
+        warnings.append(f"headings_recovered:{headings}")
+    else:
+        # 同 PDF：没有标题就意味着 heading_path 恒为空、章节边界优先不生效。
+        # 对 Word 来说这通常是"作者用加粗大字号代替了标题样式"——很常见，
+        # 而它对检索质量的影响是实打实的，所以必须留痕。
+        warnings.append("no_headings_detected")
+    if tables:
+        warnings.append(f"tables_extracted:{tables}")
+    if not blocks:
+        # 有文件、但一个段落一张表都没抽到。对应 PDF 的 no_text_layer：
+        # 几乎一定是整篇内容都在文本框/图片里，而那两种 python-docx 读不到。
+        # 不抛异常——它是一篇合法的 docx，只是对检索没有价值，
+        # 靠 warning + 入库自检兜住，别静默变成 chunks=0 的 indexed 文档。
+        warnings.append("no_extractable_text")
+
+    text = "\n\n".join(blocks)
+    return PdfExtraction(
+        text=clean_text(text) if settings.INGEST_CLEAN else text,
+        pages=0,
+        backend="python-docx",
+        warnings=warnings,
+    )
+
+
+# ========== .xlsx ==========
+# docx 的表格渲染成 Markdown 表格，xlsx **不能**照抄。这是块 4 唯一的真实取舍。
+#
+# 一张 Excel 表动辄几百行。渲染成 Markdown 表格的话：
+#   - 表头只在第一行出现一次，而 max_tokens 默认 320，几十行就要断开；
+#   - 断开之后从第二块起全是裸数据行，"500" 脱离了"住宿标准"这个列名。
+#     检索命中了也答不出问题——这正是保留表格形状本来想避免的事。
+#
+# 所以每行**自带列名**渲染成 `列名: 值 | 列名: 值`：
+#   - 每一行都是自足的，切在哪都不会丢上下文；
+#   - 行之间用空行分隔 → ``_parse_blocks`` 遇空行 flush，每行成为独立 block；
+#   - 行内不用句末标点（`：` 是全角冒号不在 ``_SENTENCE_RE`` 里，分隔用 `|`），
+#     所以 ``_split_units`` 的句子切分不会从行中间切开。
+#
+# 代价是重复：列名在每一行都出现一次，token 数比 Markdown 表格高。
+# 换来的是"任何一块都能独立回答问题"，对检索这是划算的——冗余的是提示词成本，
+# 而丢上下文是答不出来。
+
+# 一张表最多读多少行。不是性能考虑（read_only 是流式的），是**信噪比**：
+# 上万行的明细表进知识库，检索时会用几百个近乎相同的块淹掉其它文档。
+# 超出就截断并留 warning——静默截断是这个仓库里最不能接受的一类行为。
+_XLSX_MAX_ROWS = 500
+# 一张表最多读多少列。超宽表通常是把多张表拼在一起，取前 N 列已经够用。
+_XLSX_MAX_COLS = 50
+
+
+def _xlsx_cell_text(value: Any) -> str:
+    """把单元格值转成文本。
+
+    ``datetime`` 单独处理：默认的 ``str()`` 会给出 ``2026-08-24 00:00:00``，
+    那个恒为零的时间部分是噪声，也会让 BM25 多出一堆无意义词元。
+    ``float`` 的整数值同理——``100.0`` 应当是 ``100``，否则"每日 100 元"这类
+    查询字面匹配不上。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        if value.hour or value.minute or value.second:
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return " ".join(str(value).split())
+
+
+def _xlsx_header_row(rows: list[list[str]]) -> tuple[list[str], int]:
+    """挑出表头行，返回 ``(列名, 数据起始下标)``。
+
+    不是无脑取第一行：真实的表格常常第一行是标题（"2026 年差旅标准"，只占 A1，
+    后面全空），表头在第二行。判据是"非空单元格最多的那一行"，只在前 5 行里找。
+
+    找错的后果不是报错，是每一行都带上错的列名——一整篇文档静默变成噪声。
+    所以宁可用一个能解释的启发式，也不要"第一行就是表头"这个会安静出错的假设。
+    """
+    limit = min(5, len(rows))
+    best_index = 0
+    best_filled = -1
+    for index in range(limit):
+        filled = sum(1 for cell in rows[index] if cell)
+        # 严格大于：并列时取更靠上的那一行，表头一般在数据之上
+        if filled > best_filled:
+            best_filled = filled
+            best_index = index
+    header = [cell or f"第{position + 1}列" for position, cell in enumerate(rows[best_index])]
+    return header, best_index + 1
+
+
+def extract_xlsx(content: bytes) -> PdfExtraction:
+    """抽取 .xlsx：每张工作表一个二级标题，每行一个自足的 ``列名: 值`` 块。
+
+    复用 ``PdfExtraction``（理由同 ``extract_docx``），``pages`` 借用来记工作表数——
+    这是它对 Excel 唯一说得通的含义。
+    """
+    warnings: list[str] = []
+    try:
+        import openpyxl
+    except ImportError:
+        raise ValueError("Excel 文档解析需要安装 openpyxl 库")
+
+    try:
+        # data_only=True 取公式的**缓存值**而不是 "=SUM(B2:B9)" 这个字符串。
+        #
+        # 已知限制（没有修，代价不划算）：文件如果从未被 Excel 打开过（程序生成的
+        # 就是这样），公式单元格没有缓存值，取到 None——那一列会整列变空，
+        # 而这里区分不出"空单元格"和"公式没缓存值"：data_only 模式下 openpyxl
+        # 直接丢掉了公式本身。要分辨就得把工作簿加载两遍（data_only=False 看公式、
+        # True 看值），对几万行的表是双倍开销。
+        # 症状：那一列检索不到，而文档 indexed、chunks 非零。
+        # 真遇到时的处置是让用户用 Excel 打开另存一次。
+        workbook = openpyxl.load_workbook(
+            io.BytesIO(content), read_only=True, data_only=True
+        )
+    except Exception as exc:
+        logger.warning("xlsx extraction failed: %s", type(exc).__name__)
+        raise ValueError(
+            "无法解析该 Excel 文档。请确认它是 .xlsx（Excel 2007 以后的格式）；"
+            "老的 .xls 需要先另存为 .xlsx"
+        ) from exc
+
+    blocks: list[str] = []
+    sheets = 0
+    total_rows = 0
+    truncated: list[str] = []
+
+    try:
+        for sheet in workbook.worksheets:
+            raw: list[list[str]] = []
+            for position, row in enumerate(sheet.iter_rows(values_only=True)):
+                if position >= _XLSX_MAX_ROWS:
+                    truncated.append(sheet.title)
+                    break
+                cells = [_xlsx_cell_text(value) for value in row[:_XLSX_MAX_COLS]]
+                if any(cells):
+                    raw.append(cells)
+            if not raw:
+                continue
+
+            sheets += 1
+            # 工作表名当二级标题：它是这批行的共同上下文（"住宿标准" vs "交通标准"），
+            # 而 chunking 会把它放进每一块的 heading_path。
+            blocks.append(f"## {sheet.title}")
+
+            header, start = _xlsx_header_row(raw)
+            width = len(header)
+            for cells in raw[start:]:
+                padded = cells + [""] * (width - len(cells))
+                # 只保留非空单元格：空值渲染成 `列名: ` 是纯噪声，
+                # 而稀疏表（很多可选列）在真实数据里很常见。
+                pairs = [
+                    f"{header[position]}: {value}"
+                    for position, value in enumerate(padded[:width])
+                    if value
+                ]
+                if pairs:
+                    total_rows += 1
+                    blocks.append(" | ".join(pairs))
+    finally:
+        # read_only 模式持有文件句柄，不关会在 Windows 上把临时文件锁住
+        workbook.close()
+
+    if sheets:
+        warnings.append(f"sheets_extracted:{sheets}")
+        warnings.append(f"rows_extracted:{total_rows}")
+    if truncated:
+        # 截断必须可见。静默丢掉后半张表的症状是"某些条目怎么都检索不到"，
+        # 而文档状态是 indexed、chunks 也非零，看起来一切正常。
+        warnings.append(
+            f"rows_truncated:{_XLSX_MAX_ROWS}:{','.join(sorted(set(truncated)))}"
+        )
+    if not blocks:
+        warnings.append("no_extractable_text")
+
+    text = "\n\n".join(blocks)
+    return PdfExtraction(
+        text=clean_text(text) if settings.INGEST_CLEAN else text,
+        pages=sheets,
+        backend="openpyxl",
         warnings=warnings,
     )

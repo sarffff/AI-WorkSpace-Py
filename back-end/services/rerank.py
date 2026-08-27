@@ -39,7 +39,19 @@ MAX_CHARS = 4096
 
 
 class RerankError(RuntimeError):
-    """重排通道故障。调用方应当退回融合序，而不是让整次检索失败。"""
+    """重排通道故障。调用方应当退回融合序，而不是让整次检索失败。
+
+    ``code`` 是给**机器**看的简短分类（``http_429`` / ``timeout`` /
+    ``unconfigured``…），消息是给人看的。分开是因为 eval 要把降级原因汇总进报告，
+    而按消息文本分组等于拿人类可读的句子当枚举用——改一个字就把历史数据割开了。
+
+    不要把 provider 返回的原始消息塞进 ``code``：那一类消息里可能带上完整请求
+    （含 Authorization 头），而 ``code`` 会进报告和埋点。
+    """
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _clip(text: str) -> str:
@@ -160,12 +172,17 @@ class RerankClient:
                 "rerank request failed: HTTP %s provider_code=%s model=%s %s",
                 status, code, settings.RERANK_MODEL, hint,
             )
-            raise RerankError(f"重排请求失败 (HTTP {status})") from exc
+            # code 里带上 provider code：429/1113(额度没开通)和 429/普通限流
+            # 的处理动作不同,前者换端点、后者重试
+            raise RerankError(
+                f"重排请求失败 (HTTP {status})",
+                code=f"http_{status}" + (f"_{code}" if code else ""),
+            ) from exc
         except Exception as exc:
             # 超时、连接失败、JSON 解析失败等。不记异常消息：这一类的消息里
             # 可能带上完整请求（含 Authorization 头）。
             logger.warning("rerank request failed: %s", type(exc).__name__)
-            raise RerankError("重排请求失败") from exc
+            raise RerankError("重排请求失败", code=type(exc).__name__) from exc
 
         if not isinstance(data, dict):
             raise RerankError("重排返回了无法解析的响应")

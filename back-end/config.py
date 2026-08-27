@@ -336,6 +336,21 @@ class Settings(BaseSettings):
     RERANK_API_KEY: str = ""
     RERANK_TIMEOUT_SECONDS: float = 10.0
 
+    # 辅助模型调用（重排 / HyDE / 多查询改写 / 摘要）的超时与重试上限。
+    #
+    # 2026-08-27 加。此前 ``AsyncOpenAI`` 是不带这两个参数构造的，于是吃 SDK 默认：
+    # **read=600s、max_retries=2 → 最坏一次调用 1800 秒**。实测 rerank 变体
+    # p90 延迟 255 秒、最大 336 秒（baseline 是 37 秒），那个 336 就是重试链。
+    #
+    # 为什么辅助调用要单独设一个更短的值：它们**全都有降级路径**——重排失败退回
+    # 融合序、HyDE 失败用原查询。为一个可以放弃的增强等 10 分钟是纯亏，而且拖慢
+    # 的是用户正在等的那次回答。主回答的调用不受这个约束（用户确实在等它）。
+    #
+    # 60 秒的依据：实测一次 20 候选的 listwise 重排约 32 秒成功，60 秒给一倍余量。
+    # 重试 1 次而不是 2：辅助调用失败退回降级路径比多试一次更划算。
+    LLM_AUXILIARY_TIMEOUT_SECONDS: float = 60.0
+    LLM_AUXILIARY_MAX_RETRIES: int = 1
+
     # HyDE(Hypothetical Document Embeddings):先让辅助模型编一段假答案,拿它去
     # 检索。反直觉但有效——用户的问题和文档的措辞常常不在同一个语域("报销要几天"
     # vs "费用审批时限"),而一段假答案的措辞天然更接近文档。

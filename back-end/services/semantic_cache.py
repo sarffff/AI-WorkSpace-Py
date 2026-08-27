@@ -111,9 +111,32 @@ class _Store:
         if len(bucket) > max_entries:
             del bucket[: len(bucket) - max_entries]
 
-    def drop(self, user_id: str) -> int:
-        removed = len(self._buckets.get(user_id, []))
-        self._buckets.pop(user_id, None)
+    def drop(self, scope_id: str) -> int:
+        """清掉这个作用域的桶,**以及它下面所有按用户细分的桶**。
+
+        桶键现在有两种形状:``ws``(关 RAG 时)与 ``ws|user``(开 RAG 时,因为回答
+        可能引用私有文档)。知识库变化影响的是这个工作区下的每一个桶,只 pop
+        精确键会让所有 ``ws|user`` 桶留着旧答案——症状是"admin 删了文档,
+        别人还能问出它的内容",而那是最不该缓存出来的东西。
+
+        传一个具体的 ``ws|user`` 也合法(只清那个人),前缀匹配对它同样成立。
+        """
+        prefix = f"{scope_id}|"
+        keys = [
+            key for key in self._buckets if key == scope_id or key.startswith(prefix)
+        ]
+        removed = sum(len(self._buckets.get(key, [])) for key in keys)
+        for key in keys:
+            self._buckets.pop(key, None)
+        return removed
+
+    def drop_by_viewer(self, viewer_id: str) -> int:
+        """按桶键的后半段清:``<任意工作区>|<这个人>``。见 invalidate_viewer。"""
+        suffix = f"|{viewer_id}"
+        keys = [key for key in self._buckets if key.endswith(suffix)]
+        removed = sum(len(self._buckets.get(key, [])) for key in keys)
+        for key in keys:
+            self._buckets.pop(key, None)
         return removed
 
     def clear(self) -> None:
@@ -276,6 +299,17 @@ class SemanticCache:
             ),
             settings.SEMANTIC_CACHE_MAX_ENTRIES,
         )
+
+    def invalidate_viewer(self, viewer_id: str) -> int:
+        """清掉某个人的所有桶,不论他在哪个工作区。
+
+        理由同 ``retrieval_index.invalidate_viewer_indexes``:私有文档跟人走,
+        而桶键是 ``<当前工作区>|<人>``,按工作区前缀清不到他在别处留下的桶。
+        """
+        removed = self._store.drop_by_viewer(viewer_id)
+        if removed:
+            logger.info("semantic cache invalidated for viewer: %s entries", removed)
+        return removed
 
     def invalidate_user(self, user_id: str) -> int:
         """知识库变了就把该用户的缓存全清掉。

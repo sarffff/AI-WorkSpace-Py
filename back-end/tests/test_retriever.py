@@ -66,10 +66,14 @@ class StubRetriever(HybridRetriever):
         super().__init__(**kwargs)
         self._rows = rows
 
-    def _load_chunk_ids(self, db, user_id):  # type: ignore[override]
+    # viewer_id 收下但不用：这个替身绕过数据库，可见性过滤本来就发生在 SQL 那一层
+    # （见 HybridRetriever._retrievable_by）。真正测过滤的是 test_visibility。
+    def _load_chunk_ids(self, db, workspace_id, viewer_id=None):  # type: ignore[override]
         return [chunk.id for chunk, _document in self._rows]
 
-    def _load_rows(self, db, user_id, *, with_embeddings=True):  # type: ignore[override]
+    def _load_rows(  # type: ignore[override]
+        self, db, workspace_id, *, with_embeddings=True, viewer_id=None
+    ):
         return self._rows
 
 

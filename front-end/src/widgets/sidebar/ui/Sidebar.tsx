@@ -23,7 +23,6 @@ import {
   Trash2,
   Pencil,
   LogOut,
-  MessageSquare,
   LayoutDashboard,
   Route,
 } from "lucide-react";
@@ -67,22 +66,47 @@ export const Sidebar: React.FC = () => {
     {
       label: "工作区",
       items: [
-        { id: "dashboard", label: "工作台", icon: <LayoutDashboard className="w-4 h-4" />, path: "/dashboard" },
-        { id: "chat", label: "对话", icon: <MessageSquare className="w-4 h-4" />, path: "/chat" },
-        { id: "traces", label: "运行轨迹", icon: <Route className="w-4 h-4" />, path: "/traces" },
+        {
+          id: "dashboard",
+          label: "工作台",
+          icon: <LayoutDashboard className="w-4 h-4" />,
+          path: "/dashboard",
+        },
+        // { id: "chat", label: "对话", icon: <MessageSquare className="w-4 h-4" />, path: "/chat" },
+        {
+          id: "traces",
+          label: "运行轨迹",
+          icon: <Route className="w-4 h-4" />,
+          path: "/traces",
+        },
       ],
     },
     {
       label: "资源",
       items: [
-        { id: "knowledge", label: "知识库", icon: <BookOpen className="w-4 h-4" />, path: "/knowledge" },
-        { id: "prompts", label: "提示词", icon: <Sparkles className="w-4 h-4" />, path: "/prompts" },
+        {
+          id: "knowledge",
+          label: "知识库",
+          icon: <BookOpen className="w-4 h-4" />,
+          path: "/knowledge",
+        },
+        {
+          id: "prompts",
+          label: "提示词",
+          icon: <Sparkles className="w-4 h-4" />,
+          path: "/prompts",
+        },
       ],
     },
     {
       label: "系统",
       items: [
-        { id: "settings", label: "设置", icon: <Settings className="w-4 h-4" />, path: "/settings" },
+        {
+          id: "settings",
+          label: "设置",
+          icon: <Settings className="w-4 h-4" />,
+          path: "/settings",
+        },
       ],
     },
   ];
@@ -105,8 +129,7 @@ export const Sidebar: React.FC = () => {
   const handleSaveRename = (id: string) => {
     const trimmed = editValue.trim();
     if (trimmed) {
-      const previousTitle =
-        sessions.find((c) => c.id === id)?.title ?? trimmed;
+      const previousTitle = sessions.find((c) => c.id === id)?.title ?? trimmed;
       dispatch(renameAction({ id, title: trimmed }));
       apiClient.renameChat(id, trimmed).catch((e) => {
         // 乐观更新失败时把标题滚回去，侧栏不能和后端悄悄分叉
@@ -154,14 +177,14 @@ export const Sidebar: React.FC = () => {
         <BrandMark size={36} />
         <div className="min-w-0 flex-1">
           <h1 className="font-display font-semibold text-[15px] text-[#1f1e1d] dark:text-[#edece8] truncate">
-            AI Workspace
+            有据工作台
           </h1>
           <span className="text-[11px] text-[#6e6b63] dark:text-[#a19f96] flex items-center gap-1.5 truncate">
             <span className="relative flex w-1.5 h-1.5 shrink-0">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-60" />
               <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500" />
             </span>
-            {user?.name || user?.username || "User"}
+            {user?.name || user?.username || "用户"}
           </span>
         </div>
       </div>
@@ -245,9 +268,7 @@ export const Sidebar: React.FC = () => {
                   onClick={(e) => e.stopPropagation()}
                 />
               ) : (
-                <span className="flex-1 truncate">
-                  {chat.title}
-                </span>
+                <span className="flex-1 truncate">{chat.title}</span>
               )}
 
               {editingId !== chat.id && (

@@ -45,6 +45,14 @@ _PINNED_FLAGS = {
     # monkeypatch（见 test_service_security._enable_save_tool），它们缺的只是
     # 上面那个审批开关。
     "TOOL_WRITE_KNOWLEDGE_ENABLED": False,
+    # 2026-08-24 补这两个：本地 .env 把它们打开之后，三条与工具面无关的测试开始红
+    # （test_plain_chat_runs_one_round_without_tools 断言 tools == []、
+    # test_unknown_tool_is_invalid_arguments_and_loop_continues、
+    # test_new_tools_not_registered_by_default 断言注册表为空）。
+    # 症状与上面 AGENT_APPROVAL_MODE 那条一模一样，也就是这个 fixture 的文档开头
+    # 描述的那个坑本身——只是当时漏钉了这两个开关。同样钉成 config.py 的代码默认值。
+    "TOOL_CALCULATE_ENABLED": False,
+    "TOOL_WEB_SEARCH_ENABLED": False,
     # 提示词版本。空串 = 走代码里的默认版本；.env 里设成 v4-workspace 之后，
     # 断言系统提示词内容的测试会挂在与改动无关的地方（v4 里没有"不要重复检索"
     # 那句，它属于 v2/v3-lean）。提示词版本和工具面是耦合的，一旦本地为了试新
@@ -220,22 +228,31 @@ class FakeKnowledgeService:
         self.search_fails = search_fails
         self.citations = citations if citations is not None else []
         self.search_queries: list[str] = []
+        # 每次检索传进来的 viewer_id。None 表示"只查共享文档"，
+        # 而在真实 chat 链路上它应当**总是**当前用户 id。
+        self.viewer_ids: list[str | None] = []
 
+    # viewer_id 收下并记下来：真实实现用它决定"能不能检索到这个人的私有文档"，
+    # 而漏传它是个静默的功能缺失（模型永远看不见用户的个人资料）。
+    # 替身把它记进 viewer_ids，于是想断言"链路有没有把它传下去"的测试有东西可断。
     async def build_rag_context_with_citations(
-        self, db, query, user_id, top_k=5
+        self, db, query, workspace_id, top_k=5, viewer_id=None
     ) -> tuple[str, list[dict[str, Any]]]:
         self.search_queries.append(query)
+        self.viewer_ids.append(viewer_id)
         if self.search_fails:
             raise RuntimeError("embedding api down")
         return self.context, list(self.citations)
 
-    async def build_rag_context(self, db, query, user_id, top_k=5) -> str:
+    async def build_rag_context(
+        self, db, query, workspace_id, top_k=5, viewer_id=None
+    ) -> str:
         context, _citations = await self.build_rag_context_with_citations(
-            db, query, user_id, top_k
+            db, query, workspace_id, top_k, viewer_id=viewer_id
         )
         return context
 
-    async def get_documents(self, db, user_id) -> list[dict[str, Any]]:
+    async def get_documents(self, db, workspace_id, viewer_id=None) -> list[dict[str, Any]]:
         return self.documents
 
     async def read_chunks(self, db, user_id, document_id, chunk_index, window=1):

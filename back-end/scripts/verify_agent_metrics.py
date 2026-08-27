@@ -166,7 +166,7 @@ async def main() -> int:
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine, future=True)()
     now = naive_now()
-    session.add(Workspace(id="w1", name="验证", invite_code="V1", created_at=now))
+    session.add(Workspace(id="w1", name="验证", created_at=now))
     user = User(id="u1", email="v@example.com", username="v", role="admin", workspace_id="w1")
     session.add(user)
     session.commit()

@@ -41,17 +41,25 @@ export const SpanDetail: React.FC<{ node: TraceSpanNode }> = ({ node }) => {
             </span>
           }
         />
-        <DetailRow label="模型" value={node.model ?? "-"} />
+        {/* 模型/token/成本只有 llm、embedding 这类真调了外部模型的 span 才有。
+            工具与检索是本地执行，硬摆一行"模型 -"只会让人以为数据丢了 */}
+        {node.model && <DetailRow label="模型" value={node.model} />}
         <DetailRow label="耗时" value={fmtMs(node.durationMs)} />
-        <DetailRow
-          label="Token"
-          value={`${fmtInt(node.promptTokens ?? 0)} in / ${fmtInt(node.completionTokens ?? 0)} out`}
-        />
-        <DetailRow label="成本" value={fmtCost(node.cost, node.currency)} />
-        <DetailRow
-          label="Token 来源"
-          value={node.tokenSource === "estimated" ? "估算" : "实际"}
-        />
+        {(node.promptTokens != null || node.completionTokens != null) && (
+          <DetailRow
+            label="Token"
+            value={`${fmtInt(node.promptTokens ?? 0)} in / ${fmtInt(node.completionTokens ?? 0)} out`}
+          />
+        )}
+        {node.cost != null && (
+          <DetailRow label="成本" value={fmtCost(node.cost, node.currency)} />
+        )}
+        {node.tokenSource && (
+          <DetailRow
+            label="Token 来源"
+            value={node.tokenSource === "estimated" ? "估算" : "实际"}
+          />
+        )}
       </div>
       {attributesStr !== "{}" && (
         <div>

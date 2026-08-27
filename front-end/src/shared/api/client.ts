@@ -6,6 +6,8 @@ import type {
   CompletionResponse,
   StreamChunk,
   KnowledgeDocument,
+  DocumentVisibility,
+  JoinWorkspaceResponse,
   UploadDocumentResponse,
   WorkspaceInfo,
   LoginRequest,
@@ -22,9 +24,10 @@ import type {
   TraceSummary,
   TraceDetail,
   KnowledgeQueryResult,
-  MessageFeedback,
-  FeedbackSummary,
-  ToolStep,
+   MessageFeedback,
+   FeedbackSummary,
+   UserMemory,
+   ToolStep,
   AgentMetrics,
   PendingApproval,
   AgentRunDetail,
@@ -629,9 +632,16 @@ export class ApiClient {
    * 上传文档到知识库
    * POST /knowledge/documents/upload
    */
-  async uploadDocument(file: File): Promise<UploadDocumentResponse> {
+  async uploadDocument(
+    file: File,
+    visibility: DocumentVisibility = "workspace",
+  ): Promise<UploadDocumentResponse> {
     const formData = new FormData();
     formData.append("file", file);
+    // 显式传而不是靠后端默认：两个入口的默认值不同（知识库页面共享、
+    // chat 附件私有），依赖同一个默认值会让其中一个变成错的。
+    // 后端仍会校验：user 传 workspace 会被 403 挡掉。
+    formData.append("visibility", visibility);
 
     const headers: HeadersInit = {};
     if (this.token) {
@@ -690,7 +700,7 @@ export class ApiClient {
   // ========== Workspace API ==========
 
   /**
-   * 当前用户的工作区信息(名称/角色/成员/邀请码)
+   * 当前用户的工作区信息(名称/角色/成员)
    * GET /workspace
    */
   async getWorkspace(): Promise<WorkspaceInfo> {
@@ -704,7 +714,33 @@ export class ApiClient {
   }
 
   /**
-   * 重置邀请码(仅管理员,旧码立即作废)
+   * 凭邀请码加入工作区
+   * POST /workspace/join
+   *
+   * 加入是**换空间**：调用方必须把响应里的 leftBehindDocuments 提示给用户。
+   */
+  async joinWorkspace(inviteCode: string): Promise<JoinWorkspaceResponse> {
+    const response = await this.authedFetch(`${this.baseUrl}/workspace/join`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ invite_code: inviteCode }),
+    });
+
+    if (!response.ok) {
+      // 400 的 detail 是面向用户的文案（"邀请码无效"、"你已在该工作区中"），
+      // 直接透出去比一句 "Failed to join" 有用
+      const detail = await response
+        .json()
+        .then((body) => body?.detail)
+        .catch(() => null);
+      throw new Error(detail || `加入工作区失败: ${response.statusText}`);
+    }
+
+    return response.json();
+  }
+
+  /**
+   * 重置邀请码(仅管理员)。旧码立即作废
    * POST /workspace/invite-code
    */
   async regenerateInviteCode(): Promise<{ inviteCode: string }> {
@@ -714,11 +750,11 @@ export class ApiClient {
     );
 
     if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(
-        error.detail ||
-          `Failed to regenerate invite code: ${response.statusText}`,
-      );
+      const detail = await response
+        .json()
+        .then((body) => body?.detail)
+        .catch(() => null);
+      throw new Error(detail || `重置邀请码失败: ${response.statusText}`);
     }
 
     return response.json();
@@ -1062,6 +1098,34 @@ export class ApiClient {
       );
     }
     return response.json();
+  }
+
+  // ========== Memory API ==========
+
+  /**
+   * 跨会话长期记忆列表（按时间倒序）
+   * GET /memories
+   */
+  async getMemories(): Promise<UserMemory[]> {
+    const response = await this.authedFetch(`${this.baseUrl}/memories`);
+    if (!response.ok) {
+      throw new Error(`Failed to load memories: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 删除一条记忆，立即停止注入后续对话上下文
+   * DELETE /memories/{id}
+   */
+  async deleteMemory(memoryId: string): Promise<void> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/memories/${memoryId}`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to delete memory: ${response.statusText}`);
+    }
   }
 }
 

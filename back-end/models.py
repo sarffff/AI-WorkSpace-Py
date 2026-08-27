@@ -26,9 +26,14 @@ if TYPE_CHECKING:
 class Workspace(Base):
     """知识库的工作区(组织)。
 
-    知识库的可见单位从"用户"改为"工作区":同一工作区的成员共享文档,
-    admin 负责上传与删除,member 只读。这是"个人工具"与"团队产品"的分界——
-    制度文档是组织资产,不该要求每个员工自己传一遍。
+    知识库的可见单位是工作区,但工作区内部还分两层可见性(见 ``Document.visibility``):
+
+    - ``workspace`` 共享文档:同一工作区全员可见,只有 admin 能增删。
+      制度文档是组织资产,不该要求每个员工自己传一遍。
+    - ``private`` 私有文档:只有上传者本人可见可删,user 角色也能传。
+      临时资料进这里,不污染团队检索。
+
+    加入工作区凭 ``invite_code``。
     """
 
     __tablename__ = "workspaces"
@@ -37,8 +42,9 @@ class Workspace(Base):
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
     )
     name: Mapped[str] = mapped_column(String(100))
-    # 邀请码:注册时填了就加入该工作区成为 member。不区分大小写、去掉
-    # 易混淆字符(0/O、1/I),长度 8 位
+    # 加入凭据。会被人口抄、微信群转发,所以字符表去掉了易混淆字符
+    # (见 workspace_service._INVITE_ALPHABET)。泄露后的止损动作是重置,
+    # 旧码立即失效。
     invite_code: Mapped[str] = mapped_column(String(16), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
@@ -59,7 +65,11 @@ class User(Base):
 
     # 所属工作区与角色。workspace_id 为空表示还没初始化(旧用户/OAuth 新用户),
     # 第一次访问工作区相关功能时由 workspace_service.resolve_for_user 自动补建。
-    # role 只有 admin(可管理文档/邀请码)与 member(只读知识库)两档。
+    #
+    # role 两档,区别只在**共享文档**上:
+    #   admin — 可增删工作区共享文档,可重置邀请码
+    #   user  — 共享文档只读;但可以自由增删**自己的**私有文档
+    # 所以 user 不是"只读账号",它只是不能改组织资产。
     workspace_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -265,19 +275,46 @@ class Document(Base):
     name: Mapped[str] = mapped_column(String(255))
     size: Mapped[int] = mapped_column(Integer)
     content: Mapped[str | None] = mapped_column(Text, nullable=True)  # 文档全文内容
-    # 知识库的作用域:工作区。同一工作区全员可见,检索/去重/缓存都按它过滤
+    # 知识库的外层作用域:工作区。检索/去重/缓存都先按它过滤
     workspace_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True, index=True
     )
-    # 上传者,仅用于展示"这份文档是谁放的",不参与权限判断
+    # 上传者。**参与权限判断**:private 文档只有 user_id == 当前用户时可见可删。
+    # 改动之前这一列只用于展示"这份文档是谁放的",加了 visibility 之后它成了
+    # 私有文档的归属键——所以它为 NULL 的 private 文档谁都看不见(见下)。
     user_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    # 可见性:workspace = 工作区共享(仅 admin 可增删),private = 仅上传者可见。
+    #
+    # 默认 workspace 而不是 private,理由是**存量数据**:这一列加上去之前所有文档
+    # 都是工作区共享语义,迁移时必须保持原样,否则升级一次就等于把团队知识库
+    # 全部变成某个人的私有文档。新上传的默认值由调用方给,不靠这里
+    # (chat 附件默认 private,知识库页面上传默认 workspace)。
+    #
+    # user_id 为 NULL 且 visibility=private 的组合是**不该长期存在的中间态**:
+    # 那种文档谁都检索不到、谁都删不掉,是一份没人能处置的孤儿。它由
+    # ondelete="SET NULL" 在删用户时造出来。
+    #
+    # 2026-08-25 起启动时会把它们收编成工作区共享文档
+    # (workspace_service.adopt_orphaned_documents),让 admin 能看见并自己决定
+    # 删还是留。此前的注释写的是相反的语义("需要 admin 显式处理"),但那件事
+    # 当时**没有任何接口能做**——admin 连列表都看不到它们,所谓"显式处理"
+    # 实际等于永久滞留。
+    #
+    # 收编后 user_id 保持 NULL,那正是"原上传者已离开"的标记:共享文档正常
+    # 都带 user_id,所以 (visibility=workspace, user_id IS NULL) 这个组合能
+    # 零成本地把继承来的文档挑出来,不需要额外加列。
+    visibility: Mapped[str] = mapped_column(String(16), default="workspace", index=True)
     chunks: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="indexed")  # indexed, processing, failed
     # 解析后正文的 sha256。去重键:同一内容传两遍会占两套 chunk,RRF 按不同
     # chunk_id 融合不会合并,重复文档会挤掉 top_k 里的其他文档。
     # 哈希算在解析后的文本而不是原始字节上——同一份内容换个文件名、或
     # PDF 重新导出一次,应该被认出是同一篇文档。
-    # 注意:去重范围是(工作区, 哈希)——不同工作区各存一份是正常的
+    #
+    # 去重范围是(工作区, 可见性作用域, 哈希),其中"可见性作用域"对共享文档是
+    # 整个工作区、对私有文档是上传者本人。加 visibility 之前它只是(工作区, 哈希),
+    # 那会让两个人各自上传同一份文件时后一个人拿到**前一个人的私有文档**——
+    # 既是越权也是错误的复用。反过来,同一个人把自己的私有文档再传一遍仍然去重。
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     # 解析后端(text/utf-8、text/gb18030、pdfplumber、pypdf2……)与解析告警。
     # 这条链路上最常见的失败全都不抛异常:扫描件抽出空文本、GBK 解成一串替换符、

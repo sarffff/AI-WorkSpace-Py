@@ -4,7 +4,9 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from typing import Any
+
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
 from sse_starlette.sse import EventSourceResponse
 
@@ -77,6 +79,25 @@ class ResumeRequest(BaseModel):
     approved: bool
     # 拒绝时的补充说明。会随拒绝结果回灌给模型——那通常正好是它需要的修改方向
     note: str = Field(default="", max_length=2000)
+    # 改过参数再放行。``None`` = 没编辑，原样执行；给了就必须同时 approved=True
+    # （校验见下面的 validator）。
+    #
+    # 为什么不做成独立的 verdict 枚举："改完执行"在语义上就是一种批准——它经过
+    # 同一道闸门、同一套 schema 校验、写同一批 approved_call_ids。做成第三种裁决
+    # 会让下游每个判断 ``if approved`` 的地方都得再想一次"编辑算不算同意"。
+    editedArguments: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _edit_requires_approval(self) -> "ResumeRequest":
+        """拒绝时不接受参数修改。
+
+        ``approved=False`` 配上 ``editedArguments`` 是个自相矛盾的请求：不执行的
+        调用没有参数可言。静默忽略那个字段会让客户端的 bug 变成"我改了但没生效"，
+        所以这里直接 422。
+        """
+        if self.editedArguments is not None and not self.approved:
+            raise ValueError("拒绝时不能同时修改参数")
+        return self
 
 
 def _assistant_message_id(user_message_id: str) -> str:
@@ -485,6 +506,143 @@ async def pending_runs(
     return items
 
 
+def _continuation_sse(
+    stream,
+    *,
+    db: Session,
+    user_id: str,
+    run_id: str,
+    chat_id: str,
+    assistant_message_id: str | None,
+    prefix: str,
+    model: str | None,
+    state_before,
+    what: str,
+):
+    """把一条"接着跑"的事件流包成 SSE。
+
+    审批恢复和澄清恢复共用它。这段逻辑里有三处不显然的东西，各写两遍必然会分叉：
+
+    1. **再次中断时不落库。** 一次恢复可以再停一次（第二个写操作要审批，或者
+       模型拿到答案后又问一个问题）。那时 ``full_response`` 只是半截回答，
+       落库会让用户在历史里看到一句没写完的话。
+    2. **落库要接上 ``streamed_prefix``。** 中断之前可能已经有正文流给用户了
+       （"我来把这份整理好保存进知识库"）。不接的话数据库里的回答比用户看到的少一句。
+    3. **assistant id 是 uuid5(user_message_id) 算出来的。** 与被打断那次请求
+       一致，所以一问一答不会留下两条 assistant 消息。
+    """
+
+    async def event_generator():
+        full_response = ""
+        failed = False
+        interrupted = False
+        try:
+            async for event in stream:
+                payload = {**event, "chat_id": chat_id}
+                if event["type"] == "message_delta":
+                    full_response += event["content"]
+                if event["type"] == "error":
+                    failed = True
+                if event["type"] == "approval_required" or (
+                    event["type"] == "clarification" and event.get("resumable")
+                ):
+                    interrupted = True
+                    payload["message_id"] = assistant_message_id
+                yield {"data": json.dumps(payload, ensure_ascii=False)}
+                if failed:
+                    break
+
+            if interrupted:
+                return
+            answer = prefix + full_response
+            if not failed and answer.strip() and assistant_message_id:
+                await chat_service.save_message(
+                    db, chat_id, "assistant", answer, model, assistant_message_id
+                )
+                if settings.MEMORY_ENABLED and state_before is not None:
+                    asyncio.create_task(
+                        _extract_memory(user_id, chat_id, state_before.prompt, answer)
+                    )
+                yield {
+                    "data": json.dumps(
+                        {
+                            "type": "done",
+                            "done": True,
+                            "chat_id": chat_id,
+                            "message_id": assistant_message_id,
+                        },
+                        ensure_ascii=False,
+                    )
+                }
+            elif not failed:
+                yield {
+                    "data": json.dumps(
+                        {"type": "error", "error": f"{what}后模型未返回最终回答。"},
+                        ensure_ascii=False,
+                    )
+                }
+        except Exception:
+            logger.exception("%s failed for run %s", what, run_id)
+            yield {
+                "data": json.dumps(
+                    {"type": "error", "error": f"{what}失败，请稍后重试。"},
+                    ensure_ascii=False,
+                )
+            }
+
+    return EventSourceResponse(event_generator())
+
+
+class ClarificationAnswerRequest(BaseModel):
+    """对 ``ask_user`` 那个问题的回答。
+
+    没有默认值，空串由服务层挡下并保留 ``waiting_input``——用户可以再答一次。
+    """
+
+    answer: str = Field(min_length=1, max_length=10_000)
+
+
+@router.post("/runs/{run_id}/answer")
+async def answer_clarification(
+    run_id: str,
+    request: ClarificationAnswerRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """回答模型的澄清问题，并**接着那一轮**跑下去。
+
+    与 ``/resume`` 是两个端点而不是一个带 mode 的端点：它们的载荷没有交集
+    （一个是裁决 + 可选的参数修改，一个是一句话），前置状态校验也不同
+    （``waiting_approval`` vs ``waiting_input``）。合成一个的话每个字段都得
+    写"仅当 mode=X 时有效"。
+    """
+    run = checkpoint_store.get_run(db, run_id)
+    if run is None or run.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+    if run.status != "waiting_input":
+        raise HTTPException(
+            status_code=409, detail=f"该执行当前状态为 {run.status}，不在等待回答"
+        )
+
+    state_before = checkpoint_store.latest(db, run_id)
+    return _continuation_sse(
+        chat_service.answer_clarification(
+            db, current_user.id, run_id, answer=request.answer
+        ),
+        db=db,
+        user_id=current_user.id,
+        run_id=run_id,
+        chat_id=run.chat_id,
+        assistant_message_id=(
+            _assistant_message_id(run.message_id) if run.message_id else None
+        ),
+        prefix=state_before.streamed_prefix if state_before else "",
+        model=run.model,
+        state_before=state_before,
+        what="回答",
+    )
+
+
 @router.post("/runs/{run_id}/resume")
 async def resume_run(
     run_id: str,
@@ -518,73 +676,25 @@ async def resume_run(
     prefix = state_before.streamed_prefix if state_before else ""
     model = run.model
 
-    async def event_generator():
-        full_response = ""
-        failed = False
-        interrupted = False
-        try:
-            async for event in chat_service.resume_turn(
-                db,
-                current_user.id,
-                run_id,
-                approved=request.approved,
-                note=request.note,
-            ):
-                payload = {**event, "chat_id": chat_id}
-                if event["type"] == "message_delta":
-                    full_response += event["content"]
-                if event["type"] == "error":
-                    failed = True
-                if event["type"] == "approval_required":
-                    # 同一回合里可以有第二个需要审批的工具。那时再停一次,
-                    # 而不是把剩下的写操作一起放过去。
-                    interrupted = True
-                    payload["message_id"] = assistant_message_id
-                yield {"data": json.dumps(payload, ensure_ascii=False)}
-                if failed:
-                    break
-
-            if interrupted:
-                return
-            answer = prefix + full_response
-            if not failed and answer.strip() and assistant_message_id:
-                await chat_service.save_message(
-                    db, chat_id, "assistant", answer, model, assistant_message_id
-                )
-                if settings.MEMORY_ENABLED and state_before is not None:
-                    asyncio.create_task(
-                        _extract_memory(
-                            current_user.id, chat_id, state_before.prompt, answer
-                        )
-                    )
-                yield {
-                    "data": json.dumps(
-                        {
-                            "type": "done",
-                            "done": True,
-                            "chat_id": chat_id,
-                            "message_id": assistant_message_id,
-                        },
-                        ensure_ascii=False,
-                    )
-                }
-            elif not failed:
-                yield {
-                    "data": json.dumps(
-                        {"type": "error", "error": "恢复后模型未返回最终回答。"},
-                        ensure_ascii=False,
-                    )
-                }
-        except Exception:
-            logger.exception("Resume failed for run %s", run_id)
-            yield {
-                "data": json.dumps(
-                    {"type": "error", "error": "恢复执行失败，请稍后重试。"},
-                    ensure_ascii=False,
-                )
-            }
-
-    return EventSourceResponse(event_generator())
+    return _continuation_sse(
+        chat_service.resume_turn(
+            db,
+            current_user.id,
+            run_id,
+            approved=request.approved,
+            note=request.note,
+            edited_arguments=request.editedArguments,
+        ),
+        db=db,
+        user_id=current_user.id,
+        run_id=run_id,
+        chat_id=chat_id,
+        assistant_message_id=assistant_message_id,
+        prefix=prefix,
+        model=model,
+        state_before=state_before,
+        what="恢复",
+    )
 
 
 @router.get("/runs/{run_id}")

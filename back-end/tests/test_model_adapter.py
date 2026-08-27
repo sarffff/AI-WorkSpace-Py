@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from config import settings
 from conftest import run
 from services.model_adapter import OpenAICompatibleAdapter
 
@@ -257,3 +258,191 @@ def test_missing_finish_reason_stays_none():
 
     assert completion.finish_reason is None
     assert completion.truncated is False
+
+
+# ========== 辅助调用的超时与思考链 ==========
+#
+# 2026-08-27 加。此前 ``AsyncOpenAI`` 不带 timeout/max_retries 构造，吃 SDK 默认
+# **read=600s × max_retries=2 → 最坏一次 1800 秒**。实测 rerank 变体 p90 延迟
+# 255 秒、最大 336 秒（baseline 37 秒），eval 里 10/54 的降级就是耗尽重试的那些。
+
+
+def _bad_request_error() -> Exception:
+    """一个会被 ``_is_bad_request`` 认出来的异常。
+
+    判据是 ``status_code == 400`` 或类名叫 ``BadRequestError``，所以这里造
+    status_code=400 的普通异常就够，不需要拉起真的 openai 异常类型。
+    """
+    error = RuntimeError("unknown parameter: thinking")
+    error.status_code = 400
+    return error
+
+
+class _RecordingCompletions:
+    """记录每次 create 收到的 kwargs，可选地按次序抛异常。"""
+
+    def __init__(self, errors=None):
+        self.calls: list[dict] = []
+        self._errors = list(errors or [])
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self._errors:
+            error = self._errors.pop(0)
+            if error is not None:
+                raise error
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="[1, 2]", tool_calls=None),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+            model="m",
+        )
+
+
+class _RecordingClient:
+    def __init__(self, errors=None):
+        self.completions = _RecordingCompletions(errors)
+        self.chat = SimpleNamespace(completions=self.completions)
+        self.options: list[dict] = []
+
+    def with_options(self, **kwargs):
+        self.options.append(kwargs)
+        return self
+
+
+def _adapter_with(client):
+    adapter = OpenAICompatibleAdapter.__new__(OpenAICompatibleAdapter)
+    adapter._client = client
+    return adapter
+
+
+def _reset_thinking_flag():
+    OpenAICompatibleAdapter._thinking_opt_out_supported = True
+
+
+def test_auxiliary_calls_get_a_shorter_timeout():
+    """``purpose != "chat"`` 时收紧超时与重试。
+
+    辅助调用**全都有降级路径**（重排失败退回融合序、HyDE 失败用原查询），
+    为一个可以放弃的增强等 600s×3 是纯亏，而且拖慢的是用户正在等的那次回答。
+    """
+    _reset_thinking_flag()
+    client = _RecordingClient()
+    adapter = _adapter_with(client)
+    run(
+        adapter.complete(
+            messages=[{"role": "user", "content": "q"}],
+            tools=[],
+            model="m",
+            purpose="rerank",
+        )
+    )
+    assert client.options, "辅助调用该走 with_options"
+    assert client.options[0]["timeout"] == settings.LLM_AUXILIARY_TIMEOUT_SECONDS
+    assert client.options[0]["max_retries"] == settings.LLM_AUXILIARY_MAX_RETRIES
+
+
+def test_chat_calls_keep_the_default_timeout():
+    """主回答不受这个约束——用户确实在等它，不该为了省时间砍掉重试。"""
+    _reset_thinking_flag()
+    client = _RecordingClient()
+    adapter = _adapter_with(client)
+    run(
+        adapter.complete(
+            messages=[{"role": "user", "content": "q"}],
+            tools=[],
+            model="m",
+            purpose="chat",
+        )
+    )
+    assert client.options == [], "chat 不该收紧超时"
+
+
+def test_auxiliary_calls_disable_the_reasoning_chain():
+    """辅助调用关掉思考链。
+
+    实测 20 候选的 listwise 重排：开思考 20.3 秒 / 1011 输出 token，关掉
+    0.4 秒 / 7 token——**快 50 倍**，而且排序更好（开着时那 1011 token 只吐出
+    ``[10]``，关掉给出 ``[10, 20]``）。排序不需要思考链。
+    """
+    _reset_thinking_flag()
+    client = _RecordingClient()
+    adapter = _adapter_with(client)
+    run(
+        adapter.complete(
+            messages=[{"role": "user", "content": "q"}],
+            tools=[],
+            model="m",
+            purpose="rerank",
+        )
+    )
+    assert client.completions.calls[0].get("extra_body") == {
+        "thinking": {"type": "disabled"}
+    }
+
+
+def test_chat_keeps_the_reasoning_chain():
+    """主回答的思考链是有价值的，不能顺手关掉。"""
+    _reset_thinking_flag()
+    client = _RecordingClient()
+    adapter = _adapter_with(client)
+    run(
+        adapter.complete(
+            messages=[{"role": "user", "content": "q"}],
+            tools=[],
+            model="m",
+            purpose="chat",
+        )
+    )
+    assert "extra_body" not in client.completions.calls[0]
+
+
+def test_thinking_opt_out_is_remembered_after_rejection(caplog):
+    """端点拒绝这个参数时只回退一次并记住，不是每次都白试一遍。
+
+    和 ``_stream_usage_supported`` 同一个套路。每次都试的代价是每个辅助调用
+    都多一次往返。
+    """
+    _reset_thinking_flag()
+    bad_request = _bad_request_error()
+    client = _RecordingClient(errors=[bad_request, None, None])
+    adapter = _adapter_with(client)
+    for _ in range(2):
+        run(
+            adapter.complete(
+                messages=[{"role": "user", "content": "q"}],
+                tools=[],
+                model="m",
+                purpose="rerank",
+            )
+        )
+    assert OpenAICompatibleAdapter._thinking_opt_out_supported is False
+    # 第 1 次带参数被拒 → 第 2 次不带（同一次调用内的回退）→ 第 3 次直接不带
+    assert "extra_body" in client.completions.calls[0]
+    assert "extra_body" not in client.completions.calls[1]
+    assert "extra_body" not in client.completions.calls[2]
+    _reset_thinking_flag()
+
+
+def test_non_bad_request_errors_are_not_swallowed():
+    """超时/限流不代表端点不支持这个参数，不能据此记住。
+
+    记住了会让后续所有辅助调用永远吃不到这个优化——而超时是最常见的偶发错误。
+    """
+    _reset_thinking_flag()
+    client = _RecordingClient(errors=[TimeoutError("slow")])
+    adapter = _adapter_with(client)
+    with pytest.raises(TimeoutError):
+        run(
+            adapter.complete(
+                messages=[{"role": "user", "content": "q"}],
+                tools=[],
+                model="m",
+                purpose="rerank",
+            )
+        )
+    assert OpenAICompatibleAdapter._thinking_opt_out_supported is True

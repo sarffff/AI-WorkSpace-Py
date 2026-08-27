@@ -35,6 +35,7 @@
 """
 from __future__ import annotations
 
+import io
 import re
 
 # 页眉页脚每隔这么多行注入一次。真实 PDF 是每页一次，而纯文本没有页概念，
@@ -53,7 +54,43 @@ _ZERO_WIDTH_CHARS = ("​", "­", "‌")
 _ZERO_WIDTH_STRIDE = 6
 _FULLWIDTH_OFFSET = 0xFF01 - 0x21
 
-DEGRADATIONS = ("none", "pdf_like", "gbk_bytes", "noisy_unicode", "scanned")
+DEGRADATIONS = (
+    "none",
+    "pdf_like",
+    "gbk_bytes",
+    "noisy_unicode",
+    "scanned",
+    # 严格说 docx 不是"降级"——它是格式转换，而且几乎无损。放在这个模块里是因为
+    # 机制完全一样（同一份语料换一种上传形态、名字进指纹、金标不动），
+    # 而为它另开一个"格式变体"维度会让 ensure_corpus 多一条正交的分支。
+    "docx",
+)
+
+# 为什么**没有** xlsx 模式（2026-08-24 评估过，四条都是硬的）：
+#
+# 1. 13 篇语料只有 9 篇含表格 → 另外 4 篇会变成空文档。
+# 2. 即使只看 table_lookup 那 6 条金标，其中 1 条（"8000 元报销要谁审批" → 财务）
+#    的答案在**无序列表**里而不是表格里（expense-policy.md 的审批门槛那段）。
+# 3. 剥掉散文只留表格之后，30 条金标里约 24 条**按设计必然失败**，
+#    报告是一片零，只剩一个很弱的信号。
+# 4. 诚实的设计是"散文留 .md、表格拆成 .xlsx"，但 degrade_corpus_file 的契约是
+#    **1 篇源 → 1 篇上传**，而 ensure_corpus 的早退条件正是 len(文档)==len(源文件)。
+#    拆分要改这个契约，那是另一件事。
+#
+# xlsx 解析本身已有 29 条单元测试覆盖（tests/test_ingest_xlsx.py），包括"每个分块
+# 都自足"这条核心取舍以及它的 Markdown 表格对照组。eval 能**额外**给的只有一件事：
+# "``列名: 值`` 这种行在真实检索下召不召得回来"。那确实有价值，但它需要表格形态的
+# 语料内容，而造那批内容等于写新金标——也就是改考题，不是测能力。
+#
+# 真要做的前置条件：一批**本来就是表格**的语料（费率表、额度表）+ 配套金标，
+# 且 degrade_corpus_file 支持 1 源 → N 上传。
+
+# Markdown 表格的分隔行：``| --- | :--: |``。判据是去掉管道之后只剩 - : 和空白。
+_TABLE_DIVIDER_RE = re.compile(r"^\s*\|[\s\-:|]+\|\s*$")
+_TABLE_ROW_RE = re.compile(r"^\s*\|(.+)\|\s*$")
+# 无序列表标记。docx 里渲染成 List Bullet 段落而不是保留 `- `：
+# Word 文档里的列表就是这个形状，而 extract_docx 读回来是纯段落文本。
+_LIST_ITEM_RE = re.compile(r"^\s*[-*+]\s+(.*)$")
 
 
 def _strip_markdown_structure(text: str) -> str:
@@ -175,6 +212,133 @@ def noisy_unicode(text: str) -> str:
     )
 
 
+def _parse_table_row(line: str) -> list[str] | None:
+    """``| a | b |`` → ``["a", "b"]``。不是表格行就返回 None。"""
+    match = _TABLE_ROW_RE.match(line)
+    if not match:
+        return None
+    return [cell.strip() for cell in match.group(1).split("|")]
+
+
+def markdown_to_docx(text: str) -> bytes:
+    """把 Markdown 语料转成一份真 .docx。
+
+    ## 这个模式量的是什么
+
+    ``md → docx → extract_docx`` 是一条**近乎恒等**的往返：``## 标题`` 变成
+    Heading 2 样式、再被读回成 ``## 标题``；Markdown 表格变成 Word 表格、
+    再被读回成 Markdown 表格。所以这个变体的预期结果是**贴着 baseline**。
+
+    这让它成为块 3 那个解析器的回归测试，而且是用检索指标表达的：
+    差值接近零说明结构保真；掉下来就说明 ``extract_docx`` 丢了真东西
+    （标题层级没识别、表格跑到文末、单元格换行没压平……），而那些症状在单元
+    测试里都是"能读出文字"所以全绿。
+
+    和 ``pdf_like`` 的关系正好相反：那个刻意丢掉结构，量"丢了值多少"；
+    这个刻意保留结构，量"我们的解析器有没有真的把它保下来"。
+
+    ## 为什么不用 pandoc
+
+    要一个外部二进制，而降级必须是确定性的、在 CI 里可复现的。这里的转换只需要
+    覆盖语料实际用到的四种构造（标题、段落、无序列表、表格），
+    ``python-docx`` 直接写就够，也不引入版本漂移。
+
+    ## 已知的不保真处
+
+    行内标记（``**粗体**``、`` `代码` ``）原样进段落文本。语料里它们很少，
+    而且 ``extract_docx`` 读回来也是同样的字面量，所以往返仍然一致——
+    只是它没有变成 Word 的真粗体。这不影响 BM25 词元，故不修。
+    """
+    import docx  # 局部导入：只有这一个降级模式需要它
+
+    document = docx.Document()
+    pending_rows: list[list[str]] = []
+
+    def flush_table() -> None:
+        """把攒下的表格行写成一张 Word 表格。"""
+        if not pending_rows:
+            return
+        width = max(len(row) for row in pending_rows)
+        table = document.add_table(rows=len(pending_rows), cols=width)
+        for row_index, cells in enumerate(pending_rows):
+            padded = cells + [""] * (width - len(cells))
+            for column_index, value in enumerate(padded):
+                table.cell(row_index, column_index).text = value
+        pending_rows.clear()
+
+    for line in text.splitlines():
+        stripped = line.strip()
+
+        # 表格：连续的表格行攒起来一次性写，分隔行丢掉（Word 表格没有这个概念）
+        if _TABLE_DIVIDER_RE.match(line):
+            continue
+        row = _parse_table_row(line) if stripped.startswith("|") else None
+        if row is not None:
+            pending_rows.append(row)
+            continue
+        flush_table()
+
+        if not stripped:
+            continue
+
+        heading = _HEADING_RE.match(stripped)
+        if heading:
+            level = min(6, len(heading.group(1)))
+            document.add_heading(heading.group(2), level=level)
+            continue
+
+        list_item = _LIST_ITEM_RE.match(line)
+        if list_item:
+            document.add_paragraph(list_item.group(1), style="List Bullet")
+            continue
+
+        document.add_paragraph(stripped)
+
+    flush_table()
+
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return _normalize_zip_timestamps(buffer.getvalue())
+
+
+# ZIP 条目时间戳统一成这个值。取一个固定的过去时间而不是 0：
+# ZIP 的时间字段存不下 1980 年之前的日期，zipfile 会对 0 报警。
+_FIXED_ZIP_DATETIME = (1980, 1, 1, 0, 0, 0)
+
+
+def _normalize_zip_timestamps(payload: bytes) -> bytes:
+    """把 .docx（一个 ZIP）里所有条目的时间戳抹平，让输出逐位可复现。
+
+    没有这一步 ``markdown_to_docx`` 就**不满足这个模块的第一条设计约束**
+    （"同一份语料降两次逐位相同"）：ZIP 条目带修改时间，精度 2 秒，所以
+    跨过一个 2 秒边界的两次调用字节不同。
+
+    这一条是实测出来的，不是预防性的：现成的
+    ``test_every_degradation_is_deterministic`` 对 docx **本来是条 flake**——
+    它只在两次调用落在同一个 2 秒窗口里才绿，而那是大多数时候。
+
+    时间戳其实不影响检索（``_corpus_digest`` 摘的是源 ``.md``，而解析出来的
+    正文与时间戳无关），所以也可以选择把那条测试改成"对 docx 只比正文"。
+    没那么做：字节确定性本身是有用的（可复现产物、可缓存），而放宽一条已经写下
+    的不变量，代价是以后没人知道它还成不成立。
+    """
+    import zipfile
+
+    source = zipfile.ZipFile(io.BytesIO(payload))
+    out = io.BytesIO()
+    # 条目顺序沿用原样：ZIP 的中央目录顺序也进字节流，重排同样会破坏逐位相同
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as target:
+        for item in source.infolist():
+            normalized = zipfile.ZipInfo(item.filename, _FIXED_ZIP_DATETIME)
+            normalized.compress_type = item.compress_type
+            normalized.external_attr = item.external_attr
+            normalized.internal_attr = item.internal_attr
+            normalized.create_system = item.create_system
+            target.writestr(normalized, source.read(item.filename))
+    source.close()
+    return out.getvalue()
+
+
 def degrade_corpus_file(text: str, mode: str) -> tuple[bytes, str]:
     """按降级方式返回 (上传用的字节, 建议的文件后缀)。
 
@@ -196,4 +360,6 @@ def degrade_corpus_file(text: str, mode: str) -> tuple[bytes, str]:
     if mode == "scanned":
         # 图片型 PDF：有文件、有页数、抽不出任何文本
         return b"", ".txt"
+    if mode == "docx":
+        return markdown_to_docx(text), ".docx"
     raise ValueError(f"未知的降级方式: {mode}（可用: {', '.join(DEGRADATIONS)}）")

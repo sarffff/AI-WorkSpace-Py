@@ -35,6 +35,13 @@ _COLUMNS = [
     ("grounded", "有据性"),
     ("toolRecall", "工具召回"),
     ("toolPrecision", "工具精度"),
+    # 顺序对不对。和上面两列量的不是一件事:召回/精度只看"调了哪些",这一列看
+    # "先后对不对"——先算价再查价和先查价再算价,两者的召回与精度完全相同,
+    # 但后者才是对的。只在标了 expect_order 的轮次上算,目前只有 chain-rail-price
+    # 一条(web_search → calculate),所以它经常是 '-'。
+    #
+    # 这一项从加进 summary 起就没被渲染过,和 unpricedModels 是同一个形状。
+    ("toolOrderRate", "工具顺序"),
     ("roundEfficiency", "轮次效率"),
     ("avgRounds", "平均轮次"),
     ("forbiddenCalls", "违规调用"),
@@ -88,6 +95,22 @@ def _format(value: Any) -> str:
     return str(value)
 
 
+def _corpus_line(summaries: list[dict[str, Any]]) -> list[str]:
+    """语料分块数,作为"这轮测的哪版语料"的指纹。理由见 ``eval/run.py`` 同名函数。
+
+    agent 侧同样需要它:带 RAG 的任务的有据性依赖检索,而检索依赖索引。
+    """
+    counts = {s["variant"]: s.get("corpusChunks") for s in summaries}
+    present = {v: c for v, c in counts.items() if c is not None}
+    if not present:
+        return []
+    unique = set(present.values())
+    if len(unique) == 1 and len(present) == len(counts):
+        return [f"语料分块：{unique.pop()}"]
+    detail = "、".join(f"{v} {c if c is not None else '未知'}" for v, c in counts.items())
+    return [f"语料分块（各变体不同）：{detail}"]
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     summaries = report["summaries"]
     lines = [
@@ -96,6 +119,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"生成时间：{app_now().isoformat(timespec='seconds')}",
         f"任务数：{summaries[0]['tasks'] if summaries else 0}"
         f" / 轮次数：{summaries[0]['turns'] if summaries else 0}",
+        *_corpus_line(summaries),
         "",
         "| " + " | ".join(label for _key, label in _COLUMNS) + " |",
         "| " + " | ".join("---" for _ in _COLUMNS) + " |",
@@ -120,6 +144,19 @@ def render_markdown(report: dict[str, Any]) -> str:
     for summary in summaries:
         cells = [_format(summary.get(key)) for key, _label in _DIAGNOSTICS]
         lines.append(f"| {summary['variant']} | " + " | ".join(cells) + " |")
+
+    # 漏价模型。``agent_runner`` 从一开始就算了这个值,但它**从没被渲染过**——
+    # 数据在 JSON 里躺着,而结论写在 Markdown 里,于是"成本这一列不完整"这件事
+    # 谁都读不到。这正是本轮要修的那个形状。
+    unpriced = [s for s in summaries if s.get("unpricedModels")]
+    if unpriced:
+        lines += ["", "## ⚠ 计价缺口", ""]
+        for summary in unpriced:
+            models = "、".join(summary["unpricedModels"])
+            lines.append(
+                f"- **{summary['variant']}**：{models} 没有价目，"
+                "该行成本是**下界**而非总额，不能与其他变体直接比较。"
+            )
 
     lines += [
         "",

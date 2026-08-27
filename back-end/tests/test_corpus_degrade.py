@@ -214,3 +214,156 @@ def test_scanned_yields_no_text_at_all():
 
     assert payload == b""
     assert suffix == ".txt"
+
+
+# ========== docx：格式转换，不是降级 ==========
+#
+# 这个模式和上面几个方向相反：pdf_like 刻意丢结构、量"丢了值多少"；
+# docx 刻意**保留**结构、量"我们的解析器有没有真把它保下来"。
+# 所以下面的断言几乎都在说"往返之后还是原来那个东西"。
+
+
+def _docx_roundtrip(source: str) -> str:
+    """md → docx → extract_docx，返回读回来的正文。"""
+    from services.ingest_clean import extract_docx
+
+    payload, _suffix = cd.degrade_corpus_file(source, "docx")
+    return extract_docx(payload).text
+
+
+def test_docx_changes_the_suffix():
+    assert cd.degrade_corpus_file(_SOURCE, "docx")[1] == ".docx"
+
+
+def test_docx_payload_is_a_real_zip_container():
+    """OOXML 是 ZIP。这一条同时是"上传闸门认得它"的前提
+    （attachment_router._DOCX_SIGNATURE 就是这四个字节）。"""
+    payload, _suffix = cd.degrade_corpus_file(_SOURCE, "docx")
+    assert payload.startswith(b"PK\x03\x04")
+
+
+def test_docx_is_deterministic_across_a_zip_timestamp_boundary():
+    """ZIP 条目时间戳精度是 2 秒，所以"连着调两次"测不出这个问题。
+
+    ``test_every_degradation_is_deterministic`` 对 docx 本来是条 flake：
+    它只在两次调用落进同一个 2 秒窗口时才绿。这里用一个被冻住的时钟把边界跨过去，
+    不真的 sleep——测试不该为了这个慢 2 秒。
+    """
+    import time as time_module
+
+    payload_a, _ = cd.degrade_corpus_file(_SOURCE, "docx")
+    real_time = time_module.time
+    try:
+        time_module.time = lambda: real_time() + 4  # 跨过两个 2 秒窗口
+        payload_b, _ = cd.degrade_corpus_file(_SOURCE, "docx")
+    finally:
+        time_module.time = real_time
+    assert payload_a == payload_b
+
+
+def test_docx_roundtrip_preserves_heading_levels():
+    """`#` 的数量必须一模一样回来：标题层级决定 heading_path 的嵌套，
+    而 heading_path 是 contextual chunk 的全部内容。"""
+    restored = _docx_roundtrip(_SOURCE)
+    original = [line.strip() for line in _SOURCE.splitlines() if line.startswith("#")]
+    recovered = [line.strip() for line in restored.splitlines() if line.startswith("#")]
+    assert recovered == original
+
+
+def test_docx_roundtrip_preserves_table_cells():
+    """表格里的数字是 table_lookup 那 6 条金标的答案所在。"""
+    source = (
+        "# 差旅标准\n\n"
+        "## 住宿\n\n"
+        "| 城市等级 | 标准 |\n"
+        "| -------- | ---- |\n"
+        "| 一线城市 | 600 元 |\n"
+        "| 二线城市 | 450 元 |\n"
+    )
+    restored = _docx_roundtrip(source)
+    assert "| 城市等级 | 标准 |" in restored
+    assert "| 二线城市 | 450 元 |" in restored
+
+
+def test_docx_divider_row_does_not_become_a_data_row():
+    """`| --- |` 在 Word 表格里没有对应概念，进去时必须丢掉。
+
+    注意读回来的正文里**仍然有**一行 `| --- |`——那是 ``_docx_render_table``
+    渲染 Markdown 表格时自己加的表头分隔行，不是原文那一行穿过来的。
+    判据因此是"只有一行"：不丢的话 Word 表格里会多一行内容为破折号的真数据行，
+    读回来就是两行 `---`，而那一行会作为一个分块的正文进库。
+    """
+    source = "| a | b |\n| --- | --- |\n| 1 | 2 |\n"
+    restored = _docx_roundtrip(source)
+    divider_lines = [line for line in restored.splitlines() if set(line) <= set("| -")]
+    assert len(divider_lines) == 1, restored
+    assert "| 1 | 2 |" in restored
+
+
+def test_docx_keeps_list_items_as_text():
+    """无序列表进 Word 是 List Bullet 段落，读回来是纯文本。
+
+    `财务` 那条金标的答案就在列表里（expense-policy.md 的审批门槛），
+    不是在表格里——所以列表内容丢了会直接让一条金标失败。
+    """
+    restored = _docx_roundtrip("- 单笔 5000 至 20000 元：追加财务负责人审批\n")
+    assert "财务负责人审批" in restored
+
+
+def test_docx_roundtrip_keeps_tables_inside_their_own_section():
+    """表格必须留在它所属的小节里。
+
+    这一条锁的是 ``extract_docx`` 按文档流遍历 body 那个决定：分别遍历
+    paragraphs 和 tables 会把表格搬到文末，于是表格脱离它的标题路径。
+    """
+    source = (
+        "# 制度\n\n## 住宿\n\n| 城市 | 标准 |\n| --- | --- |\n"
+        "| 一线 | 600 |\n\n## 审批\n\n由直属上级审批。\n"
+    )
+    restored = _docx_roundtrip(source)
+    table_at = restored.index("| 城市 | 标准 |")
+    assert restored.index("## 住宿") < table_at < restored.index("## 审批")
+
+
+def test_docx_roundtrip_is_near_identity_on_the_real_corpus():
+    """在真实语料上跑一遍，而不只是手搓的小样本。
+
+    这是整个 format-docx 变体的前提：往返近乎恒等，所以检索指标掉下来只可能是
+    解析器的问题，而不是"转换本身丢了东西"。
+
+    对照的是 ``clean_text(源文)`` 而不是源文本身。这一点要写清楚，因为它踩过：
+    ``extract_docx`` 内部会做 ``clean_text``（``INGEST_CLEAN`` 打开时），而 ``.md``
+    那条路径**同样**会做。拿裸源文比就会看到 ``vendor-notice.md`` 的全角括号
+    ``（）`` 变成半角 ``()`` 然后判它"往返丢了东西"——那是全角折叠，两种格式都做，
+    不是 docx 的问题。真实的对照必须两边都过同一道清洗。
+    """
+    import os
+
+    from eval.runner import CORPUS_DIR
+
+    names = sorted(name for name in os.listdir(CORPUS_DIR) if name.endswith(".md"))
+    assert names, "语料目录是空的，这条断言就失去意义了"
+    for name in names:
+        with open(os.path.join(CORPUS_DIR, name), encoding="utf-8") as handle:
+            source = handle.read()
+        restored = _docx_roundtrip(source)
+        baseline = ic.clean_text(source)
+        expected = [line.strip() for line in baseline.splitlines() if line.startswith("#")]
+        actual = [line.strip() for line in restored.splitlines() if line.startswith("#")]
+        assert actual == expected, f"{name} 的标题层级往返后变了"
+
+
+def test_document_label_strips_every_suffix_degradation_can_produce():
+    """``_document_label`` 的后缀表必须覆盖 ``degrade_corpus_file`` 的全部返回值。
+
+    漏一个的症状是**那个模式的召回集体归零**——金标按原始文件名标注，标签没剥
+    干净就一个都对不上，看起来像检索坏了。docx 这一轮就差点漏掉。
+    """
+    from eval.runner import _document_label
+
+    for mode in cd.DEGRADATIONS:
+        _payload, suffix = cd.degrade_corpus_file(_SOURCE, mode)
+        upload_name = "policy.md" if suffix == ".md" else f"policy.md{suffix}"
+        assert _document_label(f"{upload_name}#fp") == "policy.md", (
+            f"降级 {mode} 产出的后缀 {suffix} 没被 _document_label 剥掉"
+        )

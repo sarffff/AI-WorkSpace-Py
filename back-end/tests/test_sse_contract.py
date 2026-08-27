@@ -38,8 +38,11 @@ class PurposeAwareAdapter(ScriptedAdapter):
 class GuardingKnowledge(FakeKnowledgeService):
     """与真实 knowledge_service 一样在拼上下文前过 guard.shield 的替身。"""
 
-    async def build_rag_context_with_citations(self, db, query, user_id, top_k=5):
+    async def build_rag_context_with_citations(
+        self, db, query, workspace_id, top_k=5, viewer_id=None
+    ):
         self.search_queries.append(query)
+        self.viewer_ids.append(viewer_id)
         context, _report = guard.shield(self.context, label="参考", kind="rag")
         return context, list(self.citations)
 

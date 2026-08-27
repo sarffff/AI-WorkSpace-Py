@@ -24,8 +24,6 @@ export interface RegisterRequest {
   username: string;
   password: string;
   name?: string;
-  /** 邀请码(可选):填了加入对应工作区成为 member,共享其知识库 */
-  inviteCode?: string;
 }
 
 export interface AuthResponse {
@@ -71,6 +69,9 @@ export interface ChatSession {
 
 // ========== Knowledge相关类型 ==========
 
+/** 文档可见性。workspace = 工作区共享（仅 admin 可增删），private = 仅上传者可见 */
+export type DocumentVisibility = "workspace" | "private";
+
 export interface KnowledgeDocument {
   id: string;
   name: string;
@@ -78,6 +79,37 @@ export interface KnowledgeDocument {
   chunks: number;
   status: "indexed" | "processing" | "failed";
   createdAt: string;
+  /** 旧版后端不返回，缺省按共享处理（那是这一列加上去之前的语义） */
+  visibility?: DocumentVisibility;
+  /**
+   * 是不是当前用户自己上传的。**由后端算**而不是前端比 user_id：
+   * 前端手上不一定有当前用户 id，而这个判断错了就是一个能点但会 403 的删除按钮。
+   */
+  isOwn?: boolean;
+  /**
+   * 上传者显示名。列表里出现别人的个人文档时（只有 admin 会）用来说明"该找谁"，
+   * 因为那些文档 admin 看得见但删不掉。
+   */
+  ownerName?: string | null;
+  /**
+   * 原上传者的账号已被删除，这一篇是被收编成共享文档的。
+   *
+   * 后端判据是"共享但没有上传者"——正常上传总会带 uploader_id。
+   * 界面要标出来：这不是团队有意发布的资料，而是某个离开的人留下的，
+   * 值得看一眼再决定删或留。
+   */
+  inherited?: boolean;
+  /**
+   * 这一篇会不会进**当前用户**的检索。
+   *
+   * admin 的列表里包含全体成员的个人文档，而那些**不参与他的检索**
+   * （后端 `HybridRetriever._retrievable_by` 不认角色）。所以"可见"和"会被引用"
+   * 是两件事，界面必须分开说——否则 admin 看到一份文档却问不出内容，
+   * 只会以为检索坏了。
+   *
+   * 旧版后端不返回时缺省 true，那时两者本来就是一回事。
+   */
+  retrievable?: boolean;
 }
 
 export interface UploadDocumentResponse extends KnowledgeDocument {
@@ -90,17 +122,36 @@ export interface UploadDocumentResponse extends KnowledgeDocument {
 export interface WorkspaceMember {
   id: string;
   name: string;
-  role: "admin" | "member";
+  /** `member` 是历史值，语义等同 `user`（见 WorkspaceInfo.role） */
+  role: "admin" | "user" | "member";
 }
 
 export interface WorkspaceInfo {
   id: string;
   name: string;
-  role: "admin" | "member";
+  /**
+   * ``admin`` 管共享文档与邀请码；``user`` 只管自己的私有文档。
+   * ``member`` 是历史值（语义等同 ``user``），存量账号上还可能出现，
+   * 所以判断权限一律用 ``isAdmin`` 而不是比这个字段。
+   */
+  role: "admin" | "user" | "member";
+  /** 唯一的权限判据。后端算好，前端不要自己比 role */
+  isAdmin?: boolean;
   memberCount: number;
   members: WorkspaceMember[];
-  /** 只有 admin 能看到邀请码;member 为 null */
-  inviteCode: string | null;
+  /** 邀请码只发给 admin；user 拿到的是 null，界面上就不该出现它 */
+  inviteCode?: string | null;
+}
+
+export interface JoinWorkspaceResponse {
+  success: boolean;
+  workspace: WorkspaceInfo;
+  /**
+   * 原空间里这个人能看到的文档数。加入是**换空间**不是多一个空间
+   * （后端 ``User.workspace_id`` 是单值外键），这些文档不会被删，
+   * 但加入后不再出现在任何检索里——必须提示，静默切换会让人以为资料丢了。
+   */
+  leftBehindDocuments: number;
 }
 
 // ========== Prompt相关类型 ==========
@@ -188,6 +239,29 @@ export interface ServerCapabilities {
   delegation?: DelegationCapability;
   /** 旧版后端不返回这一块 */
   approval?: ApprovalCapability;
+  /** 旧版后端不返回这一块 */
+  fileTypes?: FileTypesCapability;
+}
+
+/**
+ * 能上传哪些文件。**这里是唯一来源，前端不要再各自维护扩展名清单。**
+ *
+ * 改动之前这份清单在前后端共有六处副本且已经互相矛盾：`.html` 三处前端都收、
+ * 两处后端都不收（知识库上传直接 400）；`.svg` 前端当图片收、后端出于安全
+ * 故意排除，而图片分支没有兜底，所以必然报"图片上传失败"。
+ * 判据与排除理由见后端 `services/file_types.py`。
+ */
+export interface FileTypesCapability {
+  /** 能按纯文本读取、内联进 prompt 的 */
+  text: string[];
+  /** 用 <img> 渲染的。不含 svg（可内嵌 script） */
+  image: string[];
+  /** 要专门解析器的二进制文档，走知识库链路 */
+  document: string[];
+  /** 知识库上传用的 accept：text + document，不含图片 */
+  knowledgeAccept: string;
+  /** 对话附件用的 accept：text + image + document */
+  attachmentAccept: string;
 }
 
 /**
@@ -283,6 +357,7 @@ export interface StreamChunk {
     | "approval_required"
     | "approval_resolved"
     | "clarification"
+    | "clarification_answered"
     | "done"
     | "error";
   content?: string;
@@ -328,6 +403,14 @@ export interface StreamChunk {
   checkpoint?: number | null;
   /** clarification 携带：模型抛回给用户的问题 */
   question?: string;
+  /**
+   * clarification 携带：这次澄清能不能**接着原来那一轮**继续。
+   *
+   * `true` 时该调 `POST /chats/runs/{runId}/answer` 把答案送回去——模型手里
+   * 还留着它问问题之前检索到的一切。缺这个键（没开 checkpoint）时只能退回旧
+   * 行为：把回答当成新一轮发出去，代价是前面几轮的工具结果全部丢掉。
+   */
+  resumable?: boolean;
   /** approval_required 携带：这一回合最终回答将要落在哪条 assistant 消息上 */
   message_id?: string;
   /** SSE 的子代理状态会额外出现 started / completed / failed */
@@ -565,6 +648,22 @@ export interface FeedbackSummary {
   pendingExport: number;
 }
 
+// ========== 长期记忆 ==========
+
+/**
+ * 跨会话长期记忆。每轮回答结束后由辅助模型从对话里抽取事实与偏好，
+ * 注入之后所有会话的系统上下文——删除即立即停止注入。
+ */
+export interface UserMemory {
+  id: string;
+  /** fact = 客观事实；preference = 用户偏好 */
+  kind: "fact" | "preference";
+  content: string;
+  /** 抽取来源的会话 id，用于追溯这句话是在哪次对话里说的 */
+  chatId: string | null;
+  createdAt: string;
+}
+
 // ========== 用量与追踪 ==========
 
 /** 按某个维度（span 名 / 模型 / kind）聚合出的一行用量 */
@@ -592,6 +691,10 @@ export interface UsageSummary {
     promptTokens: number;
     completionTokens: number;
     failures: number;
+    /** promptTokens 中被提供商上下文缓存命中的部分（子集，不是增量） */
+    cachedTokens: number;
+    /** 提供商侧上下文缓存命中率；没有回传缓存信息的调用时为 null */
+    promptCacheHitRate: number | null;
     /** 本地估算的 token 占比，越高说明成本数字越只能当量级参考 */
     estimatedTokenShare: number | null;
   };

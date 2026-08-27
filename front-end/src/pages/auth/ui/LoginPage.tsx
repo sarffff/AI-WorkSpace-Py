@@ -66,9 +66,9 @@ export const LoginPage: React.FC = () => {
         <div className="relative z-10">
           <div className="flex items-center gap-3 mb-10">
             <BrandMark size={40} />
-            <span className="font-display text-lg font-semibold">AI Workspace</span>
+            <span className="font-display text-lg font-semibold">有据工作台</span>
           </div>
-          <p className="label-eyebrow mb-3">Glass bench</p>
+          <p className="label-eyebrow mb-3">工作台</p>
           <h1 className="font-display text-[40px] leading-[1.15] font-semibold text-[#1f1e1d] dark:text-[#edece8] text-balance">
             看见模型<br />怎么想
           </h1>

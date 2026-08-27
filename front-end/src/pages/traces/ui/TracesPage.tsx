@@ -82,11 +82,19 @@ export const TracesPage: React.FC = () => {
     ? traces.filter((t) => t.failures > 0)
     : traces;
 
+  // 首次加载（还没有任何数据）才整页换 loading 态；「加载更多」与手动刷新时
+  // 列表保持挂载——整页换成一行"正在加载"会把滚动位置弹回顶部，这正是
+  // 加载更多跳顶的原因：列表被卸载重挂，scrollTop 归零。
+  const initialLoading = loading && traces.length === 0;
+  const loadingMore = loading && traces.length > 0;
+  // 后端 /metrics/traces 的 limit 上限是 100；返回条数少于请求的 limit 说明没有更多了
+  const hasMore = traces.length >= limit;
+
   return (
     <div className="page-shell app-atmosphere transition-colors duration-200">
       <div className="relative z-10 space-y-5 h-full flex flex-col max-w-6xl">
         <PageHeader
-          eyebrow="Replay"
+          eyebrow="回放"
           title="运行轨迹"
           description="把一次回答拆成 span 瀑布。核对耗时、token、失败点——不是看热闹。"
           actions={
@@ -99,9 +107,12 @@ export const TracesPage: React.FC = () => {
               </button>
               <button
                 onClick={fetchTraces}
-                className="btn-accent px-3 py-1.5 rounded-lg text-[11px] flex items-center gap-1.5"
+                disabled={loading}
+                className="btn-accent px-3 py-1.5 rounded-lg text-[11px] flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                <RefreshCw className="w-3.5 h-3.5" />
+                <RefreshCw
+                  className={`w-3.5 h-3.5 ${loadingMore ? "animate-spin" : ""}`}
+                />
                 刷新
               </button>
             </div>
@@ -115,13 +126,13 @@ export const TracesPage: React.FC = () => {
           </div>
         )}
 
-        {loading && (
+        {initialLoading && (
           <div className="flex items-center gap-2 text-xs text-[#6e6b63] dark:text-[#a19f96]">
             <Loader2 className="w-4 h-4 animate-spin" /> 正在加载...
           </div>
         )}
 
-        {!loading && traces.length === 0 && !error && (
+        {!initialLoading && traces.length === 0 && !error && (
           <EmptyState
             icon={<BrandMark size={48} className="!rounded-[16px]" />}
             title="还没有可回放的轨迹"
@@ -133,7 +144,8 @@ export const TracesPage: React.FC = () => {
           />
         )}
 
-        {!loading && traces.length > 0 && (
+        {/* 有数据就一直挂载（包括"加载更多"进行中）——列表被卸载重挂是滚动跳顶的根源 */}
+        {traces.length > 0 && (
           <div className="flex-1 grid grid-cols-[1fr_2fr] gap-5 min-h-0">
             {/* 左列:列表 */}
             <div className="card-surface rounded-2xl overflow-hidden flex flex-col">
@@ -182,9 +194,17 @@ export const TracesPage: React.FC = () => {
               </div>
               <button
                 onClick={() => setLimit((l) => l + 20)}
-                className="p-3 text-xs text-[#da7756] hover:bg-[#f3f0e6] dark:hover:bg-[#22211e] font-medium transition-colors"
+                disabled={loadingMore || !hasMore}
+                className="p-3 text-xs text-[#da7756] hover:bg-[#f3f0e6] dark:hover:bg-[#22211e] font-medium transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-1.5"
               >
-                加载更多
+                {loadingMore && (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                )}
+                {loadingMore
+                  ? "正在加载..."
+                  : hasMore
+                    ? "加载更多"
+                    : "没有更多了"}
               </button>
             </div>
 

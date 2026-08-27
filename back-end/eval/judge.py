@@ -70,6 +70,25 @@ def _bool_from_fragment(text: str, field: str) -> bool | None:
         return None
     return match.group(1) == "true"
 
+
+# 裁判理由里表示"它认为这次是拒答"的说法。只用来**检测自相矛盾**，
+# 不用来改判——见 AnswerJudge.judge 里那段注释。
+_REASON_SAYS_ABSTAINED = re.compile(
+    r"正确拒答|正确地拒答|已拒答|拒答正确|未找到|没有找到|未提及|未涉及"
+)
+
+
+def _contradicts(reason: str, abstained: bool) -> bool:
+    """裁判的理由和它的布尔判定是否互相矛盾。
+
+    只查一个方向：``abstained=false`` 而理由说"正确拒答"。反方向
+    （``abstained=true`` 但理由说编造了）不算矛盾——一次拒答完全可以同时带编造，
+    这正是 rubric 现在明确说开的那件事。
+    """
+    if abstained:
+        return False
+    return bool(_REASON_SAYS_ABSTAINED.search(reason or ""))
+
 _RUBRIC = """你是严格的评审。根据「参考内容」判断「回答」的质量，不要用你自己的知识补充。
 
 按 1-5 打分：
@@ -81,10 +100,19 @@ _RUBRIC = """你是严格的评审。根据「参考内容」判断「回答」�
 
 _ABSTENTION_RUBRIC = """你是严格的评审。这个问题在知识库中**没有**答案，正确行为是说明未找到相关内容。
 
-判断「回答」是否正确地拒答了。编造了具体信息（数字、流程、金额）即为失败。
+请分别判断两件**互不影响**的事：
 
-只输出 JSON，不要任何解释文字：
-{"abstained": true/false, "fabricated": ["..."], "reason": "一句话"}"""
+1. `abstained`：回答有没有说明"资料里没有"。这是**纯行为判断**，只看回答说了什么。
+   只要回答表达了"未找到 / 没有相关信息 / 资料未提及"，`abstained` 就是 true——
+   **即使**它同时犯了别的错（比如列了不存在的来源、又多补了一句猜测）。
+2. `fabricated`：回答里凭空出现的具体信息（数字、流程、金额、来源文件名）。
+   有就逐条列出，没有就给空数组。
+
+一次拒答同时带编造是完全可能的：那时 `abstained` 是 true，`fabricated` 非空。
+不要因为回答有别的问题就把 `abstained` 写成 false——那两个字段各管一件事。
+
+只输出 JSON，不要任何解释文字。**先写 reason，最后写 abstained**：
+{"reason": "一句话", "fabricated": ["..."], "abstained": true/false}"""
 
 _TASK_RUBRIC = """你是严格的评审，正在评估一个能调用工具的 AI 助手。
 
@@ -114,6 +142,8 @@ class JudgeVerdict:
     abstained: bool | None = None
     reason: str = ""
     failed: bool = False
+    # 裁判的理由和它的 abstained 互相矛盾。计数进报告，用来验证 rubric 改动生效
+    inconsistent: bool = False
 
 
 def _clamp_score(value: object) -> float | None:
@@ -202,7 +232,15 @@ class AnswerJudge:
 
         if not answerable:
             assert isinstance(result, structured.AbstentionVerdict)
-            return JudgeVerdict(abstained=result.abstained, reason=result.reason[:300])
+            return JudgeVerdict(
+                abstained=result.abstained,
+                reason=result.reason[:300],
+                # 不在这里"改对"裁判的判定:那是拿子串规则覆盖模型的结论,而子串
+                # 规则本身就是不可靠的(见 metrics._fold 那段)。只把矛盾标出来、
+                # 让它在报告里可见——真正的修法是上面那份 rubric,而这个计数是
+                # 用来证明修法生效的。
+                inconsistent=_contradicts(result.reason, result.abstained),
+            )
 
         assert isinstance(result, structured.AnswerScores)
         return JudgeVerdict(

@@ -1,17 +1,17 @@
-# AI Workspace
+# 有据工作台 (YouJu Workspace)
 
 <div align="center">
 
-![AI Workspace](https://img.shields.io/badge/AI-Workspace-blue?style=for-the-badge)
+![有据工作台](https://img.shields.io/badge/有据-工作台-blue?style=for-the-badge)
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)
 ![React](https://img.shields.io/badge/React-19.0-61DAFB?style=for-the-badge&logo=react&logoColor=black)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.5-3178C6?style=for-the-badge&logo=typescript&logoColor=white)
 ![Electron](https://img.shields.io/badge/Electron-31.0-47848F?style=for-the-badge&logo=electron&logoColor=white)
 
-**一个功能丰富的 AI 助手桌面应用**
+**回答有据可查的企业知识库 AI 工作台**
 
-集成对话管理、知识库、提示词工程等功能的现代化 AI 工作空间
+集成知识库问答（RAG）、对话管理、提示词工程与全程可观测能力的桌面应用——每条引用可溯源、每次执行可回放、每条差评可变成回归用例。
 
 [快速开始](#快速开始) · [功能特性](#功能特性) · [技术栈](#技术栈) · [开发文档](#开发文档)
 

@@ -14,7 +14,7 @@ from services.settings_service import (
     save_preferences,
 )
 from services.web_search import web_search_client
-from services import agent_roles, approval, subagent
+from services import agent_roles, approval, file_types, subagent
 
 router = APIRouter(prefix="/settings", tags=["设置"])
 
@@ -74,6 +74,11 @@ async def get_settings(
                 "tools": sorted(approval.gated_tools()),
                 "checkpoints": app_settings.AGENT_CHECKPOINT_ENABLED,
             },
+            # 能上传哪些文件。放在 capabilities 里而不是 server 里：它和上面几项
+            # 一样是"前端据此改变行为"，不是拿来显示的配置值——文件选择器的 accept、
+            # 以及"这个扩展名走内联还是走知识库"的分派都由它决定。
+            # 前端不再自己维护扩展名清单，理由见 services/file_types.py。
+            "fileTypes": file_types.payload(),
         },
     }
 

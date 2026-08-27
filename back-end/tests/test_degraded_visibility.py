@@ -94,10 +94,18 @@ def test_rerank_api_request_failure_is_marked(monkeypatch):
 
 
 def test_rerank_api_unconfigured_is_marked(monkeypatch):
-    """未配置端点时不静默退回 llm——否则报告里的 mode=api 与实际跑的东西不一致。"""
+    """未配置端点时不静默退回 llm——否则报告里的 mode=api 与实际跑的东西不一致。
+
+    2026-08-27 补：原来只清 3 个设置，而 ``configured`` 仍为 True（``endpoint``
+    空 base 时是 ``"/rerank"``、``api_key`` 回落 ``LLM_API_KEY``），于是这条测试
+    走的是**请求失败**分支——``stages == ["rerank_api"]`` 在那条路上同样成立，
+    所以它绿着却没测到未配置。现在清全 5 个，并顺带断言原因。
+    """
     monkeypatch.setattr(settings, "RERANK_API_KEY", "")
     monkeypatch.setattr(settings, "RERANK_BASE_URL", "")
     monkeypatch.setattr(settings, "LLM_BASE_URL", "")
+    monkeypatch.setattr(settings, "LLM_API_KEY", "")
+    monkeypatch.setattr(settings, "RERANK_MODEL", "")
 
     async def body():
         out = await retriever.HybridRetriever()._rerank_via_api(
@@ -108,6 +116,8 @@ def test_rerank_api_unconfigured_is_marked(monkeypatch):
     attrs = run(_capture(body))
     stages = [a["degraded_stage"] for a in attrs if a.get("degraded_stage")]
     assert stages == ["rerank_api"]
+    reasons = [a["degraded_reason"] for a in attrs if a.get("degraded_reason")]
+    assert reasons == ["unconfigured"], "这才说明走的是未配置分支，不是请求失败分支"
 
 
 def test_eval_collects_degraded_stages_from_the_whole_trace():
@@ -182,3 +192,161 @@ def test_successful_rerank_is_not_marked(monkeypatch):
 
     attrs = run(_capture(body))
     assert not [a for a in attrs if a.get("degraded_stage")]
+
+
+# ========== 降级**原因**也要留痕 ==========
+#
+# 次数回答"生效了没有"，原因回答"该改哪里"。只有次数时下一步只能靠猜——
+# 2026-08-27 那份报告说 rerank 降级 10 次，而 truncated（加预算）、no_json
+# （换提示词）、http_429（换端点）的修法完全不同。
+
+
+def test_http_failure_carries_the_status_code_as_a_reason(monkeypatch):
+    """HTTP 失败的原因要带状态码：401/429/400 指向三种不同的处理动作。"""
+
+    async def boom(*_a, **_kw):
+        raise RerankError("重排请求失败 (HTTP 429)", code="http_429_1113")
+
+    monkeypatch.setattr(rerank.rerank_client, "rerank", boom)
+
+    async def body():
+        await retriever.HybridRetriever()._rerank_via_api("q", ["c1"], ["s1"])
+
+    attrs = run(_capture(body))
+    reasons = [a["degraded_reason"] for a in attrs if a.get("degraded_reason")]
+    assert reasons == ["http_429_1113"], (
+        "429/1113 是额度没开通、要换端点；普通 429 是限流、该重试。只记"
+        "「请求失败」这两件事分不开。"
+    )
+
+
+def test_unconfigured_endpoint_has_its_own_reason(monkeypatch):
+    """没配端点和配了但失败是两件事，原因要分得开。
+
+    ## 为什么要清 4 个设置而不是 3 个
+
+    ``RerankClient.configured`` 是 ``api_key and RERANK_MODEL and endpoint``，而：
+
+    - ``endpoint`` 返回 ``f"{base}/rerank"``，base 空时是 ``"/rerank"`` —— **真值**
+    - ``api_key`` 会回落到 ``LLM_API_KEY``，而 ``.env`` 里有
+
+    所以只清 RERANK_* 和 LLM_BASE_URL 时 ``configured`` 仍然为 True，会真的发一次
+    请求并走**失败**分支。上面那条 ``test_rerank_api_unconfigured_is_marked`` 就是
+    这样：它断言的 ``stages == ["rerank_api"]`` 在失败分支上同样成立，所以它一直
+    绿着，却从没真正测到未配置那条路。是这条测试断言了原因才把它暴露出来。
+    """
+    monkeypatch.setattr(settings, "RERANK_API_KEY", "")
+    monkeypatch.setattr(settings, "RERANK_BASE_URL", "")
+    monkeypatch.setattr(settings, "LLM_BASE_URL", "")
+    monkeypatch.setattr(settings, "LLM_API_KEY", "")
+    monkeypatch.setattr(settings, "RERANK_MODEL", "")
+
+    async def body():
+        await retriever.HybridRetriever()._rerank_via_api("q", ["c1"], ["s1"])
+
+    attrs = run(_capture(body))
+    reasons = [a["degraded_reason"] for a in attrs if a.get("degraded_reason")]
+    assert reasons == ["unconfigured"]
+
+
+def test_reason_is_absent_rather_than_unknown_when_there_is_none():
+    """没有原因时不写这个键，而不是写 "unknown"。
+
+    缺失和"确实不知道"在汇总时该分得开——写死 unknown 会让"埋点没接上"
+    和"这次真的拿不到原因"长得一样。
+    """
+
+    async def body():
+        retriever._mark_degraded("some_stage", "退回默认")
+
+    attrs = run(_capture(body))
+    marked = [a for a in attrs if a.get("degraded_stage")]
+    assert marked, "阶段本身要写上"
+    assert "degraded_reason" not in marked[0]
+
+
+def test_structured_failure_reason_reaches_the_span():
+    """``_warn_degraded`` 手里有 failures，那就必须传下去。
+
+    改动之前它只写日志：报告能说出"rerank 降级 10 次"却说不出为什么，
+    而读报告的人不看日志。
+    """
+
+    class _Report:
+        attempts = 2
+        failures = ["truncated", "no_json"]
+        finish_reason = "length"
+        budget_exhausted = False
+
+    async def body():
+        retriever._warn_degraded("rerank", _Report(), "退回融合序")
+
+    attrs = run(_capture(body))
+    marked = [a for a in attrs if a.get("degraded_stage")]
+    assert marked[0]["degraded_stage"] == "rerank"
+    # 取**最后**一次失败：前面几次可能是重试路上的不同原因
+    assert marked[0]["degraded_reason"] == "no_json"
+
+
+def test_finish_reason_is_used_when_there_are_no_failures():
+    """一次都没进 failures 但仍然返回 None 时，退回用 finish_reason。"""
+
+    class _Report:
+        attempts = 1
+        failures: list[str] = []
+        finish_reason = "length"
+        budget_exhausted = True
+
+    async def body():
+        retriever._warn_degraded("hyde", _Report(), "用原查询")
+
+    attrs = run(_capture(body))
+    marked = [a for a in attrs if a.get("degraded_stage")]
+    assert marked[0]["degraded_reason"] == "finish_length"
+
+
+def test_eval_aggregates_reasons_per_stage():
+    """eval 把原因按 ``阶段:原因`` 汇总，不和阶段计数混在一起。
+
+    混进 ``degraded_stages`` 会让"同一阶段两种原因"变成两个阶段，
+    而那一列是按阶段计数用的。
+    """
+    from eval.runner import _degraded_reasons, _degraded_stages
+
+    class _Span:
+        def __init__(self, **attrs):
+            self.attributes = attrs
+
+    class _Trace:
+        spans = [
+            _Span(degraded_stage="rerank", degraded_reason="truncated"),
+            _Span(degraded_stage="rerank", degraded_reason="no_json"),
+            _Span(degraded_stage="rerank", degraded_reason="truncated"),
+            _Span(other="x"),
+        ]
+
+    trace = _Trace()
+    # 阶段那一列仍然只数阶段
+    assert _degraded_stages(trace) == ["rerank", "rerank", "rerank"]
+    assert _degraded_reasons(trace) == [
+        "rerank:truncated",
+        "rerank:no_json",
+        "rerank:truncated",
+    ]
+
+
+def test_degradation_without_a_reason_counts_as_unknown_in_the_summary():
+    """没有原因的降级也要计数，归到 unknown。
+
+    少算一次会让 degradedCases 和原因数对不上，而对不上比缺信息更难查。
+    """
+    from eval.runner import _degraded_reasons
+
+    class _Span:
+        def __init__(self, **attrs):
+            self.attributes = attrs
+
+    class _Trace:
+        spans = [_Span(degraded_stage="rerank_api")]
+
+    assert _degraded_reasons(_Trace()) == ["rerank_api:unknown"]

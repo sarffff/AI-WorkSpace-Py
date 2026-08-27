@@ -16,7 +16,7 @@ import math
 import re
 import threading
 from collections import Counter
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -315,7 +315,10 @@ class BM25Index:
 
 
 def reciprocal_rank_fusion(
-    rankings: list[list[str]], k: int = 60, weights: list[float] | None = None
+    rankings: list[list[str]],
+    k: int = 60,
+    weights: list[float] | None = None,
+    tiebreak: Callable[[str], Any] | None = None,
 ) -> list[tuple[str, float]]:
     """RRF 融合多条召回通道。
 
@@ -330,6 +333,21 @@ def reciprocal_rank_fusion(
 
     权重个数与通道数不匹配时按 1.0 补齐而不是抛错：多查询改写会让通道数变成
     动态的（每个改写变体各贡献两路），调用方很难预先算准个数。
+
+    **``tiebreak`` 不是可选的讲究，是修一个真实的不确定性。** RRF 的并列是
+    *结构性*的：两个块只要在 dense 与 sparse 里相邻互换位置，两边各拿一个第 n
+    一个第 n+1，融合分就是同一个 ``w/(k+n) + w/(k+n+1)``——不是"接近"，是浮点
+    位位相同。这种情况很常见，而默认按 ``chunk_id`` 打破并列意味着胜者由**随机
+    UUID** 决定：同一份语料重新索引一次，top-1 就可能换人。
+
+    2026-08-23 量到的实例："什么职级可以买高铁一等座？" 里 ``travel-booking``
+    在 dense 第 1、sparse 第 2，``expense-policy`` 恰好相反，两者融合分都是
+    ``1/61 + 1/62 = 0.03252247488101534``。重新索引前后 top-1 互换，期望文档
+    从第 1 位掉到第 2 位，那条题的 nDCG 在 1.0 与 0.6309 之间跳——**改动无关的
+    语料也会让别的用例变色**，评估里读到的"提升"可能只是换了一批 UUID。
+
+    传入按"文档名 + 块序号"这类**跨重建稳定**的键，同一份语料就永远给出同一个
+    顺序。不传时退回 ``chunk_id``，保持既有调用方与基线数字不变。
     """
     scores: dict[str, float] = {}
     for index, ranking in enumerate(rankings):
@@ -338,7 +356,8 @@ def reciprocal_rank_fusion(
             weight = weights[index]
         for rank, chunk_id in enumerate(ranking, start=1):
             scores[chunk_id] = scores.get(chunk_id, 0.0) + weight / (k + rank)
-    return sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    key = tiebreak or (lambda chunk_id: chunk_id)
+    return sorted(scores.items(), key=lambda item: (-item[1], key(item[0])))
 
 
 class _UserIndexes:
@@ -349,13 +368,41 @@ class _UserIndexes:
         self.bm25 = BM25Index()
 
 
-# 桶键是知识库的作用域 id(现为 workspace_id)。
+# 桶键是"检索作用域"。加可见性之前它就是 workspace_id;现在因为"能检索到什么"
+# 因人而异(共享文档 + 自己的私有文档),它是 workspace_id 或 workspace_id|viewer_id,
+# 由 scope_key() 拼。
 _indexes: dict[str, _UserIndexes] = {}
 _indexes_lock = threading.Lock()
 
+_SCOPE_SEPARATOR = "|"
+
+
+def scope_key(workspace_id: str, viewer_id: str | None = None) -> str:
+    """拼检索作用域键。
+
+    ``viewer_id`` 为 None 时退回纯工作区键——那是"只检索共享文档"的语义,
+    离线评估与脚本走这条路。
+
+    **为什么按人分桶。** 索引是按 SQL 查回来的行建的,而那批行现在取决于查看者
+    (共享文档 + 他自己的私有文档)。共用一份索引就意味着别人的私有分块也在 BM25
+    词表里——正确性上仍然安全(``_retrieve`` 里 ``chunk_id in by_id`` 会把它们滤掉),
+    但那是把隔离押在一个后置过滤上,而且会挤占 per-channel 的候选席位。
+
+    **代价说清楚。** 每个活跃用户一份索引,共享文档在每份里各占一次内存。
+    不是重新 embedding(``build_if_stale`` 从库里已存的 embedding 建索引,不发请求),
+    但内存确实随活跃用户数线性增长。
+    可接受的前提是"一个工作区几个人";上百人的工作区应当改成
+    "共享索引一份 + 每人一份小私有索引,检索时各取 top-k 再 RRF 融合"——
+    RRF 已经在 ``reciprocal_rank_fusion`` 里,那条路不需要新机制,只需要
+    ``_retrieve`` 支持两个来源。留到真有那个规模再做。
+    """
+    if not viewer_id:
+        return workspace_id
+    return f"{workspace_id}{_SCOPE_SEPARATOR}{viewer_id}"
+
 
 def get_scope_indexes(scope_id: str) -> _UserIndexes:
-    """按知识库作用域(工作区)隔离索引，避免跨工作区检索结果混合。"""
+    """按检索作用域隔离索引，避免跨工作区/跨用户的结果混合。"""
     with _indexes_lock:
         return _indexes.setdefault(scope_id, _UserIndexes())
 
@@ -378,6 +425,38 @@ def indexes_fresh(scope_id: str, signature: str) -> bool:
 
 
 def invalidate_scope_indexes(scope_id: str) -> None:
-    """文档增删后调用；下次检索时重建。scope_id 是工作区 id。"""
+    """文档增删后调用；下次检索时重建。``scope_id`` 传工作区 id。
+
+    **按前缀清掉该工作区下所有分桶**,不只是同名那一个。加可见性之后一个工作区
+    有多个桶(``ws`` 与 ``ws|viewer``),而共享文档的增删影响其中每一个——
+    只 pop 精确键会让所有带 viewer 的桶继续用旧索引,症状是"admin 传了新文档,
+    别人搜不到,重启才好"。
+
+    传一个具体的 ``ws|viewer`` 键也是合法的(只清那一个人的桶),那是私有文档
+    增删的场景。前缀匹配对它同样成立且更宽,清多了只是多一次重建。
+    """
+    prefix = f"{scope_id}{_SCOPE_SEPARATOR}"
     with _indexes_lock:
-        _indexes.pop(scope_id, None)
+        for key in [
+            key
+            for key in _indexes
+            if key == scope_id or key.startswith(prefix)
+        ]:
+            _indexes.pop(key, None)
+
+
+def invalidate_viewer_indexes(viewer_id: str) -> None:
+    """清掉某个人的所有桶,**不论他在哪个工作区**。
+
+    存在的理由是私有文档跟人走(见 ``HybridRetriever._retrievable_by``):一个人的
+    私有文档增删要影响的是"他的"索引,而他的桶键是
+    ``<他当前所在工作区>|<他>``——那个工作区未必等于文档的 ``workspace_id``
+    (文档可能是他在上一个空间里传的)。所以按工作区前缀清是清不到的,
+    这里改成扫键的后半段。
+
+    症状如果漏掉:删了自己的私有文档,当前会话里还能搜到它。
+    """
+    suffix = f"{_SCOPE_SEPARATOR}{viewer_id}"
+    with _indexes_lock:
+        for key in [key for key in _indexes if key.endswith(suffix)]:
+            _indexes.pop(key, None)

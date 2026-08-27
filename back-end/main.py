@@ -222,6 +222,37 @@ def _check_ingest_backend() -> None:
         )
 
 
+def _adopt_orphaned_documents() -> None:
+    """把删用户留下的无主私有文档收编成工作区共享文档。
+
+    挂在启动上而不是删用户时,因为**没有删用户的接口**:今天删账号只能走 SQL,
+    而 SQL 不触发任何应用层逻辑。所以启动是唯一能兜住它的位置。
+
+    正常情况下这里一篇都收编不到(一行都不打)。收编到了就必须打出来:那意味着
+    有文档从"谁都搜不到"变成了"全工作区可检索",而这件事在界面上只表现为
+    "共享库里多了几篇没人记得传过的文档"——不打出来就没有任何地方能对上因果。
+
+    整段包在 try 里:收编失败不该让服务起不来。它修的是一个已经存在了一段时间的
+    滞留状态,晚一次重启再修没有损失,而起不来是立刻的损失。
+    """
+    from database import SessionLocal
+    from services import workspace_service
+
+    db = SessionLocal()
+    try:
+        adopted = workspace_service.adopt_orphaned_documents(db)
+        if adopted:
+            print(
+                f"  ⚠ 已收编 {adopted} 篇无主个人文档为工作区共享文档 —— "
+                "原上传者的账号已被删除，这些文档此前谁都检索不到、也删不掉。"
+                "现在管理员能在知识库列表里看到它们（带「继承」标记），自行决定删或留。"
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠ 收编无主个人文档失败（不影响启动）：{type(exc).__name__}: {exc}")
+    finally:
+        db.close()
+
+
 @app.on_event("startup")
 async def startup():
     """应用启动时执行"""
@@ -231,6 +262,7 @@ async def startup():
     # 起不来，而不是等第一个用户提问时才在 500 里暴露。
     prompt_library.validate()
     _check_ingest_backend()
+    _adopt_orphaned_documents()
     # 工具是按开关注册的，而"开关开了但没配 key 的 web_search 根本不注册"这类
     # 静默行为在界面上只表现为"模型不用那个工具"——分不清是没注册还是模型不想用。
     # 所以启动时把实际注册了哪些打出来，这是排查工具类问题的第一现场。

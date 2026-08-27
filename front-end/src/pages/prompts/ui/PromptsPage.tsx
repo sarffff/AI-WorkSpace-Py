@@ -161,7 +161,7 @@ export const PromptsPage: React.FC = () => {
         <div className="page-shell app-atmosphere transition-colors duration-200">
             <div className="relative z-10 space-y-6 max-w-6xl">
             <PageHeader
-                eyebrow="Lab"
+                eyebrow="实验"
                 title="提示词工作台"
                 description="左边是自己攒的模板，右边是驱动对话与评估的系统提示词——只读，因为版本是仓库里的文件。"
                 actions={

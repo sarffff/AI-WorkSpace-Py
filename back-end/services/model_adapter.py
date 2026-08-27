@@ -265,10 +265,27 @@ class OpenAICompatibleAdapter(ModelAdapter):
             streaming=False,
             tools=len(tools) or None,
         ) as span:
-            response = await self._client.chat.completions.create(
-                **self._build_request(
-                    messages, tools, model, temperature, max_tokens, top_p
+            client = self._client
+            # 辅助调用（重排 / HyDE / 改写 / 摘要）单独设更短的超时与更少的重试。
+            #
+            # 判据是 ``purpose != "chat"``：辅助调用**全都有降级路径**，为一个
+            # 可以放弃的增强等 SDK 默认的 600s×3 是纯亏。实测 rerank 变体 p90
+            # 延迟 255 秒、最大 336 秒（baseline 37 秒），那个 336 就是重试链，
+            # 而 eval 里 10/54 的降级正是耗尽重试的那些。
+            #
+            # ``with_options`` 返回一个浅拷贝，共用底层连接池，所以这里不会因为
+            # 每次调用都造新客户端而丢掉 keep-alive。
+            if purpose != "chat":
+                client = client.with_options(
+                    timeout=settings.LLM_AUXILIARY_TIMEOUT_SECONDS,
+                    max_retries=settings.LLM_AUXILIARY_MAX_RETRIES,
                 )
+                span.set(auxiliary_timeout=settings.LLM_AUXILIARY_TIMEOUT_SECONDS)
+            request = self._build_request(
+                messages, tools, model, temperature, max_tokens, top_p
+            )
+            response = await self._create_completion(
+                client, request, auxiliary=purpose != "chat", span=span
             )
             if not response.choices:
                 span.set(empty_response=True)
@@ -451,6 +468,42 @@ class OpenAICompatibleAdapter(ModelAdapter):
 
     # 部分 OpenAI 兼容端点不认 stream_options。被拒一次就记住，不再重复试探。
     _stream_usage_supported = True
+    # 同一个套路:辅助调用尝试关掉思考链,端点不认就记住并不再试探。
+    #
+    # 为什么值得关:实测 20 候选的 listwise 重排,开思考 20.3 秒 / 1011 输出 token,
+    # 关掉 0.4 秒 / 7 token——**快 50 倍**,而且排序结果更好(开着时那 1011 token
+    # 想了半天只吐出 [10],关掉给出 [10, 20])。排序不需要思考链,而思考链的代价
+    # 恰恰是这个调用点唯一的瓶颈。
+    #
+    # 只对辅助调用做。主回答那次的思考链是有价值的,不能顺手关掉。
+    _thinking_opt_out_supported = True
+
+    async def _create_completion(
+        self, client: Any, request: dict[str, Any], *, auxiliary: bool, span: Any
+    ) -> Any:
+        """发一次非流式请求。辅助调用先试着关掉思考链。
+
+        被端点拒绝时**只回退一次并记住**,而不是每次调用都白试一遍——和
+        ``_stream_usage_supported`` 同一个套路。只认 400 类错误(``_is_bad_request``):
+        超时或限流不代表端点不支持这个参数,那种情况下记住会让后续调用永远吃不到
+        这个优化。
+        """
+        if auxiliary and self._thinking_opt_out_supported:
+            try:
+                result = await client.chat.completions.create(
+                    **request, extra_body={"thinking": {"type": "disabled"}}
+                )
+                span.set(thinking_disabled=True)
+                return result
+            except Exception as exc:
+                if not _is_bad_request(exc):
+                    raise
+                type(self)._thinking_opt_out_supported = False
+                logger.info(
+                    "Provider rejected thinking opt-out; auxiliary calls will "
+                    "keep the reasoning chain (slower)."
+                )
+        return await client.chat.completions.create(**request)
 
     async def _open_stream(self, request: dict[str, Any]) -> Any:
         """开流。尽量带上 include_usage，被提供商拒绝则降级为本地估算。"""

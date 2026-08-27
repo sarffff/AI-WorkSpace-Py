@@ -279,11 +279,23 @@ class AnswerScores(BaseModel):
 
 
 class AbstentionVerdict(BaseModel):
-    """``AnswerJudge`` 的不可答问题判定。"""
+    """``AnswerJudge`` 的不可答问题判定。
 
-    abstained: bool
-    fabricated: list[str] = Field(default_factory=list)
+    字段顺序是刻意的：``reason`` 在 ``abstained`` **之前**。
+
+    2026-08-27 那轮评估里有 8 条样本的 ``abstained`` 是 false，而同一条的
+    ``reason`` 写着"回答正确拒答，未编造信息"——裁判自己的两个输出互相矛盾。
+    被误判的答案是 ``未找到相关信息。`` 这种毫无歧义的拒答。后果是拒答率整列
+    失真（format-docx 实际 10/10 被算成 5/10），而那一列的量程是 precision 的
+    十倍，本来是这份报告里信号最强的地方。
+
+    先写 reason 再写 bool，是让模型在给出判定**之前**先把理由写完。反过来时
+    bool 是在推理完成前就落定的，写完理由也不会回头改。
+    """
+
     reason: str = ""
+    fabricated: list[str] = Field(default_factory=list)
+    abstained: bool
 
 
 class TaskScores(BaseModel):
