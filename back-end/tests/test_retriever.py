@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import pytest
@@ -242,6 +243,46 @@ def test_rerank_reorders_by_model_output(monkeypatch):
 
     assert original[0] != reranked[0]
     assert set(original) == set(reranked)
+
+
+def test_rerank_prompt_asks_for_a_complete_ordering(monkeypatch):
+    """提示词不能邀请模型省略候选——那和契约、和调用方都矛盾。
+
+    2026-08-28 的评估里 `rerank` 降级 3 次，原因全是 `rerank:invalid`。三方
+    各自都对，合起来是个死结：
+
+    1. 提示词说「完全不相关的片段直接省略」；
+    2. ``RerankOrder`` 把空数组判成非法（"重排结果为空"）；
+    3. 调用方（``_rerank`` 末尾）本来就会把省略掉的候选按原相对顺序**全部追加
+       回来**，它自己的注释写着"避免重排把召回变成筛除"。
+
+    于是省略一个是空操作，省略全部是白付一次重试再降级——而降级和全部省略最终
+    都落到同一个融合序。还有一层：``mode=api`` 的 cross-encoder 给每个候选都
+    打分、从不省略，邀请 llm 这一支去筛除会让两个变体干的不是同一件事，而
+    "专用重排比通用模型好多少"正是这组对照要量的。
+
+    这个测试盯的是提示词字面。修法住在一个字符串里，没有测试的话，一次好意的
+    改写就能把 ``省略`` 放回去，而症状只会在下一轮评估的降级列里冒出来。
+    """
+    monkeypatch.setattr(settings, "RAG_RERANK", True)
+    monkeypatch.setattr(settings, "RAG_HYBRID", False)
+    monkeypatch.setattr(settings, "RAG_MIN_SCORE", 0.0)
+    adapter = StaticAdapter([json.dumps([2, 1, 3])])
+    retriever = StubRetriever(
+        _corpus(),
+        embedding=FakeEmbedding({"预算": [1.0, 0.0]}),
+        model_adapter=adapter,
+    )
+    run(retriever.retrieve(None, USER, "预算", 3))
+
+    prompt = adapter.prompts[-1]
+    # 盯"直接省略"而不是"省略":修好之后的提示词写的是"不要省略",
+    # 裸子串两边都命中,那样的断言对这两种写法都说不出话来。
+    assert "直接省略" not in prompt, "省略会被调用方撤销，全部省略则被契约判成非法"
+    assert "不要省略" in prompt
+    # 候选个数要写进提示词:模型得知道"完整"是几个。数字取决于本次候选数,
+    # 所以匹配形状而不是写死一个值。
+    assert re.search(r"全部 \d+ 个", prompt), f"提示词里没有候选个数：{prompt[:80]}"
 
 
 def test_rerank_failure_keeps_fusion_order(monkeypatch):

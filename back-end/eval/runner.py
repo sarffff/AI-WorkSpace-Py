@@ -16,6 +16,7 @@ Agent 循环涉及多轮工具决策，方差大、成本高，适合单独设�
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -23,7 +24,9 @@ import os
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable, TypeVar
+
+from openai import RateLimitError
 
 from config import settings
 from database import SessionLocal
@@ -58,6 +61,77 @@ EVAL_USER_ID = "eval-harness"
 # 给得比 _JUDGE_MAX_TOKENS 小一点是有意的:回答要的是几百字散文，裁判要的是
 # 一个带 reason 的 JSON，后者更容易被思考挤掉。
 _ANSWER_MAX_TOKENS = 3072
+
+
+_T = TypeVar("_T")
+
+
+class _LLMRateGate:
+    """评估链路的 LLM 限流闸:防突发 + 撞 429 按配额窗口退避后重试。
+
+    ```
+    completion = await gate.call(lambda: adapter.complete(...))
+    verdict    = await gate.call(lambda: judge.judge(...))
+    ```
+
+    为什么评估需要这个,而线上不需要:线上每次回答之间隔着真实用户的输入节奏,
+    突发天然被摊开;评估是一台脚本在几分钟内把几百次调用打出去,``eval_answer``
+    和 ``judge`` 又共用同一个账号的配额——2026-08-27 那轮 3 变体评估因此吃了
+    **211 次 HTTP 429**。SDK 自带的指数退避(0.5s→1s→2s…)在分钟级配额窗口面前
+    约等于不退避,退避完还是 429,于是 ``max_retries=1`` 很快就放弃,
+    直接导致 rerank-api 整轮 54/54 答案生成为空。
+
+    这层兜底只在这一个文件里用,不影响线上路径:
+
+    - ``min_interval`` 强制相邻 LLM 调用至少隔开这么长时间,防突发;
+    - 撞上 ``RateLimitError`` 时按 ``Retry-After``(缺省则退 ``cooldown``)
+      退避后重试,最多 ``max_retries`` 次,把分钟窗口让过去再继续。
+    """
+
+    def __init__(self) -> None:
+        self._min_interval = settings.EVAL_LLM_MIN_INTERVAL_SECONDS
+        self._cooldown = settings.EVAL_LLM_RATE_LIMIT_COOLDOWN_SECONDS
+        self._max_retries = settings.EVAL_LLM_MAX_RATE_RETRIES
+        self._last_start = 0.0
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _retry_after(exc: Exception) -> float:
+        """从 429 响应头里读服务端建议的等待秒数。没有则返回 0。"""
+        headers = getattr(getattr(exc, "response", None), "headers", None) or {}
+        try:
+            return float(headers.get("retry-after", 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    async def call(self, fn: Callable[[], Awaitable[_T]]) -> _T:
+        """执行一次受节流的 LLM 调用。撞 429 按窗口退避后重试。"""
+        for attempt in range(self._max_retries + 1):
+            async with self._lock:
+                now = time.monotonic()
+                delay = self._last_start + self._min_interval - now
+                self._last_start = now + max(delay, 0.0)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                return await fn()
+            except RateLimitError as exc:
+                if attempt >= self._max_retries:
+                    raise
+                wait = max(self._retry_after(exc), self._cooldown)
+                logger.warning(
+                    "LLM rate limited (attempt %s/%s); backing off %.1fs [Retry-After=%.1fs]",
+                    attempt + 1,
+                    self._max_retries,
+                    wait,
+                    self._retry_after(exc),
+                )
+                await asyncio.sleep(wait)
+        raise RuntimeError("unreachable")
+
+
+# 单例:一个评估进程里所有变体共用同一把锁,配额是账号级的,不是变体级的。
+_RATE_GATE = _LLMRateGate()
 
 
 def ensure_eval_user(session: Any) -> None:
@@ -416,21 +490,23 @@ async def _run_case(
 
             answer = ""
             try:
-                completion = await adapter.complete(
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": answer_prompt.render(
-                                context=context or "（无参考内容）",
-                                question=case.question,
-                            ),
-                        }
-                    ],
-                    tools=[],
-                    model=settings.LLM_MODEL,
-                    temperature=0.0,
-                    max_tokens=_ANSWER_MAX_TOKENS,
-                    purpose="eval_answer",
+                completion = await _RATE_GATE.call(
+                    lambda: adapter.complete(
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": answer_prompt.render(
+                                    context=context or "(无参考内容)",
+                                    question=case.question,
+                                ),
+                            }
+                        ],
+                        tools=[],
+                        model=settings.LLM_MODEL,
+                        temperature=0.0,
+                        max_tokens=_ANSWER_MAX_TOKENS,
+                        purpose="eval_answer",
+                    )
                 )
                 answer = completion.content or ""
             except Exception as exc:
@@ -438,11 +514,13 @@ async def _run_case(
                     "answer generation failed for %s: %s", case.id, type(exc).__name__
                 )
 
-            verdict = await judge.judge(
-                question=case.question,
-                answer=answer,
-                context=context,
-                answerable=case.answerable,
+            verdict = await _RATE_GATE.call(
+                lambda: judge.judge(
+                    question=case.question,
+                    answer=answer,
+                    context=context,
+                    answerable=case.answerable,
+                )
             )
             latency_ms = int((time.perf_counter() - started) * 1000)
 
@@ -686,6 +764,12 @@ async def run(
                 "judgeFailed": result.verdict.failed,
                 "answer": result.answer,
                 "latencyMs": result.latency_ms,
+                # 逐题的降级原因。summary 里已经有按原因的计数,但计数说不出
+                # "是哪几道题",而修的时候要看的正是那几道题的问题长什么样。
+                # 2026-08-28 那份报告说 rerank:invalid x3,想知道是哪 3 道只能
+                # 重跑一次——这就是"记录了但没冒泡到能用的那一层"。
+                # 空列表省掉,不给 51 道正常题各加一个 [] 把文件撑大。
+                "degradedReasons": result.degraded_reasons or None,
             }
             for result in results
         ]

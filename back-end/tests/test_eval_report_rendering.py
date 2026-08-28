@@ -201,6 +201,77 @@ def test_multiple_variants_each_get_their_own_line():
     assert "- **baseline**" not in markdown, "干净的变体不该出现在这一节"
 
 
+def _render_with_details(summary: dict, rows: list[dict]) -> str:
+    """一个降级变体 + 它的逐题明细 → 完整报告文本。"""
+    return eval_run.render_markdown(
+        {"summaries": [summary], "details": {summary["variant"]: rows}}
+    )
+
+
+def test_degradation_section_names_the_affected_cases():
+    """降了几次、为什么降之外,还得说是**哪几道题**。
+
+    2026-08-28 那份报告已经写到"rerank:invalid x3"了,但想知道是哪 3 道
+    只能整轮重跑一次——计数和原因都在报告里,唯独缺这一行。这是同一个形状的
+    问题又下沉了一层:记录了(逐题 trace 里有),没冒泡到能拿去复现的那一层。
+    """
+    markdown = _render_with_details(
+        _summary(variant="rerank", degradedCases=2, degradedStages={"rerank": 2}),
+        [
+            {"id": "password-length", "degradedReasons": ["rerank:invalid"]},
+            {"id": "trial-period"},
+            {"id": "absent-parking", "degradedReasons": ["rerank:invalid"]},
+        ],
+    )
+    assert "涉及问题：" in markdown
+    assert "password-length" in markdown
+    assert "absent-parking" in markdown
+    assert "trial-period" not in markdown, "没降级的题不该被点名"
+
+
+def test_historical_reports_render_without_the_case_line():
+    """2026-08-28 之前的报告逐题不带原因,此时少写一行,而不是报错。
+
+    历史报告要能重渲染:``--render`` 就是拿旧 JSON 重出 Markdown 的。
+    """
+    markdown = _render_with_details(
+        _summary(variant="rerank", degradedCases=3, degradedStages={"rerank": 3}),
+        [{"id": "password-length"}, {"id": "trial-period"}],
+    )
+    assert "rerank x3" in markdown, "阶段计数照旧"
+    assert "涉及问题：" not in markdown
+
+
+def test_full_degradation_truncates_the_case_list():
+    """全量降级时不要把 54 个题号全列出来,那一行会把整节冲掉。
+
+    这种情况本来就有专门的"没有真正执行"提示,题号在这里是多余的;真正需要
+    题号的是**偶发**降级——少数几道题坏掉,得知道是哪几道。
+    """
+    rows = [{"id": f"q{i}", "degradedReasons": ["rerank:invalid"]} for i in range(46)]
+    markdown = _render_with_details(
+        _summary(variant="rerank", degradedCases=46, degradedStages={"rerank": 46}),
+        rows,
+    )
+    case_line = next(line for line in markdown.splitlines() if "涉及问题：" in line)
+    assert "另有" in case_line, "超出的部分给个数量而不是全列"
+    assert len(case_line) < 200, f"这一行太长了：{len(case_line)}"
+    assert "没有真正执行" in markdown, "满额降级的提示仍然要在"
+
+
+def test_report_without_details_still_renders():
+    """``details`` 整个缺失时不能炸——只渲染 summary 是合法用法。"""
+    markdown = eval_run.render_markdown(
+        {
+            "summaries": [
+                _summary(variant="rerank", degradedCases=1, degradedStages={"rerank": 1})
+            ]
+        }
+    )
+    assert "rerank x1" in markdown
+    assert "涉及问题：" not in markdown
+
+
 def test_a_variant_hit_by_both_problems_appears_once():
     """同时降级又漏价的变体只出现一个条目,两条问题作为子项。
 

@@ -50,8 +50,15 @@ coverage
 next-env.d.ts
 
 # Electron
-out/
-app/
+#
+# 这几条必须锚在根上（前导 /）。gitignore 里不带斜杠的 `app/` 会在**任意层级**
+# 匹配，于是它连 `src/app/` 一起吞掉——那里面是 App.tsx、Layout.tsx、
+# providers/store.ts 和 main.tsx，而 main.tsx 正是 index.html 引用的入口。
+# 后果是版本库里从来没有这四个文件，克隆下来直接构建不了，而本地开发一切正常，
+# 所以没人发现。electron-builder 的实际输出目录是 release/（见 package.json 的
+# directories.output），`app/` 这条本来就没用上。
+/out/
+/release/
 *.exe
 *.dmg
 *.app

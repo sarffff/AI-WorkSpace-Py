@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     # ========== LLM API 配置 ==========
     LLM_API_KEY: str = "your_api_key_here"
     LLM_BASE_URL: str = "https://open.bigmodel.cn/api/paas/v4/"
-    LLM_MODEL: str = "glm-4.5-air"
+    LLM_MODEL: str = "glm-4.6v"
     # 流式请求附带 stream_options.include_usage 以拿到真实 token 用量。
     # 部分 OpenAI 兼容端点不认这个参数,被拒一次后会自动停发并改用本地估算。
     LLM_STREAM_USAGE: bool = True
@@ -350,6 +350,26 @@ class Settings(BaseSettings):
     # 重试 1 次而不是 2：辅助调用失败退回降级路径比多试一次更划算。
     LLM_AUXILIARY_TIMEOUT_SECONDS: float = 60.0
     LLM_AUXILIARY_MAX_RETRIES: int = 1
+
+    # ---- 评估链路的限流与 429 退避(eval/runner) -------------------------------
+    #
+    # 2026-08-27 那轮 3 变体评估打了 **211 次 HTTP 429**:评估一次性在几分钟内
+    # 打出几百次对话调用(~问题数×变体数×2,外加重试),没有真实用户节奏兜底,
+    # 很容易把账号的每分钟配额打满。线上靠人肉节奏天然散开,评估没有——所以
+    # 在这里显式节流,而不是去改 LLM_AUXILIARY_*(那会影响线上辅助调用)。
+    #
+    # 这三个开关只作用于 eval/runner 里的 _LLMRateGate:评估跑完不再需要,
+    # 设默认值即可,不设也不会影响线上路径。
+    #
+    # min_interval:每次 LLM 调用之间的最小间隔。0 关闭(不加间隔)。
+    #   它的作用是**防突发**,不是限速——每次调用本身要花好几秒,间隔只在
+    #   配额已耗尽(服务端秒拒)时才真正起作用。
+    # cooldown:撞上 429 且服务端没给 Retry-After 时,退避多少秒再重试。
+    # max_retries:撞上 429 后重试几次(含按配额窗口退避)。默认 12 次是给
+    #   一分钟配额窗口留下足够余量;retries 是给「重试次数」的兜底。
+    EVAL_LLM_MIN_INTERVAL_SECONDS: float = 0.5
+    EVAL_LLM_RATE_LIMIT_COOLDOWN_SECONDS: float = 8.0
+    EVAL_LLM_MAX_RATE_RETRIES: int = 12
 
     # HyDE(Hypothetical Document Embeddings):先让辅助模型编一段假答案,拿它去
     # 检索。反直觉但有效——用户的问题和文档的措辞常常不在同一个语域("报销要几天"
