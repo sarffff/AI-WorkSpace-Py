@@ -53,6 +53,14 @@ _PINNED_FLAGS = {
     # 描述的那个坑本身——只是当时漏钉了这两个开关。同样钉成 config.py 的代码默认值。
     "TOOL_CALCULATE_ENABLED": False,
     "TOOL_WEB_SEARCH_ENABLED": False,
+    # 2026-08-28 补：模型名也得钉。``chat_service`` 到处是
+    # ``model or settings.LLM_MODEL``，所以任何不显式传模型的测试，实际参与
+    # 判断的都是本地 .env 里的模型名。视觉那两条测试就是这么红的：白名单写
+    # ``glm-4.5-air``，而 .env 是 ``glm-4.6v``，于是断言"图片变成内容块"必然失败，
+    # 报错却长得像视觉功能坏了。钉成一个**不在任何视觉白名单里**的固定名字，
+    # 需要视觉的测试自己 monkeypatch 成白名单里的值。
+    "LLM_MODEL": "glm-4.5-air",
+    "VISION_MODELS": "",
     # 提示词版本。空串 = 走代码里的默认版本；.env 里设成 v4-workspace 之后，
     # 断言系统提示词内容的测试会挂在与改动无关的地方（v4 里没有"不要重复检索"
     # 那句，它属于 v2/v3-lean）。提示词版本和工具面是耦合的，一旦本地为了试新

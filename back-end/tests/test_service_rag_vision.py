@@ -135,13 +135,22 @@ def _write_test_image(upload_root):
 
 
 def test_vision_images_become_content_blocks(db, monkeypatch):
-    """模型在视觉白名单里：消息里的图片引用变成 image_url 内容块，文本里留序号。"""
+    """模型在视觉白名单里：消息里的图片引用变成 image_url 内容块，文本里留序号。
+
+    ``LLM_MODEL`` 必须一起钉死。``chat_service`` 走的是
+    ``model or settings.LLM_MODEL``，测试没传模型，于是实际参与白名单比对的是
+    **本地 .env 里的模型名**。只钉 ``VISION_MODELS`` 的话，这条测试断言的其实是
+    "开发机的 LLM_MODEL 恰好等于 glm-4.5-air"——这条测试因此长期为红：.env 里
+    是 ``glm-4.6v``，白名单写的是 ``glm-4.5-air``，``supports_vision`` 正确地
+    返回 False，而报错看起来像视觉功能坏了。
+    """
     from pathlib import Path
     from tempfile import TemporaryDirectory
 
     td = TemporaryDirectory()
     monkeypatch.setattr(settings, "UPLOAD_DIR", td.name)
     _write_test_image(Path(td.name))
+    monkeypatch.setattr(settings, "LLM_MODEL", "glm-4.5-air")
     monkeypatch.setattr(settings, "VISION_MODELS", "glm-4.5-air")
 
     service, adapter = make_service([{"text": "答案"}])
@@ -168,7 +177,12 @@ def test_vision_images_become_content_blocks(db, monkeypatch):
 
 
 def test_non_vision_model_keeps_url_in_text(db, monkeypatch):
-    """模型不在白名单：图片引用原样留在文本里（模型至少能说自己收到了链接）。"""
+    """模型不在白名单：图片引用原样留在文本里（模型至少能说自己收到了链接）。
+
+    两个都钉：这条现在是靠"本地 LLM_MODEL 恰好不等于 glm-4v-plus"才通过的，
+    谁把 .env 换成那个名字它就跟着红——和上面那条是同一个坑的反面。
+    """
+    monkeypatch.setattr(settings, "LLM_MODEL", "glm-4.5-air")
     monkeypatch.setattr(settings, "VISION_MODELS", "glm-4v-plus")
 
     service, adapter = make_service([{"text": "答案"}])
