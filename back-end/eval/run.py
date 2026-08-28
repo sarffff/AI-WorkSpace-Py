@@ -86,7 +86,35 @@ def _format(value: Any) -> str:
     return str(value)
 
 
-def _render_degradation(summaries: list[dict[str, Any]]) -> list[str]:
+def _degraded_case_ids(
+    details: dict[str, list[dict[str, Any]]] | None,
+    variant: str | None,
+    *,
+    limit: int = 8,
+) -> list[str]:
+    """这个变体里降级了的题号，按报告顺序，最多 ``limit`` 个。
+
+    ``details`` 允许缺失:2026-08-28 之前的报告逐题不带 ``degradedReasons``,
+    此时返回空列表让渲染器少写一行,而不是报错——历史报告要还能重渲染。
+
+    截断而不是全列:全量降级时这里会是 54 个题号,那一行会把整节冲掉,
+    而"全量降级"本身已经有专门的提示。超出的部分给个数量。
+    """
+    rows = (details or {}).get(variant or "") or []
+    named = [
+        str(row.get("id"))
+        for row in rows
+        if row.get("degradedReasons") or row.get("degraded_reasons")
+    ]
+    if len(named) > limit:
+        return named[:limit] + [f"…另有 {len(named) - limit} 条"]
+    return named
+
+
+def _render_degradation(
+    summaries: list[dict[str, Any]],
+    details: dict[str, list[dict[str, Any]]] | None = None,
+) -> list[str]:
     """降级明细与漏价模型。全都干净时**整节不出现**。
 
     这一节是主表那个计数的展开:哪个阶段降的、降了几次。阶段名很重要——
@@ -122,6 +150,12 @@ def _render_degradation(summaries: list[dict[str, Any]]) -> list[str]:
                     "  - 原因："
                     + "、".join(f"{name} x{count}" for name, count in reasons.items())
                 )
+            # 再往下一层:是哪几道题。原因回答"该改哪里",题号回答"拿哪道题去复现"。
+            # 2026-08-28 报告写着 rerank:invalid x3,想知道是哪 3 道只能整轮重跑——
+            # 计数和原因都在报告里了,唯一缺的是这一行。
+            named = _degraded_case_ids(details, summary.get("variant"))
+            if named:
+                lines.append(f"  - 涉及问题：{'、'.join(named)}")
             # 全量降级单独点出来。这是"配了等于没配"最典型的样子,而它在指标上
             # 的表现是**和 baseline 完全一致**——最容易被读成"这个技术没有增益"。
             total = summary.get("questions") or 0
@@ -434,7 +468,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         ]
         lines.append("| " + " | ".join(cells) + " |")
 
-    lines += _render_degradation(summaries)
+    lines += _render_degradation(summaries, report.get("details"))
     # 紧跟主表:点估计刚看完就给不确定性,免得读者已经在心里下了结论
     lines += _render_significance(report)
 
