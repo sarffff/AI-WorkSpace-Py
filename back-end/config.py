@@ -351,6 +351,29 @@ class Settings(BaseSettings):
     LLM_AUXILIARY_TIMEOUT_SECONDS: float = 60.0
     LLM_AUXILIARY_MAX_RETRIES: int = 1
 
+    # 主回答调用的上界。2026-08-29 加。
+    #
+    # 上面那条注释说「主回答的调用不受这个约束(用户确实在等它)」——那个判断对,
+    # 但它得出的结论应该是「给一个更宽松的超时」,而不是「不给超时」。不给的结果是
+    # 落回 SDK 默认 600s × 3 = **最坏 1800 秒**,而这条路径上挂着的东西比辅助调用
+    # 多得多:一个数据库会话、一条 SSE 连接、以及 Agent 循环最多 6 轮里的这一轮。
+    # 连接池打满就是全站不可用,而不只是这一次回答变慢。
+    #
+    # **流式下这个值的语义是「两个分片之间最多等多久」,不是整条流的总时长。**
+    # httpx 的 read timeout 在每次读之间重置,所以正常输出的长回答不会被这个值切断
+    # (每个分片都在刷新计时),真正被它拦住的是「连上了但不再吐字节」的挂死连接
+    # ——那恰好是我们要防的。整条流的总时长另有 AGENT_MAX_TOOL_ROUNDS 与
+    # 结果字符预算兜着。
+    #
+    # 120 秒的依据:实测 baseline 一次对话调用 p90 约 37 秒(见上面 EVAL 那段的实测
+    # 数据),给三倍余量。带思考链的推理模型首字延迟更长,所以不取更小的值。
+    #
+    # 重试 2 次:与辅助调用不同,主回答**没有降级路径**——失败就是用户看到报错,
+    # 所以这里值得多试。安全性见 model_adapter._open_stream 的注释:重试发生在
+    # 开流之前,不会让用户看到重复内容。
+    LLM_CHAT_TIMEOUT_SECONDS: float = 120.0
+    LLM_CHAT_MAX_RETRIES: int = 2
+
     # ---- 评估链路的限流与 429 退避(eval/runner) -------------------------------
     #
     # 2026-08-27 那轮 3 变体评估打了 **211 次 HTTP 429**:评估一次性在几分钟内
@@ -611,6 +634,39 @@ class Settings(BaseSettings):
     PRICING_CONFIG_PATH: str = "model_prices.json"
     # 用量查询的默认统计窗口(天)
     METRICS_DEFAULT_DAYS: int = 7
+
+    # ---- 用量闸门(services/usage_guard) ---------------------------------------
+    #
+    # 2026-08-29 加。此前 ``/chats/completions/stream`` 上一个上界都没有:
+    # ``@limiter.limit`` 只挂在 auth 的两个端点上,而这条路径是全项目最贵的
+    # ——最多 AGENT_MAX_TOOL_ROUNDS 轮模型调用,每轮可能带 web_search 与向量化。
+    # 成本那边 telemetry 一直在算并写进 trace_spans.cost,但**没有任何一处因为
+    # 成本拒绝执行**。两条合起来就是:一个脚本 = 无上界的花钱。
+    #
+    # 三个上界互相独立,分别防三件不同的事,全为 0 表示关闭:
+    #
+    # 1. **请求频率**(RATE):防滥用。进程内计数,每个请求都算,**不管有没有花钱**
+    #    ——早早失败的请求也要算,否则打空请求的脚本永远撞不到上限。
+    #    代价见 usage_guard 模块文档:多 worker 下每个进程各有一份计数。
+    # 2. **成本**(COST):防超支。读 trace_spans.cost,也就是**真实记账**。
+    # 3. **token**(TOKENS):成本的兜底。价目表里没有的模型 cost 是 NULL,
+    #    只卡成本的话换个未定价模型就绕过去了;token 永远有记录(实测或本地估算)。
+    #
+    # 窗口都是滑动的,不按自然日对齐:按自然日对齐会在午夜给出一个整份的新配额,
+    # 于是"卡住了就等到零点"变成一种可行的绕过方式。
+    USAGE_GUARD_ENABLED: bool = True
+    # 每用户每窗口的对话请求数上限。窗口用分钟计。
+    USAGE_RATE_WINDOW_MINUTES: float = 1.0
+    USAGE_RATE_MAX_REQUESTS: int = 20
+    # 成本与 token 的窗口(小时)。默认 24 小时。
+    USAGE_QUOTA_WINDOW_HOURS: float = 24.0
+    # 每用户每窗口的成本上限,单位与价目表的 currency 一致。0 = 不限。
+    #
+    # 混币种时按**各币种独立比较**,不做汇率换算——项目里没有汇率来源,
+    # 编一个换算率会得到一个看起来精确的假数字(同 pricing 模块的取舍)。
+    USAGE_QUOTA_MAX_COST: float = 0.0
+    # 每用户每窗口的 token 上限(输入+输出)。0 = 不限。
+    USAGE_QUOTA_MAX_TOKENS: int = 0
 
     @property
     def embedding_api_key(self) -> str:

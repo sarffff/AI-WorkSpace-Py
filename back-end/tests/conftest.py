@@ -69,6 +69,14 @@ _PINNED_FLAGS = {
     # 护栏按"开启但不拦截"测，拦截行为由 test_guardrails 自己 monkeypatch 阈值
     "GUARDRAIL_ENABLED": True,
     "GUARDRAIL_BLOCK_SCORE": 0,
+    # 2026-08-29 补：用量闸门。它按**用户**计数（不是按 IP，见 usage_guard 的
+    # 模块文档），而测试里同一个用户会连发几十次请求，20/min 的默认值必然撞上。
+    # 撞上之后的症状是 429，而报错位置在被测功能里，看起来像那个功能坏了——
+    # 与上面 LLM_MODEL 那条完全同一个形状。
+    #
+    # 关掉而不是把上限调高：闸门自己的行为由 test_usage_guard 显式打开来测，
+    # 其余测试不该有一个"跑够多少次就会红"的隐含前提。
+    "USAGE_GUARD_ENABLED": False,
 }
 
 

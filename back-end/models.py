@@ -268,6 +268,67 @@ class AgentCheckpoint(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime)
 
 
+class AgentApproval(Base):
+    """一次人工审批的审计记录。
+
+    改动之前裁决只活在快照里（``TurnState.approved_call_ids`` /
+    ``rejected_call_ids`` / ``edited_arguments``），而快照有两个性质让它当不了
+    审计记录：**会被 ``AGENT_CHECKPOINT_KEEP`` 裁剪掉**，而且**不记录人与时间**。
+    审批这个功能的全部意义是"有人授权了这次写入"，那么"谁、什么时候、看到的
+    参数是哪一版"就是它必须能回答的问题。
+
+    与 run 是一对多：一次执行可以被打断多次（``AgentRun.interrupts`` 就是这个
+    数），而"第一次拒绝、改了参数第二次才批"恰恰是最需要留痕的形状。
+
+    **不存完整参数，只存摘要 + 预览。** 写知识库的参数里是整篇文档正文，可以到
+    ``AGENT_WRITE_MAX_CHARS``。整份复制进来等于同一份用户内容在库里存两遍，
+    而审计要回答的是"当时批准的到底是不是这一份"——digest 足以证明同一性。
+
+    ``decision`` 里 ``expired`` 与 ``rejected`` 必须分开：拒绝是人做的决定，
+    过期是没人做决定。在审计上这两件事完全不同，混成一个会让"这个团队到底在
+    认真审批还是放着不管"这个问题查不出来。
+    """
+
+    __tablename__ = "agent_approvals"
+    __table_args__ = (
+        Index("ix_agent_approvals_run", "run_id"),
+        Index("ix_agent_approvals_user_requested", "user_id", "requested_at"),
+        Index("ix_agent_approvals_decision_requested", "decision", "requested_at"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    run_id: Mapped[str] = mapped_column(String(36))
+    chat_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # 发起执行的用户。与 decided_by 通常相同但不必然——将来若允许管理员代批，
+    # 两者的差异正是审计要看的东西
+    user_id: Mapped[str] = mapped_column(String(36))
+
+    tool_name: Mapped[str] = mapped_column(String(80))
+    tool_call_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    round_index: Mapped[int] = mapped_column(Integer, default=0)
+    call_index: Mapped[int] = mapped_column(Integer, default=0)
+
+    # 请求时的参数摘要：模型原本想执行的那一份
+    arguments_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    arguments_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # pending / approved / rejected / expired
+    decision: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    # 过期时为 NULL——那正是"没有人做这个决定"的准确表示
+    decided_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 用户改过参数的话这里是**改后**那份的摘要。与 arguments_digest 不同就说明
+    # 真正执行的不是模型原本要执行的东西
+    decided_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    edited_fields: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    requested_at: Mapped[datetime] = mapped_column(DateTime)
+    reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
 class Document(Base):
     __tablename__ = "documents"
 

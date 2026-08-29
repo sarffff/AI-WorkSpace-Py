@@ -34,6 +34,7 @@ from services.token_budget import HistoryMessage
 from services import agent_roles
 from services import agent_state
 from services import approval
+from services import approval_audit
 from services import checkpoint_store
 from services import planner
 from services import retrieval_index
@@ -1368,6 +1369,16 @@ class ChatService:
                 trace_id=current_trace_id(),
             )
             turn.set(run_id=run_id)
+            # 先把 run id 发出去,再开始跑。
+            #
+            # 位置是刻意的:客户端要在**任何东西可能断掉之前**拿到这个 id,否则
+            # 断线之后它没有接续凭证——原来只有 approval_required / clarification
+            # 这两类事件带 runId,而那两件事恰好是"没断线"的情形。
+            yield {
+                "type": "run_started",
+                "runId": run_id,
+                "chatId": chat_id,
+            }
 
         async for event in self._drive_loop(db, state, ctx):
             yield event
@@ -1598,6 +1609,21 @@ class ChatService:
                             status="waiting_approval",
                             rounds=round_index,
                             bump_interrupts=True,
+                        )
+                        # 审计留痕。位置是刻意的：在 approval_required 发出去
+                        # **之前**。反过来的话，进程在这两步之间挂掉就会留下一个
+                        # 用户看到过、但审计里不存在的审批请求。
+                        approval_audit.record_request(
+                            db,
+                            run_id=state.run_id,
+                            chat_id=state.chat_id,
+                            user_id=state.user_id,
+                            tool_name=call.name,
+                            tool_call_id=call.id,
+                            round_index=round_index,
+                            call_index=call_index,
+                            arguments=arguments,
+                            reason=request.reason,
                         )
                         turn.set(interrupted="tool_approval", interrupt_tool=call.name)
                         yield {
@@ -1851,6 +1877,20 @@ class ChatService:
                 rounds=round_index,
                 delegations=state.delegations_used,
             )
+            # 轮次边界的快照。这是**断线之后唯一能安全回到的点**。
+            #
+            # 为什么不能从 pre_tools 那份恢复:那份是在"模型说完、工具还没跑"时拍的,
+            # 从它恢复会把本轮的工具**重跑一遍**。只读工具重跑是白花钱,而
+            # save_to_knowledge_base 重跑就是写第二份——审批那条路径靠 writes +
+            # replay_writes 精确避开了这件事,但断线时 writes 停在快照那一刻,
+            # 之后真正跑掉的那几步没人记下来,所以那套机制在这里用不上。
+            #
+            # 到了 post_tools 就没有这个问题:本轮工具全部执行完,结果已经在
+            # state.messages 里,恢复等于"接着发下一轮的模型调用"。
+            #
+            # 代价是每轮多一份快照(一份就是整个 messages,几十 KB),由
+            # AGENT_CHECKPOINT_KEEP 兜着——它本来就是为这个存在的。
+            checkpoint_store.put(db, state)
 
     @staticmethod
     def _finish_run(
@@ -2034,6 +2074,21 @@ class ChatService:
         state.phase = "pre_tools"
         state.status = "running"
         checkpoint_store.update_run(db, run_id, status="running")
+        # 审计留痕：谁批的、什么时候、以及**真正要执行的那份参数**。
+        # effective_arguments 传改后的那份（没改就是原始那份），它的 digest
+        # 与请求时的不同就说明执行的不是模型原本要执行的东西。
+        effective = request.arguments
+        if changed_keys:
+            effective = json.loads(state.edited_arguments[call_key])
+        approval_audit.record_decision(
+            db,
+            run_id=run_id,
+            decided_by=user_id,
+            approved=approved,
+            note=note,
+            effective_arguments=effective,
+            edited_fields=changed_keys,
+        )
 
         resolved: dict[str, Any] = {
             "type": "approval_resolved",
@@ -2131,6 +2186,129 @@ class ChatService:
                 state.pending_index = request.call_index
                 ctx.restore_from(state)
                 turn.set(replayed_writes=len(state.writes))
+
+                async for event in self._drive_loop(db, state, ctx):
+                    yield event
+
+    async def continue_orphan(
+        self,
+        db: Session,
+        user_id: str,
+        run_id: str,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """接上一个因断线而没跑完的回合。
+
+        与 ``resume_turn`` 的区别在于**没有裁决要消费**:没有人做错什么,是连接断了。
+        所以这里不碰 ``approved_call_ids``、不重建确认令牌、也不发
+        ``approval_resolved``。
+
+        **只从 ``post_tools`` 的快照接。** 这是整件事的支点:那个 phase 意味着本轮
+        工具全部执行完、结果已经在 ``messages`` 里,所以恢复等于"接着发下一轮的
+        模型调用",一次工具都不会重跑。
+
+        从 ``pre_tools`` 接是不安全的——那份快照拍在"模型说完、工具还没跑"的位置,
+        接上去会把本轮工具重跑一遍。审批那条路径能安全地从 pre_tools 接,靠的是
+        ``writes`` 里逐步记着"哪几个已经跑完了";而断线时 ``writes`` 停在拍快照
+        那一刻,之后真正跑掉的那几步没人记下来,所以那套机制在这里用不上。
+        只读工具重跑是白花钱,``save_to_knowledge_base`` 重跑就是写第二份。
+        """
+        run = checkpoint_store.get_run(db, run_id)
+        if run is None or run.user_id != user_id:
+            yield {"type": "error", "error": "找不到这次执行，或它不属于当前用户。"}
+            return
+        if run.status != "running":
+            yield {
+                "type": "error",
+                "error": f"这次执行当前状态是 {run.status}，不是断线未完成。",
+            }
+            return
+
+        state = checkpoint_store.latest(db, run_id)
+        if state is None:
+            yield {"type": "error", "error": "这次执行没有可用的状态快照，无法接续。"}
+            return
+        if state.phase != "post_tools":
+            # 停在 pre_tools 说明断线发生在工具执行**当中**。那一轮里哪几个工具
+            # 真的跑完了没有记录,接上去要么重跑(可能重复写入)、要么跳过
+            # (模型看不到本该有的结果)。两者都比"请重新提问"更糟。
+            yield {
+                "type": "error",
+                "error": (
+                    "这次执行断在工具执行中途，无法安全接续（可能造成重复写入）。"
+                    "请重新提问。"
+                ),
+            }
+            checkpoint_store.update_run(
+                db, run_id, status="failed", error_type="unsafe_resume_point"
+            )
+            return
+
+        scope = _ToolScope(
+            user_id=state.user_id,
+            workspace_id=state.workspace_id,
+            is_admin=state.is_admin,
+        )
+        checkpoint_store.update_run(db, run_id, status="running")
+        yield {"type": "run_resumed", "runId": run_id, "round": state.round_index}
+
+        async with tracer.trace(
+            user_id=state.user_id, chat_id=state.chat_id, message_id=state.message_id
+        ):
+            async with tracer.span(
+                "chat.continue",
+                SpanKind.AGENT,
+                model=state.model or settings.LLM_MODEL,
+                run_id=state.run_id,
+                resumed_from=state.round_index,
+                prompt_version=state.prompt_ref,
+            ) as turn:
+                history = await self._get_chat_history_messages(
+                    db, state.chat_id, exclude_message_id=state.message_id
+                )
+                scope.history = history
+                # 删除令牌不给:它的依据是"用户原话里要求过",而这里没有任何
+                # 新的用户输入。断线不该顺带把一次删除授权带过来。
+                approvals = workspace_tools._ToolApprovals(delete_granted=False)
+                citations: list[dict] = []
+                budget = _ToolResultBudget(
+                    settings.TOOL_RESULT_TOTAL_CHARS, settings.TOOL_RESULT_MAX_CHARS
+                )
+                breaker = CircuitBreaker(settings.TOOL_CIRCUIT_BREAKER_FAILURES)
+                repeats = RepeatGuard(settings.AGENT_REPEAT_LIMIT)
+                generation: dict[str, Any] = {
+                    "model": state.model or settings.LLM_MODEL,
+                    "temperature": state.temperature,
+                    "max_tokens": state.max_tokens,
+                    "top_p": state.top_p,
+                }
+                base_tools = self._create_tools(
+                    db, scope, state.use_rag, citations, approvals
+                )
+                runtime, delegations = self._build_tool_surface(
+                    base_tools,
+                    generation=generation,
+                    take_budget=budget.take,
+                    breaker=breaker,
+                    turn=turn,
+                )
+                ctx = _TurnContext(
+                    runtime=runtime,
+                    budget=budget,
+                    repeats=repeats,
+                    breaker=breaker,
+                    citations=citations,
+                    generation=generation,
+                    scope=scope,
+                    turn=turn,
+                    delegations=delegations,
+                    gated=frozenset(approval.gated_tools()),
+                )
+                # 守卫余额直接从快照灌:post_tools 的快照里 writes 已经清空
+                # (本轮收尾时清的),而余额、重复计数、熔断状态都是那一刻的真值。
+                # 不能像审批那条路径一样调 replay_writes——它会按空的 writes
+                # 把 pending_index 拨成 0,而这里本来就该是 0。
+                ctx.restore_from(state)
+                turn.set(resumed_round=state.round_index)
 
                 async for event in self._drive_loop(db, state, ctx):
                     yield event
