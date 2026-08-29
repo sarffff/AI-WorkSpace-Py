@@ -18,12 +18,59 @@ from services.chat_service import ChatService
 from services.memory_service import memory_service
 from services import approval
 from services import checkpoint_store
+from services import approval_audit
 from services import prompt_library
+from services import usage_guard
 from services.settings_service import is_model_allowed, load_preferences
 
 router = APIRouter(prefix="/chats", tags=["对话"])
 chat_service = ChatService()
 logger = logging.getLogger("chat_router")
+
+
+def _enforce_usage(db: Session, user_id: str) -> None:
+    """用量闸门。撞上上限抛 429。
+
+    **必须在进入 SSE 之前调用**,理由和 ``resume_run`` 里那句归属校验一样:
+    生成器里抛 HTTPException 只会得到一条已经建立、然后突然断掉的流,
+    前端拿不到状态码,用户看到的是"连上了又没了",而不是"你被限流了"。
+
+    ``Retry-After`` 是标准头,客户端与反向代理都认。只有频率那道闸门给得出
+    可信的等待时间——成本与 token 要等窗口滑过去,而窗口是 24 小时量级,
+    给一个精确到秒的数字没有意义。
+    """
+    rejection = usage_guard.check(db, user_id)
+    if rejection is None:
+        return
+    logger.info("usage guard rejected user=%s kind=%s", user_id, rejection.kind)
+    headers = (
+        {"Retry-After": str(rejection.retry_after)}
+        if rejection.retry_after is not None
+        else None
+    )
+    raise HTTPException(status_code=429, detail=rejection.message, headers=headers)
+
+
+def _reject_if_expired(db: Session, run) -> None:
+    """审批超时的执行不允许恢复，就地标成 abandoned 并抛 409。
+
+    这道判断**不依赖过期扫描跑过**。扫描挂在 ``/runs/pending`` 这个读路径上，
+    也就是说"一直没人打开审批列表"时它一次都不会发生——而恢复恰恰是那种情况下
+    真正要拦住的地方：一个三天前的审批现在被点同意，工具面会按**当下**的权限
+    重建，当初批准的语境早就不存在了。
+    """
+    if not approval_audit.is_expired(run.updated_at):
+        return
+    hours = settings.AGENT_APPROVAL_TIMEOUT_HOURS
+    checkpoint_store.expire_stale_runs(db, run.user_id)
+    logger.info("rejected resume of expired run %s", run.id)
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"这次审批已超过 {hours} 小时时限，不能再恢复。"
+            "请重新提问——工具权限与知识库内容可能都已经变了。"
+        ),
+    )
 
 
 async def _extract_memory(user_id: str, chat_id: str, question: str, answer: str) -> None:
@@ -246,6 +293,7 @@ async def completions(
     current_user: User = Depends(get_current_user)
 ):
     """非流式对话"""
+    _enforce_usage(db, current_user.id)
     # 如果没有 chat_id，创建新对话
     chat_id = request.chat_id
     if not chat_id:
@@ -325,6 +373,7 @@ async def stream_completions(
     current_user: User = Depends(get_current_user)
 ):
     """流式对话 SSE"""
+    _enforce_usage(db, current_user.id)
     # 如果没有 chat_id，创建新对话
     chat_id = request.chat_id
     if not chat_id:
@@ -483,6 +532,11 @@ async def pending_runs(
     刷新页面之后靠它把审批卡片找回来。这是可恢复执行与"挂一个长连接等用户点"
     最直观的区别:中断活在数据库里,不活在那条已经断掉的 SSE 连接里。
     """
+    # 顺带把超时的清掉。放在读路径上而不是起一个后台调度器:项目里没有 worker
+    # 进程,而这个列表本来就要查这批数据。副作用是"一直没人打开审批列表"时清理
+    # 不会发生——所以恢复那边另有一道独立的时限判断,不依赖这里跑过。
+    checkpoint_store.expire_stale_runs(db, current_user.id)
+    approval_audit.expire_stale(db)
     runs = checkpoint_store.list_pending(db, current_user.id)
     items = []
     for run in runs:
@@ -623,6 +677,12 @@ async def answer_clarification(
         raise HTTPException(
             status_code=409, detail=f"该执行当前状态为 {run.status}，不在等待回答"
         )
+    _reject_if_expired(db, run)
+    # 恢复也要过闸门:它接着跑的是同一个 Agent 循环,剩下几轮照样花钱。
+    # 代价是配额耗尽时这个 run 会卡在 waiting_input 里,得等窗口滑过去——
+    # 但那正是成本上限的语义。归属校验放在前面,所以 404 优先于 429:
+    # 不该让别人的 run 存不存在这件事被限流状态泄露出去。
+    _enforce_usage(db, current_user.id)
 
     state_before = checkpoint_store.latest(db, run_id)
     return _continuation_sse(
@@ -640,6 +700,86 @@ async def answer_clarification(
         model=run.model,
         state_before=state_before,
         what="回答",
+    )
+
+
+@router.get("/runs/resumable")
+async def resumable_runs(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """断线留下、可以接着跑的执行。
+
+    与 ``/runs/pending`` 分开:那个列的是"等你做决定"(``waiting_*``),这个列的是
+    "没人做错什么,连接断了"。界面上是两种不同的提示——前者要人裁决,后者只要
+    问一句"接着跑吗"。
+
+    顺带把真正回收不了的孤儿标掉(超时且没有安全接续点的)。
+    """
+    checkpoint_store.reap_orphan_runs(db, current_user.id)
+    items = []
+    for run in checkpoint_store.list_resumable(db, current_user.id):
+        state = checkpoint_store.latest(db, run.id)
+        # 只有停在 post_tools 的才接得上(见 continue_orphan 的文档串)。
+        # 接不上的不列出来——给用户一个点了只会报错的按钮比不给更糟。
+        if state is None or state.phase != "post_tools":
+            continue
+        items.append(
+            {
+                "runId": run.id,
+                "chatId": run.chat_id,
+                "messageId": run.message_id,
+                "round": state.round_index,
+                "updatedAt": run.updated_at.isoformat() if run.updated_at else None,
+            }
+        )
+    return {"items": items}
+
+
+@router.post("/runs/{run_id}/continue")
+async def continue_run(
+    run_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """接上一个因断线而没跑完的回合。
+
+    与 ``/resume`` 是两个端点:那个要带裁决(同意/拒绝/改参数),这个没有任何载荷
+    ——没有人做错什么,是连接断了。合成一个会让 ``approved`` 字段在断线场景下
+    变成一个没有意义但必填的值。
+    """
+    run = checkpoint_store.get_run(db, run_id)
+    if run is None or run.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+    if run.status != "running":
+        raise HTTPException(
+            status_code=409,
+            detail=f"该执行当前状态为 {run.status}，不是断线未完成",
+        )
+    # 接着跑等于接着花钱,同 resume。
+    _enforce_usage(db, current_user.id)
+
+    state_before = checkpoint_store.latest(db, run_id)
+    if state_before is None or state_before.phase != "post_tools":
+        # 在进入 SSE 之前判:生成器里报错只会得到一条建立后立刻断掉的流。
+        raise HTTPException(
+            status_code=409,
+            detail="这次执行断在工具执行中途，无法安全接续（可能造成重复写入）。请重新提问。",
+        )
+
+    return _continuation_sse(
+        chat_service.continue_orphan(db, current_user.id, run_id),
+        db=db,
+        user_id=current_user.id,
+        run_id=run_id,
+        chat_id=run.chat_id,
+        assistant_message_id=(
+            _assistant_message_id(run.message_id) if run.message_id else None
+        ),
+        prefix=state_before.streamed_prefix,
+        model=run.model,
+        state_before=state_before,
+        what="接续",
     )
 
 
@@ -667,6 +807,9 @@ async def resume_run(
         raise HTTPException(
             status_code=409, detail=f"该执行当前状态为 {run.status}，不在等待审批"
         )
+    _reject_if_expired(db, run)
+    # 同 answer_clarification：恢复接着跑同一个循环，剩下几轮照样花钱。
+    _enforce_usage(db, current_user.id)
 
     chat_id = run.chat_id
     assistant_message_id = (
@@ -738,4 +881,10 @@ async def get_run(
             for child in children
         ],
         "checkpoints": checkpoint_store.history(db, run_id),
+        # 审批留痕。挂在这里而不是单开一个端点:问"这次执行被批过什么"的人
+        # 和问"这次执行走了几轮"的人是同一个人,分两个端点只是让他多发一次请求。
+        #
+        # 一定要有一个读路径,否则就是"写进库了但没有任何地方看得到"——审计表最
+        # 常见的失效方式恰恰是这个,而它在测试里完全看不出来。
+        "approvals": approval_audit.history(db, run_id),
     }

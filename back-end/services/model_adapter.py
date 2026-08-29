@@ -186,9 +186,13 @@ class OpenAICompatibleAdapter(ModelAdapter):
         from openai import AsyncOpenAI
         from config import settings
 
+        # 超时与重试在这里就定死,而不是留给 SDK 默认(600s × 3 = 最坏 1800 秒)。
+        # 辅助调用会在 with_options 里再收紧一次,见 _create_completion。
         self._client = AsyncOpenAI(
             api_key=settings.LLM_API_KEY,
             base_url=settings.LLM_BASE_URL,
+            timeout=settings.LLM_CHAT_TIMEOUT_SECONDS,
+            max_retries=settings.LLM_CHAT_MAX_RETRIES,
         )
 
     @classmethod
@@ -506,7 +510,17 @@ class OpenAICompatibleAdapter(ModelAdapter):
         return await client.chat.completions.create(**request)
 
     async def _open_stream(self, request: dict[str, Any]) -> Any:
-        """开流。尽量带上 include_usage，被提供商拒绝则降级为本地估算。"""
+        """开流。尽量带上 include_usage，被提供商拒绝则降级为本地估算。
+
+        超时与重试来自构造函数里配的客户端(``LLM_CHAT_*``)。对流式来说这两件事
+        的语义值得写清楚,因为它们和非流式不一样:
+
+        - **超时**是「两个分片之间最多等多久」,每次读都重置。所以它不会切断一个
+          正常输出的长回答,只会掐掉「连上了但不再吐字节」的挂死连接。
+        - **重试**只发生在这个函数里,也就是**开流之前**。一旦返回了 stream 对象、
+          调用方开始迭代,失败就直接抛给调用方,不会重放已经发给用户的内容。
+          这是「主回答可以重试 2 次」在流式下依然安全的全部理由。
+        """
         if self._stream_usage_supported and settings.LLM_STREAM_USAGE:
             try:
                 return await self._client.chat.completions.create(

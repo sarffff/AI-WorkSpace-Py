@@ -463,3 +463,177 @@ def test_attachment_spoofed_image_rejected(monkeypatch, db_session):
         app.state.limiter.enabled = True
         app.dependency_overrides.clear()
         td.cleanup()
+
+# ========== 用量闸门与审批审计（HTTP 链路） ==========
+
+
+def test_用量闸门在HTTP层返回429并带RetryAfter(client, db_session, monkeypatch):
+    """限流必须在进入 SSE 之前发生。
+
+    生成器里抛 HTTPException 只会得到一条已经建立、然后突然断掉的流，前端拿不到
+    状态码——用户看到的是"连上了又没了"，而不是"你被限流了"。这条断言的就是
+    真的拿到了 429 和 Retry-After，而不是一条空流。
+    """
+    from services import usage_guard
+
+    _register(client)
+    token = _login(client)
+
+    monkeypatch.setattr(settings, "USAGE_GUARD_ENABLED", True)
+    monkeypatch.setattr(settings, "USAGE_RATE_MAX_REQUESTS", 1)
+    monkeypatch.setattr(settings, "USAGE_RATE_WINDOW_MINUTES", 5.0)
+    usage_guard.reset_rate_counter()
+
+    payload = {"prompt": "你好", "use_rag": False}
+    # 第一次放行(会因为没有真实模型而失败，但那发生在闸门之后)
+    client.post("/chats/completions/stream", json=payload, headers=_auth(token))
+    # 第二次必须是 429，而且是**结构化的错误响应**，不是一条 SSE 流
+    response = client.post(
+        "/chats/completions/stream", json=payload, headers=_auth(token)
+    )
+    assert response.status_code == 429, response.text
+    assert response.headers.get("Retry-After") is not None
+    assert "过于频繁" in response.json()["detail"]
+
+    usage_guard.reset_rate_counter()
+
+
+def test_用量闸门关闭时不拦(client, db_session, monkeypatch):
+    from services import usage_guard
+
+    _register(client)
+    token = _login(client)
+    monkeypatch.setattr(settings, "USAGE_GUARD_ENABLED", False)
+    usage_guard.reset_rate_counter()
+
+    payload = {"prompt": "你好", "use_rag": False}
+    for _ in range(3):
+        response = client.post(
+            "/chats/completions/stream", json=payload, headers=_auth(token)
+        )
+        assert response.status_code != 429
+
+
+def test_审批审计能从run详情读到(client, db_session):
+    """写进库但没有读路径 = 审计表最常见的失效方式，而它在单测里看不出来。"""
+    from models import AgentRun, User
+    from services import approval_audit
+    from services.clock import naive_now
+
+    _register(client)
+    token = _login(client)
+    user = db_session.query(User).filter_by(username="alice").one()
+
+    db_session.add(
+        AgentRun(
+            id="run-audit",
+            chat_id="chat-x",
+            user_id=user.id,
+            status="done",
+            rounds=2,
+            started_at=naive_now(),
+            updated_at=naive_now(),
+        )
+    )
+    db_session.commit()
+
+    approval_audit.record_request(
+        db_session,
+        run_id="run-audit",
+        chat_id="chat-x",
+        user_id=user.id,
+        tool_name="save_to_knowledge_base",
+        tool_call_id="call-0",
+        round_index=1,
+        call_index=0,
+        arguments={"title": "报销制度", "content": "正文"},
+        reason="写操作需确认",
+    )
+    approval_audit.record_decision(
+        db_session,
+        run_id="run-audit",
+        decided_by=user.id,
+        approved=True,
+        effective_arguments={"title": "改过的标题", "content": "正文"},
+        edited_fields=["title"],
+    )
+
+    response = client.get("/chats/runs/run-audit", headers=_auth(token))
+    assert response.status_code == 200, response.text
+    approvals = response.json()["approvals"]
+    assert len(approvals) == 1
+    entry = approvals[0]
+    assert entry["decision"] == "approved"
+    assert entry["decidedBy"] == user.id
+    assert entry["decidedAt"] is not None
+    # 执行的不是模型原本要执行的那份——审计里最值得看的一行
+    assert entry["argumentsEdited"] is True
+    assert entry["editedFields"] == ["title"]
+
+
+def test_别人的run看不到审计(client, db_session):
+    from models import AgentRun, User
+    from services.clock import naive_now
+
+    _register(client)
+    _register(client, email="bob@example.com", username="bob")
+    token = _login(client)
+    bob = db_session.query(User).filter_by(username="bob").one()
+
+    db_session.add(
+        AgentRun(
+            id="run-bob",
+            chat_id="chat-b",
+            user_id=bob.id,
+            status="done",
+            rounds=1,
+            started_at=naive_now(),
+            updated_at=naive_now(),
+        )
+    )
+    db_session.commit()
+
+    response = client.get("/chats/runs/run-bob", headers=_auth(token))
+    assert response.status_code == 404
+
+
+def test_超时的审批不允许恢复(client, db_session, monkeypatch):
+    """一个三天前的审批现在被点同意，工具面会按**当下**的权限重建。
+
+    这道判断不能依赖过期扫描跑过——扫描挂在 /runs/pending 这个读路径上，
+    "一直没人打开审批列表"时它一次都不会发生。
+    """
+    from datetime import timedelta
+
+    from models import AgentRun, User
+    from services.clock import naive_now
+
+    _register(client)
+    token = _login(client)
+    user = db_session.query(User).filter_by(username="alice").one()
+
+    monkeypatch.setattr(settings, "AGENT_APPROVAL_TIMEOUT_HOURS", 24)
+    stale = naive_now() - timedelta(hours=25)
+    db_session.add(
+        AgentRun(
+            id="run-stale",
+            chat_id="chat-s",
+            user_id=user.id,
+            status="waiting_approval",
+            rounds=1,
+            started_at=stale,
+            updated_at=stale,
+        )
+    )
+    db_session.commit()
+
+    response = client.post(
+        "/chats/runs/run-stale/resume",
+        json={"approved": True},
+        headers=_auth(token),
+    )
+    assert response.status_code == 409, response.text
+    assert "时限" in response.json()["detail"]
+    # 就地标成 abandoned，不是留在 waiting_approval 里等下一次再拒
+    db_session.expire_all()
+    assert db_session.get(AgentRun, "run-stale").status == "abandoned"

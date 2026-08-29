@@ -844,20 +844,43 @@ def test_snapshot_keeps_the_original_proposal_while_the_tool_gets_the_edit(
         )
     )
 
-    # 快照里仍是**模型原来那份参数**——恢复路径不写新快照（``put`` 只在非
-    # resuming 分支），而且不需要写：调用执行完进 ``writes``，再次恢复靠
-    # ``replay_writes`` 摆回 messages 而**不重新执行**，所以改动没有必须
-    # 跨快照存活的理由。
-    #
-    # 我原来断言 ``latest().edited_arguments`` 里能看到改后的值，那是断言了
-    # 设计并不保证的东西。真正该锁的是下面这两条。
-    after = checkpoint_store.latest(db_real, run_id)
-    pending = after.pending_calls[0]
-    assert "季度总结草稿" in str(pending.get("arguments")), (
-        "快照该保留模型的原始提议，那是审批记录的一部分"
-    )
+    # 工具收到的必须是改后的值——这一条是功能本身，先锁住。
     filename, _content, _workspace = knowledge.uploaded[0]
     assert "Q3 复盘" in filename, "工具收到的必须是改后的值"
+
+    # "模型当初想写什么"这个问题的归宿是 ``agent_approvals``，不是快照。
+    #
+    # 2026-08-29 改：这条断言原来落在 ``latest().pending_calls[0]`` 上。加了
+    # **轮次边界快照**（post_tools，断线接续用）之后 ``latest()`` 返回的是那一份，
+    # 而它按定义清空了 pending_calls——本轮工具已经跑完，留着游标会让下一轮
+    # 整批跳过。所以断言的不是设计变了，是**取快照的方式**变了。
+    #
+    # 顺带说清为什么不把这条搬到 ``at_seq``：快照会被 AGENT_CHECKPOINT_KEEP
+    # 裁剪，它从来当不了审计记录（这也是这条断言的注释里那句"我原来断言了
+    # 设计并不保证的东西"的同一个毛病）。真正的审批记录是 agent_approvals：
+    # 它不随快照裁剪消失，而且分别记着"模型提议的那份"和"实际执行的那份"。
+    from services import approval_audit
+
+    history = approval_audit.history(db_real, run_id)
+    assert len(history) == 1, "一次中断该留下恰好一条审批记录"
+    entry = history[0]
+    assert "季度总结草稿" in (entry["argumentsPreview"] or ""), (
+        "审批记录该保留模型的原始提议"
+    )
+    assert entry["argumentsEdited"] is True, "执行的那份与提议的那份不同，要能看出来"
+    assert entry["editedFields"] == ["name"]
+
+    # 中断那一份快照仍然在历史里（只是不再是 latest）——断线接续要的是最新那份，
+    # 而重放调试要的是这一份，两者都还在。
+    seqs = [item["seq"] for item in checkpoint_store.history(db_real, run_id)]
+    interrupt_states = [
+        checkpoint_store.at_seq(db_real, run_id, seq) for seq in seqs
+    ]
+    assert any(
+        state and state.pending_calls
+        and "季度总结草稿" in str(state.pending_calls[0].get("arguments"))
+        for state in interrupt_states
+    ), "模型的原始提议仍应能从快照历史里取回"
 
 
 # ========== ask_user：问清楚再动手 ==========

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -116,6 +117,123 @@ def update_run(
     except Exception:
         db.rollback()
         logger.warning("update_run failed for %s", run_id, exc_info=True)
+
+
+def orphan_timeout_seconds() -> float:
+    """``running`` 多久没动就算没人在驱动它。
+
+    不新加一个配置项，从已有的上界推：一轮最坏耗时是
+    ``LLM_CHAT_TIMEOUT_SECONDS × (LLM_CHAT_MAX_RETRIES + 1)``（模型调用的上界），
+    加上工具执行的余量。取两轮的量再加 60 秒缓冲——只要比"一轮真的可能花多久"
+    宽，就不会把正在跑的 run 误判成孤儿。
+
+    自己拍一个 `AGENT_ORPHAN_TIMEOUT` 的问题是它会和超时配置各自漂移：有人把
+    LLM_CHAT_TIMEOUT_SECONDS 调到 600，孤儿判定还停在原来的值，于是正常运行的
+    回合会被当成孤儿标掉。推导出来的值不会有这个问题。
+    """
+    per_round = settings.LLM_CHAT_TIMEOUT_SECONDS * (settings.LLM_CHAT_MAX_RETRIES + 1)
+    return per_round * 2 + 60
+
+
+def reap_orphan_runs(db: Session, user_id: str | None = None, limit: int = 100) -> int:
+    """把没人驱动的 ``running`` 执行标成 ``failed``，返回条数。
+
+    SSE 连接断掉时驱动循环的那个异步生成器直接被回收，``_finish_run`` 不会执行，
+    于是这一行永远停在 ``running``。它和"等审批"完全不同：等审批是**刻意**让它
+    活着（状态在库里，等另一个请求接上），而这个是真的没人管了。
+
+    判据是 ``updated_at``：``update_run`` 每轮都会推它，所以一个超过
+    ``orphan_timeout_seconds()`` 没动过的 ``running`` 就是没有进程在跑它。
+
+    终态是 ``failed``（``error_type='orphaned'``）而不是 ``abandoned``：这次执行
+    确实是异常结束的（连接断了），与"没人来裁决"不是一回事。分开之后，
+    "断线率"和"审批积压"是两个可以分别查的数。
+    """
+    cutoff = naive_now() - timedelta(seconds=orphan_timeout_seconds())
+    try:
+        query = db.query(AgentRun).filter(
+            AgentRun.status == "running",
+            AgentRun.updated_at < cutoff,
+        )
+        if user_id is not None:
+            query = query.filter(AgentRun.user_id == user_id)
+        stale = query.limit(limit).all()
+        for run in stale:
+            run.status = "failed"
+            run.finished_at = naive_now()
+            run.error_type = "orphaned"
+        if stale:
+            db.commit()
+        return len(stale)
+    except Exception:
+        db.rollback()
+        logger.exception("failed to reap orphan runs")
+        return 0
+
+
+def list_resumable(db: Session, user_id: str, limit: int = 20) -> list[AgentRun]:
+    """这个用户可以接着跑的执行:断线留下的孤儿。
+
+    与 ``list_pending`` 分开:那个列的是"等你做决定"(``waiting_*``),这个列的是
+    "没人做错什么,连接断了"。两者在界面上是两种不同的提示——前者要人裁决,
+    后者只要问一句"接着跑吗"。
+    """
+    cutoff = naive_now() - timedelta(seconds=orphan_timeout_seconds())
+    return (
+        db.query(AgentRun)
+        .filter(
+            AgentRun.user_id == user_id,
+            AgentRun.status == "running",
+            AgentRun.updated_at < cutoff,
+            # 只有拍过快照的才接得上。没有快照就只能重新提问,
+            # 列出来只会给用户一个点了没反应的按钮。
+            AgentRun.parent_run_id.is_(None),
+        )
+        .order_by(AgentRun.updated_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+
+def expire_stale_runs(db: Session, user_id: str | None = None, limit: int = 100) -> int:
+    """把超时未裁决的 ``waiting_*`` 执行标成 ``abandoned``，返回条数。
+
+    ``AGENT_APPROVAL_TIMEOUT_HOURS`` 在此之前是死配置——声明了但全项目引用为零。
+    不设时限有两个后果：等待审批的 run 永不过期，快照行无限累积；以及一个三天前的
+    ``waiting_approval`` 可以现在恢复，而那时工具面会按**当下**的权限重建，
+    当初批准的语境早就不存在了。
+
+    终态用 ``abandoned`` 而不是 ``failed``：这次执行没有出错，是没人来裁决。
+    ``failed`` 会让"错误率"这个指标把无人处理的审批也算成故障。
+
+    判据是 ``updated_at``：中断那一刻由 ``update_run`` 写的就是它。
+
+    不起后台调度器（项目里没有 worker 进程），改成在读路径上顺带扫——列待审批
+    时本来就要查这批数据。真正要拦住的地方是恢复，那里另有一道单独的判断。
+    """
+    hours = settings.AGENT_APPROVAL_TIMEOUT_HOURS
+    if hours <= 0:
+        return 0
+    cutoff = naive_now() - timedelta(hours=hours)
+    try:
+        query = db.query(AgentRun).filter(
+            AgentRun.status.in_(["waiting_approval", "waiting_input"]),
+            AgentRun.updated_at < cutoff,
+        )
+        if user_id is not None:
+            query = query.filter(AgentRun.user_id == user_id)
+        stale = query.limit(limit).all()
+        for run in stale:
+            run.status = "abandoned"
+            run.finished_at = naive_now()
+            run.error_type = "approval_timeout"
+        if stale:
+            db.commit()
+        return len(stale)
+    except Exception:
+        db.rollback()
+        logger.exception("failed to expire stale runs")
+        return 0
 
 
 def get_run(db: Session, run_id: str) -> AgentRun | None:
