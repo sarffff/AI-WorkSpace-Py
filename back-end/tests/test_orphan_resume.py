@@ -204,3 +204,64 @@ def test_已完成的run接不了(db_real, cp_on):
     service = ChatService()
     events = run(collect(service.continue_orphan(db_real, "u1", "run-1")))
     assert [e for e in events if e["type"] == "error"]
+
+
+# ---- interrupted：断线后立刻可接续 ---------------------------------------
+
+
+def test_断线立刻可接续不必等超时(db_real, cp_on):
+    """静默重连要在几秒内接上，等不了 780 秒的孤儿超时。
+
+    所以 SSE 的 finally 会把它标成 interrupted，而这一档**不看时间**。
+    """
+    _run_row(db_real, age_seconds=1)
+    checkpoint_store.put(db_real, _state())
+    assert checkpoint_store.mark_interrupted("run-1", db_real) is True
+
+    rows = checkpoint_store.list_resumable(db_real, "u1")
+    assert [row.id for row in rows] == ["run-1"], (
+        "标成 interrupted 之后应立刻出现在可接续列表里，不该等超时"
+    )
+
+
+def test_标记不存在的run返回假(db_real, cp_on):
+    assert checkpoint_store.mark_interrupted("nope", db_real) is False
+
+
+def test_interrupted的run能接续(db_real, cp_on):
+    from tests.conftest import collect, run
+    from services.chat_service import ChatService
+
+    _run_row(db_real, age_seconds=1)
+    checkpoint_store.put(db_real, _state())
+    checkpoint_store.mark_interrupted("run-1", db_real)
+
+    service = ChatService()
+    events = run(collect(service.continue_orphan(db_real, "u1", "run-1")))
+    # 不该因为状态不是 running 就拒绝
+    errors = [e for e in events if e["type"] == "error"]
+    assert not any("不是断线未完成" in e["error"] for e in errors), errors
+
+
+def test_等审批的不会被标成interrupted(db_real, cp_on):
+    """审批中断走的是 waiting_approval。把它改成 interrupted 会让审批卡片
+    从待审批列表里消失——用户点开发现要批的东西不见了。"""
+    _run_row(db_real, status="waiting_approval", age_seconds=1)
+    assert checkpoint_store.mark_interrupted("run-1", db_real) is False
+    assert db_real.get(AgentRun, "run-1").status == "waiting_approval"
+
+
+def test_interrupted超时后一并回收(db_real, cp_on):
+    """interrupted 是"可以接续"，不是"永远等着接续"。
+
+    超过同一个时限还没人接，说明用户已经走了。
+    """
+    _run_row(db_real, age_seconds=10_000)
+    checkpoint_store.mark_interrupted("run-1", db_real)
+    # 时间要保持在超时之外
+    row = db_real.get(AgentRun, "run-1")
+    row.updated_at = naive_now() - timedelta(seconds=10_000)
+    db_real.commit()
+
+    assert checkpoint_store.reap_orphan_runs(db_real, "u1") == 1
+    assert db_real.get(AgentRun, "run-1").status == "failed"
