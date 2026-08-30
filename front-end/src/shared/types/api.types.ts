@@ -345,6 +345,14 @@ export interface Citation {
 export interface StreamChunk {
   type?:
     | "message_delta"
+    /**
+     * 回合开始，携带 runId。在**任何东西可能断掉之前**就发出——断线之后
+     * runId 是唯一的接续凭证，而 approval_required / clarification 那两类
+     * 事件恰好只在"没断线"的情形下才会到。
+     */
+    | "run_started"
+    /** 接续成功，携带从第几轮接上 */
+    | "run_resumed"
     | "tool_start"
     | "tool_result"
     | "tool_rounds_ended"
@@ -579,6 +587,21 @@ export interface PendingApproval {
   reason: string;
   /** 参数预览，已在服务端脱敏截断 */
   preview: Record<string, unknown>;
+}
+
+/**
+ * 断线留下、可以接着跑的执行。
+ *
+ * 与 `PendingApproval` 是两种东西：那个在等人做决定，这个只是连接断了。
+ * 所以这里没有 tool / reason / preview——没有什么要给人看、要人裁决的。
+ */
+export interface ResumableRun {
+  runId: string;
+  chatId: string;
+  messageId?: string | null;
+  /** 断在第几轮。接续会从这一轮之后继续 */
+  round: number;
+  updatedAt?: string | null;
 }
 
 /** 一次执行的详情。子代理是它的 children */

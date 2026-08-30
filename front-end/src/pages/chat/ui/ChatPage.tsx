@@ -9,6 +9,7 @@ import { useSelector, useDispatch } from "react-redux";
 import { RootState } from "@/app/providers/store";
 import {
   addMessage,
+  appendToMessage,
   updateMessageContent,
   removeMessage,
   setIsGenerating,
@@ -24,6 +25,7 @@ import {
   setPromptVersion,
 } from "@/entities/chat/model/chatSlice";
 import { apiClient } from "@/shared/api/client";
+import { streamWithReconnect } from "@/shared/api/reconnect";
 import type {
   Citation,
   GuardrailNotice,
@@ -228,6 +230,23 @@ export const ChatPage: React.FC = () => {
     assistantId: string | null;
   } | null>(null);
   const [approvalBusy, setApprovalBusy] = useState(false);
+  // 静默重连试满之后的提示。null = 没发生过。
+  //
+  // 与 pendingApproval 分开：那个在等人做决定（批不批），这个只是告诉人
+  // "接不回去了"。前者不点就卡着，后者点不点都行。
+  const [reconnectFailed, setReconnectFailed] = useState<{
+    resumable: boolean;
+    attempts: number;
+  } | null>(null);
+  // 当前回合的 runId 与它写在哪条气泡上。"再试一次"要用它接续。
+  //
+  // 用 ref 而不是 state：它在 SSE 循环里被写、被读，走 state 会因为闭包
+  // 拿到旧值——那正是"点了再试一次却接了上一回合"的成因。
+  const activeRunRef = useRef<{
+    runId: string;
+    sessionId: string;
+    assistantId: string;
+  } | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -752,6 +771,8 @@ export const ChatPage: React.FC = () => {
         setReplyStarted(true);
       }
 
+      // 审批恢复不套重连：它是用户刚点的一次明确动作，失败了该让他看到错误，
+      // 而不是悄悄重试一个"已经批准过"的写操作。
       const stream = resume
         ? apiClient.resumeRun(
             resume.runId,
@@ -759,21 +780,56 @@ export const ChatPage: React.FC = () => {
             resume.note,
             controller.signal,
           )
-        : apiClient.streamMessage(
-            {
-              prompt: userMsg,
-              model: selectedModel,
-              chat_id: sessionId,
-              use_rag: useRag,
-              message_id: userMessageId,
-              // 提示词实验台里挂上的版本；没挂就交给服务端默认版本
-              ...(promptVersion ? { prompt_version: promptVersion } : {}),
-            },
-            controller.signal,
-          );
+        : streamWithReconnect({
+            open: () =>
+              apiClient.streamMessage(
+                {
+                  prompt: userMsg,
+                  model: selectedModel,
+                  chat_id: sessionId,
+                  use_rag: useRag,
+                  message_id: userMessageId,
+                  // 提示词实验台里挂上的版本；没挂就交给服务端默认版本
+                  ...(promptVersion ? { prompt_version: promptVersion } : {}),
+                },
+                controller.signal,
+              ),
+            resume: (runId) =>
+              apiClient.continueRun(runId, controller.signal),
+            signal: controller.signal,
+          });
 
       try {
         for await (const chunk of stream) {
+          // 静默重连：只改一行状态文字，不弹窗、不打断正文。
+          // 一次 WiFi 抖动接回去就好了，弹窗只是噪音。
+          if (chunk.type === "run_started" && chunk.runId) {
+            activeRunRef.current = {
+              runId: chunk.runId,
+              sessionId,
+              assistantId: assistantMsgId,
+            };
+          }
+          if (chunk.type === "reconnecting") {
+            setToolStatus(
+              `连接中断，正在接回（第 ${chunk.attempt}/${chunk.maxAttempts} 次）…`,
+            );
+            continue;
+          }
+          // 静默试满了才问用户。分两种话术：还能接的给"继续"，
+          // 服务端说接不上的（断在工具执行中途，重跑可能重复写入）只能重新提问。
+          if (chunk.type === "reconnect_failed") {
+            stopFlushTimer();
+            flushBuffer();
+            setShowThinking(false);
+            setToolStatus(null);
+            dispatch(setIsGenerating(false));
+            setReconnectFailed({
+              resumable: chunk.resumable,
+              attempts: chunk.attempts,
+            });
+            break;
+          }
           if (chunk.error) {
             stopFlushTimer();
             setShowThinking(false);
@@ -1167,6 +1223,11 @@ export const ChatPage: React.FC = () => {
                 apiClient.renameChat(sessionId, title).catch(() => {});
               }
               assistantMsgId = Date.now().toString();
+              // run_started 比第一段正文早到，那时气泡还不存在，所以 runId 记下时
+              // assistantId 是空的。这里补上——"再试一次"要接着同一条气泡写。
+              if (activeRunRef.current) {
+                activeRunRef.current.assistantId = assistantMsgId;
+              }
               bufferRef.current = {
                 id: assistantMsgId,
                 content: chunk.content,
@@ -1301,6 +1362,81 @@ export const ChatPage: React.FC = () => {
       toast,
     ],
   );
+
+  /**
+   * "再试一次"：手动接续一次断掉的回合。
+   *
+   * 不套 `streamWithReconnect`：这一下是用户明确点的，再失败就该让他看到，
+   * 而不是又悄悄重试一轮。静默那几次已经用掉了。
+   *
+   * 也不走 `runCompletion`：它的 resume 形状带 `approved`/`note`，在断线接续里
+   * 这两个字段没有意义，硬塞进去会让"审批恢复"和"断线接续"在同一个参数里
+   * 表达两件不同的事。
+   */
+  const handleRetryReconnect = useCallback(async () => {
+    const active = activeRunRef.current;
+    if (!active) {
+      setReconnectFailed(null);
+      return;
+    }
+    setReconnectFailed(null);
+    dispatch(setIsGenerating(true));
+    const controller = new AbortController();
+    abortRef.current = controller;
+    try {
+      for await (const chunk of apiClient.continueRun(
+        active.runId,
+        controller.signal,
+      )) {
+        if (chunk.type === "message_delta" && chunk.content) {
+          // 接着同一条气泡往后写。没有气泡（刷新过页面）时下面兜底重拉。
+          if (active.assistantId) {
+            dispatch(
+              appendToMessage({
+                sessionId: active.sessionId,
+                id: active.assistantId,
+                content: chunk.content,
+              }),
+            );
+          }
+        }
+        if (chunk.type === "error" && chunk.error) {
+          toast.error(chunk.error);
+          break;
+        }
+        if (chunk.done) break;
+      }
+      if (!active.assistantId) {
+        // 本地没有那条气泡，拿后端拼好的完整回答。
+        const msgs = await apiClient.getMessages(active.sessionId);
+        dispatch(
+          setMessages({
+            sessionId: active.sessionId,
+            messages: msgs.map((m) => ({
+              id: m.id,
+              sessionId: m.chatId,
+              role: m.role,
+              content: m.content,
+              timestamp: new Date(m.createdAt).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+              }),
+              model: m.model,
+            })),
+          }),
+        );
+      }
+    } catch (err) {
+      if ((err as Error)?.message === "NOT_RESUMABLE") {
+        setReconnectFailed({ resumable: false, attempts: 0 });
+      } else if ((err as Error)?.name !== "AbortError") {
+        toast.error(toastMessageFrom(err, "接续失败"));
+      }
+    } finally {
+      dispatch(setIsGenerating(false));
+      activeRunRef.current = null;
+    }
+  }, [dispatch, toast]);
 
   const handleSend = useCallback(
     async (e: React.FormEvent) => {
@@ -1807,6 +1943,41 @@ export const ChatPage: React.FC = () => {
                   busy={approvalBusy}
                   onDecide={handleApprovalDecision}
                 />
+              </div>
+            </div>
+          )}
+          {reconnectFailed && (
+            <div className="flex items-start gap-4 max-w-3xl">
+              <div className="w-8 h-8 rounded-xl bg-[#282724] dark:bg-[#2e2d2a] flex items-center justify-center text-amber-500 shadow-sm">
+                <Bot className="w-4 h-4" />
+              </div>
+              <div className="min-w-0 flex-1 rounded-2xl border border-amber-500/30 bg-amber-500/5 px-4 py-3">
+                <p className="text-sm text-[#3d3929] dark:text-[#c8c5ba]">
+                  {reconnectFailed.resumable
+                    ? `连接中断，已自动重试 ${reconnectFailed.attempts} 次仍未接回。`
+                    : "连接中断，这次回答无法安全接续（可能造成重复写入）。"}
+                </p>
+                <p className="mt-1 text-xs text-[#7c7a70] dark:text-[#8a8880]">
+                  {reconnectFailed.resumable
+                    ? "已经生成的内容保留在上面。可以再试一次接上，或者重新提问。"
+                    : "已经生成的内容保留在上面。请重新提问。"}
+                </p>
+                <div className="mt-3 flex gap-2">
+                  {reconnectFailed.resumable && (
+                    <button
+                      onClick={handleRetryReconnect}
+                      className="px-3 py-1.5 rounded-xl bg-[#da7756] hover:bg-[#c96a4b] text-white text-xs font-medium transition-colors"
+                    >
+                      再试一次
+                    </button>
+                  )}
+                  <button
+                    onClick={() => setReconnectFailed(null)}
+                    className="px-3 py-1.5 rounded-xl bg-black/5 dark:bg-white/10 hover:bg-black/10 dark:hover:bg-white/15 text-[#3d3929] dark:text-[#c8c5ba] text-xs font-medium transition-colors"
+                  >
+                    知道了
+                  </button>
+                </div>
               </div>
             </div>
           )}

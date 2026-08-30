@@ -30,6 +30,7 @@ import type {
    ToolStep,
   AgentMetrics,
   PendingApproval,
+  ResumableRun,
   AgentRunDetail,
 } from "../types/api.types";
 
@@ -510,6 +511,55 @@ export class ApiClient {
       throw new Error(`Failed to resume run: ${response.statusText}`);
     }
     yield* this.readStream(response);
+  }
+
+  /**
+   * 接上一个因断线而没跑完的回合。
+   * POST /chats/runs/{runId}/continue
+   *
+   * 与 `resumeRun` 分开而不是加个可选参数：那个要带裁决（同意/拒绝/改参数），
+   * 这个没有任何载荷——没有人做错什么，是连接断了。
+   *
+   * 409 有两种含义，都不该重试：
+   * - 这个回合断在工具执行中途，接上去可能重复写入（服务端拒绝）
+   * - 它已经跑完了，或已经被别的标签页接走了
+   * 统一抛 `NOT_RESUMABLE`，由调用方决定是重新提问还是什么都不做。
+   */
+  async *continueRun(
+    runId: string,
+    signal?: AbortSignal,
+  ): AsyncGenerator<StreamChunk, void, undefined> {
+    const response = await this.openStream(
+      `/chats/runs/${runId}/continue`,
+      {},
+      signal,
+    );
+    if (response.status === 409) {
+      throw new Error("NOT_RESUMABLE");
+    }
+    if (!response.ok) {
+      throw new Error(`Failed to continue run: ${response.statusText}`);
+    }
+    yield* this.readStream(response);
+  }
+
+  /**
+   * 断线留下、可以接着跑的执行。
+   * GET /chats/runs/resumable
+   *
+   * 与 `getPendingApprovals` 分开：那个是"等你做决定"，这个是"连接断了"。
+   * 界面上是两种不同的提示——前者要人裁决，后者只要问一句"接着跑吗"。
+   */
+  async getResumableRuns(): Promise<ResumableRun[]> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/chats/runs/resumable`,
+      { method: "GET" },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch resumable runs: ${response.statusText}`);
+    }
+    const body = (await response.json()) as { items?: ResumableRun[] };
+    return body.items ?? [];
   }
 
   /**

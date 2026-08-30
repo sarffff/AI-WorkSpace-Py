@@ -415,6 +415,12 @@ async def stream_completions(
         # 被审批打断了。这一回合还没有最终回答，所以既不落 assistant 消息，
         # 也不能报"模型未返回最终回答"——它没失败，它在等人。
         interrupted = False
+        # 这一回合的 run id 与"有没有走到自然结束"。两者一起决定断线时怎么收尾。
+        #
+        # run_id 只能从事件流里拿:它是在 chat_service 内部生成的,路由这边
+        # 事先不知道。``run_started`` 正是为此在任何东西可能断掉之前就发出。
+        run_id: str | None = None
+        settled = False
         try:
             if existing_assistant:
                 yield {
@@ -453,6 +459,8 @@ async def stream_completions(
                 prompt_version,
             ):
                 payload = {**event, "chat_id": chat_id}
+                if event["type"] == "run_started":
+                    run_id = event.get("runId")
                 if event["type"] == "message_delta":
                     full_response += event["content"]
                 if event["type"] == "error":
@@ -472,6 +480,7 @@ async def stream_completions(
             if interrupted:
                 # 状态在 agent_checkpoints 里，恢复走 /runs/{run_id}/resume。
                 # 这里什么都不落：半截回答不是回答。
+                settled = True
                 return
             if not failed and full_response.strip():
                 await chat_service.save_message(
@@ -510,14 +519,26 @@ async def stream_completions(
                         ensure_ascii=False,
                     )
                 }
+            settled = True
         except Exception:
             logger.exception("Chat stream failed for chat %s", chat_id)
+            settled = True
             yield {
                 "data": json.dumps(
                     {"type": "error", "error": "生成回答失败，请稍后重试。"},
                     ensure_ascii=False,
                 )
             }
+        finally:
+            # 客户端断线时这个 finally 会在生成器被回收时执行,而上面的正常收尾
+            # 一条都没走到——``settled`` 就是用来区分这两种情况的。
+            #
+            # 不标的话这一行会永远停在 ``running``,要等 orphan_timeout_seconds()
+            # (约 780 秒)才被回收,而**静默重连等不了那么久**。标成 interrupted
+            # 让它立刻可接续;进程真的崩掉、连 finally 都没跑到的情况仍由孤儿
+            # 回收兜着。
+            if not settled and run_id:
+                checkpoint_store.mark_interrupted(run_id)
 
     return EventSourceResponse(event_generator())
 
@@ -751,7 +772,7 @@ async def continue_run(
     run = checkpoint_store.get_run(db, run_id)
     if run is None or run.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="执行记录不存在")
-    if run.status != "running":
+    if run.status not in ("interrupted", "running"):
         raise HTTPException(
             status_code=409,
             detail=f"该执行当前状态为 {run.status}，不是断线未完成",

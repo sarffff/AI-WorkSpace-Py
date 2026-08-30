@@ -2216,7 +2216,9 @@ class ChatService:
         if run is None or run.user_id != user_id:
             yield {"type": "error", "error": "找不到这次执行，或它不属于当前用户。"}
             return
-        if run.status != "running":
+        # ``interrupted`` 是 SSE 的 finally 明确标下的断线；``running`` 是连 finally
+        # 都没跑到（进程被杀）。两者都可接续，区别只在怎么被发现的。
+        if run.status not in ("interrupted", "running"):
             yield {
                 "type": "error",
                 "error": f"这次执行当前状态是 {run.status}，不是断线未完成。",

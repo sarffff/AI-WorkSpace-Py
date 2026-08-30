@@ -24,6 +24,7 @@ import logging
 from datetime import timedelta
 from typing import Any
 
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from config import settings
@@ -119,6 +120,50 @@ def update_run(
         logger.warning("update_run failed for %s", run_id, exc_info=True)
 
 
+def mark_interrupted(run_id: str, db: Session | None = None) -> bool:
+    """把断线的执行标成 ``interrupted``，让它**立刻**可接续。返回是否标上了。
+
+    在 SSE 生成器的 ``finally`` 里调用。不标的话这一行会停在 ``running``，要等
+    ``orphan_timeout_seconds()``（约 780 秒）才被孤儿回收认领——而静默重连等不了
+    那么久，它要在几秒内接上。
+
+    ``interrupted`` 与 ``failed``/``orphaned`` 分开：前者是"连接断了、状态完好、
+    可以接着跑"，后者是"超时都没人管，放弃了"。孤儿回收仍然兜着那些连 finally
+    都没跑到的情况（进程被杀）。
+
+    **自建会话。** 生成器被回收时请求作用域的 db 很可能已经关了，用它会抛
+    ``ResourceClosedError``，而那个异常发生在 finally 里、会盖住原本的断线原因。
+    同 ``chat_router._extract_memory`` 的取舍。
+
+    只在当前状态确实是 ``running`` 时才改：审批中断走的是 ``waiting_approval``，
+    那条路径的 finally 也会经过这里（``settled`` 为真时不会，但多一层保险），
+    把它改成 interrupted 会让审批卡片从待审批列表里消失。
+    """
+    if not enabled():
+        return False
+
+    def _apply(session: Session) -> bool:
+        run = session.get(AgentRun, run_id)
+        if run is None or run.status != "running":
+            return False
+        run.status = "interrupted"
+        run.updated_at = naive_now()
+        session.commit()
+        return True
+
+    try:
+        if db is not None:
+            return _apply(db)
+        from database import SessionLocal
+
+        with SessionLocal() as owned:
+            return _apply(owned)
+    except Exception:
+        # 断线收尾失败不该再抛：这里已经在 finally 里，抛出去会盖住断线本身。
+        logger.exception("failed to mark run %s interrupted", run_id)
+        return False
+
+
 def orphan_timeout_seconds() -> float:
     """``running`` 多久没动就算没人在驱动它。
 
@@ -151,8 +196,10 @@ def reap_orphan_runs(db: Session, user_id: str | None = None, limit: int = 100) 
     """
     cutoff = naive_now() - timedelta(seconds=orphan_timeout_seconds())
     try:
+        # ``interrupted`` 也一起回收：它是"可以接续"，不是"永远等着接续"。
+        # 超过同一个时限还没人接，说明用户已经走了，留着只会让列表越来越长。
         query = db.query(AgentRun).filter(
-            AgentRun.status == "running",
+            AgentRun.status.in_(["running", "interrupted"]),
             AgentRun.updated_at < cutoff,
         )
         if user_id is not None:
@@ -183,10 +230,17 @@ def list_resumable(db: Session, user_id: str, limit: int = 20) -> list[AgentRun]
         db.query(AgentRun)
         .filter(
             AgentRun.user_id == user_id,
-            AgentRun.status == "running",
-            AgentRun.updated_at < cutoff,
-            # 只有拍过快照的才接得上。没有快照就只能重新提问,
-            # 列出来只会给用户一个点了没反应的按钮。
+            # 两类都算可接续，但判据不同：
+            #
+            # - ``interrupted``：SSE 的 finally 明确标过的，状态完好，**不看时间**。
+            #   静默重连要在几秒内接上，加时间条件等于让它永远等不到。
+            # - ``running`` 且超时：finally 都没跑到（进程被杀），只能靠时间推断
+            #   没人在驱动它。
+            or_(
+                AgentRun.status == "interrupted",
+                and_(AgentRun.status == "running", AgentRun.updated_at < cutoff),
+            ),
+            # 子代理跑在父代理的一次 delegate 调用内部，没有独立的接续入口。
             AgentRun.parent_run_id.is_(None),
         )
         .order_by(AgentRun.updated_at.desc())
