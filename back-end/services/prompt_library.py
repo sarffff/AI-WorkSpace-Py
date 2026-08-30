@@ -161,7 +161,11 @@ SPECS: dict[str, PromptSpec] = {
     "agent_researcher": PromptSpec(
         key="agent_researcher",
         purpose="researcher 子代理：查资料并如实汇报出处",
-        default_version="v1",
+        # v2：把"必须先调工具"写成硬要求。v1 没有这一条，2026-08-28 的评估里
+        # memory-web 与 recovery-search-down 两条都是 researcher 一次工具都没调
+        # 就凭记忆交了报告——而 v1 里"没有出处就标明是推测"恰好给了它一个合法出口。
+        # v1 保留在目录里，好对照跑 A/B。
+        default_version="v2",
         setting="PROMPT_AGENT_RESEARCHER_VERSION",
     ),
     "agent_analyst": PromptSpec(

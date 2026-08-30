@@ -55,7 +55,17 @@ ROLES: dict[str, AgentRole] = {
             "read_document_chunk",
             "web_search",
         ),
-        max_rounds=4,
+        # 5 而不是 4。**最后一轮不下发工具**（要它写报告），所以能用的工具轮数是
+        # max_rounds - 1；4 只给 3 轮。
+        #
+        # researcher 是唯一横跨两个来源的角色，而它的提示词要求"两者都可能相关时
+        # 先查本地再查网页"。那条路径最短也是：检索本地 → 列文档或读分块 →
+        # 转网页 → 写报告。3 个工具轮意味着转一次来源就用光了。
+        #
+        # 2026-08-28 的评估里这个数字是 supervisor 那三条失败的一半原因（另一半是
+        # 重复检测把 schema 收走，见 subagent 的收敛逻辑）：4 轮预算下，前两轮被
+        # 两次相同的无参调用吃掉之后，web_search 已经排不进来了。
+        max_rounds=5,
     ),
     "analyst": AgentRole(
         name="analyst",

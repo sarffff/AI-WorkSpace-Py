@@ -70,6 +70,25 @@ def role_prompt(role: AgentRole) -> str:
     return prompt_library.get(role.prompt_key).render()
 
 
+def repeat_limit() -> int:
+    """子代理的重复调用上限。比主代理紧一档。
+
+    ``AGENT_REPEAT_LIMIT`` 默认 3,是按主代理 6 轮的预算定的——放过两次相同调用
+    占三分之一。子代理只有 3~5 轮,同一个比例意味着"先烧掉一半再拦",而拦下来
+    那一刻剩下的轮次已经不够换一条路了。2026-08-28 那次 supervisor 失败的算术
+    就是这个:4 轮预算,前两轮放过两次同样的无参调用,第三轮拦下,第四轮是最后
+    一轮(不下发 schema),于是 ``web_search`` 一次都没机会被调到。
+
+    取 ``min(2, 主上限)`` 而不是写死 2:主上限被调到 1(等于"一次都不许重复")时,
+    子代理不该反而比它松。
+    """
+    main = settings.AGENT_REPEAT_LIMIT
+    if main <= 0:
+        # 0 表示关闭重复检测,子代理跟随
+        return main
+    return min(2, main)
+
+
 class SubAgentRunner:
     """按角色跑一次委派。
 
@@ -121,7 +140,7 @@ class SubAgentRunner:
         # 共享会立刻出错:子代理看不到对话历史(见模块文档的约束 1),所以它去查
         # 主代理刚查过的东西是完全正当的——那是它拿到任务后的第一次调用,不是重复。
         # 共享计数会把这第一次就算成第二次,委派两次之后 researcher 一句都查不动。
-        repeats = RepeatGuard(settings.AGENT_REPEAT_LIMIT)
+        repeats = RepeatGuard(repeat_limit())
         max_rounds = max(1, role.max_rounds)
         report_parts: list[str] = []
         round_index = 0
@@ -177,6 +196,12 @@ class SubAgentRunner:
 
                 messages.append(completion.as_assistant_message())
                 text_results: list[str] = []
+                # ``barren`` 只数**此路不通**的调用(工具不可用)。
+                #
+                # 重复调用**不进这个计数**,这是 2026-08-29 修 supervisor 那次失败
+                # 的核心。``REPEATED`` 回灌的原话是"请改用不同的参数,或者基于已有
+                # 信息直接作答"——原来的实现把它算进 barren,于是下一轮 schema 被
+                # 清空,模型拿到了"换个工具"的建议却没有了执行它的手段。
                 barren = 0
 
                 for call_index, call in enumerate(calls):
@@ -202,10 +227,13 @@ class SubAgentRunner:
                         repeated = repeats.check(call.name, arguments)
                         if repeated is not None:
                             # 子代理轮次比主代理少(role.max_rounds),原地转圈的代价
-                            # 相对更高:三轮里浪费一轮就是三分之一。
+                            # 相对更高:三轮里浪费一轮就是三分之一。所以子代理用
+                            # 自己那个更紧的上限(见 repeat_limit)。
+                            #
+                            # 但**不算 barren**:被拦下不等于此路不通,恰恰相反,
+                            # 那句纠正说明请它换参数或换工具,而换工具需要 schema。
                             result_text = repeated.content
                             status = repeated.status.value
-                            barren += 1
                         else:
                             with guardrails.collecting():
                                 # 护栏命中记在外层 delegate 那一步:子代理跑在
@@ -254,9 +282,24 @@ class SubAgentRunner:
                     )
 
                 if barren == len(calls):
-                    # 本轮没有一次调用带回新东西(全不可用,或全是重复调用),
-                    # 继续只会原地转圈。下一轮不给 schema,逼它用已有信息写报告。
+                    # 本轮每一次调用都**此路不通**(工具不可用)。工具坏了就是坏了,
+                    # 把剩下的轮次全花在同一个失败上,等于把一次故障放大成一整个
+                    # 委派。下一轮不给 schema,逼它用已有信息写报告。
                     max_rounds = round_index + 1
+                # **重复调用不触发提前收敛。** 一条也不减。
+                #
+                # 先试过"连续两轮全是重复才收敛",仍然不对:那等于假设模型只需要
+                # 一次提醒就会转向。评估里 web-vat-code 是连发三次才换工具的,
+                # 两轮的规则照样在它转向前一轮把 schema 收走了。
+                #
+                # 为什么可以完全不收敛:被拦下的调用**根本没有执行**,它的成本是
+                # 一次模型调用,没有任何工具副作用;而轮次总数由 max_rounds 兜着,
+                # 所以浪费是有上界的。反过来,提前收走 schema 是在模型需要一次以上
+                # 提醒时**保证失败**——有上界的浪费比保证失败好。
+                #
+                # 这正是 ToolStatus 把 REPEATED 与 UNAVAILABLE 分成两档的意义
+                # (见 tool_runtime 里那段注释):前者"换个参数仍然值得试",而
+                # "值得试"要求手里还有工具。
 
             report = "\n\n".join(part for part in report_parts if part.strip()).strip()
             span.set(
@@ -376,6 +419,22 @@ def format_report(outcome: SubAgentOutcome) -> str:
         header += f"、{len(outcome.steps)} 次工具调用"
     header += "]"
     body = [header, outcome.report]
+    if not outcome.steps:
+        # 一次工具都没调就交了报告 = 凭记忆答的。
+        #
+        # 2026-08-28 的评估里 memory-web 与 recovery-search-down 都是这个形状
+        # (``calls=[delegate]``、``stubQueries=[]``)。最危险的是后者:那道题考的
+        # 恰恰是"查不到时如实说",而它编了一个具体汇率出来。
+        #
+        # 为什么标在这里而不是只靠提示词:主代理**看不到检索过程**,只看到这段
+        # 正文,而一段凭记忆写的报告读起来和查过的一模一样。提示词里已经写了
+        # "没有出处不要写成事实",但那句话给了模型一个合法出口(标成推测就行),
+        # 而"有没有真的调过工具"是这边确定知道的事实,不该交给措辞去保证。
+        body.append(
+            f"[注意：{outcome.role} **没有调用任何工具**，这份报告未经检索，"
+            "内容来自模型自身记忆。不要把其中任何具体数字、日期或条款当作已核实的事实；"
+            "需要确凭的话请自己查，或告诉用户这部分未能核实。]"
+        )
     if outcome.truncated:
         body.append(
             f"[注意：{outcome.role} 的轮次已用尽，这份报告可能不完整。"
