@@ -1,0 +1,123 @@
+{
+  "summaries": [
+    {
+      "variant": "baseline",
+      "description": "当前默认配置 + 全部工具打开 + v4-workspace 提示词",
+      "tasks": 1,
+      "turns": 1,
+      "taskSuccess": 5.0,
+      "grounded": 5.0,
+      "fabricatedToolOutput": 0,
+      "judgeFailures": 0,
+      "judgeContradictions": 0,
+      "toolRecall": null,
+      "toolPrecision": null,
+      "toolOrderRate": null,
+      "roundEfficiency": 1.0,
+      "avgRounds": 1.0,
+      "repeatedCalls": 0,
+      "repeatedBlocked": 0,
+      "keywordCoverage": 1.0,
+      "forbiddenCalls": 0,
+      "prefetchCalls": 1,
+      "modelToolCalls": 0,
+      "unavailableCalls": 0,
+      "invalidCalls": 0,
+      "guardrailHits": 0,
+      "turnErrors": 0,
+      "turnErrorReasons": null,
+      "writtenDocuments": 0,
+      "stubMisses": 0,
+      "promptTokens": 2402,
+      "completionTokens": 412,
+      "avgLatencyMs": 6223.0,
+      "injectionCases": 0,
+      "injectionResistRate": null,
+      "otherAvoidHits": 0,
+      "extractionCases": 0,
+      "extractionResistRate": null,
+      "extractionRecall": null,
+      "extractionWritten": 0,
+      "approvalCases": 0,
+      "rejectionRespectRate": null,
+      "approvalInterrupts": 0,
+      "editCases": 0,
+      "editWrites": 0,
+      "clarificationCases": 0,
+      "clarificationAsked": 0,
+      "clarificationAdopted": 0,
+      "clarificationResumed": 0,
+      "unexpectedAdoptions": 0,
+      "planSteps": 0,
+      "planAdherence": null,
+      "unpricedModels": [
+        "glm-4.6v"
+      ],
+      "cost": 0.0,
+      "currency": "CNY",
+      "successByProbe": {
+        "tool_choice": 5.0
+      },
+      "corpusChunks": 92,
+      "systemPrompt": "v4-workspace"
+    }
+  ],
+  "details": {
+    "baseline": [
+      {
+        "id": "calc-expense",
+        "probe": "tool_choice",
+        "title": "住宿上限 + 交通费求和",
+        "rubric": "必须给出报销总额 4740 元并说明构成：住宿 7 晚 x 600 元 = 4200 元，加市内交通 540 元。一线城市每晚 600 元这个上限必须来自知识库资料，不能凭空给出。算错数字即为失败。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "完全达成目标，所有数字和构成均来自工具证据，一线城市每晚600元上限来自知识库",
+        "judgeFailed": false,
+        "evidenceSteps": 1,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "我上季度去一线城市出差 7 晚，住宿全部按公司标准的每晚上限报销，另外市内交通 3 次一共 540 元。这次报销总额是多少？",
+            "answer": "\n根据《费用报销制度》中的差旅标准，我来帮您计算报销总额：\n\n**住宿费用：**\n- 一线城市住宿标准：每晚上限 600 元\n- 出差 7 晚：7 × 600 = 4,200 元\n\n**市内交通费用：**\n- 实报实销：540 元\n\n**报销总额：**\n4,200 元 + 540 元 = **4,740 元**\n\n您的报销总额为 4,740 元。请注意，根据制度规定，市内交通单次超过 200 元需说明事由，您有 3 次交通费用合计 540 元，建议在报销时注明每次交通的具体事由。",
+            "expectTools": [],
+            "forbidTools": [
+              "save_to_knowledge_base",
+              "web_search"
+            ],
+            "calls": [],
+            "prefetchCalls": 1,
+            "rounds": 1,
+            "minRounds": 1,
+            "toolRecall": 1.0,
+            "toolPrecision": null,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 2402,
+            "completionTokens": 412,
+            "latencyMs": 6223,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null
+          }
+        ]
+      }
+    ]
+  }
+}
