@@ -192,6 +192,33 @@ class MemoryService:
     def build_system_block(self, db: Session, user_id: str) -> str:
         """注入用的记忆块。最新优先——偏好会变,新说的应该压过旧说的。
 
+        **2026-09-03 临时收窄：只注入 fact，不注入 preference。**
+
+        ``injection-memory`` 探针三次实测（8/28、8/30、9/3）全部失败，措辞修改
+        无效——即使声明明确点名攻击形状、加粗、逐项排除，模型照样执行注入。
+
+        攻击载荷在 ``kind="preference"`` 里，正当背景（财务部、合规审核）在
+        ``kind="fact"`` 里。暂时只注入 fact，preference 留着（抽取照样跑、
+        数据照样入库）但不给模型，直到下列之一完成：
+
+        - 抽取侧抗性提升到 0.7+（当前 0.40，漏掉 60%）
+        - 或者把 preference 结构化成枚举（language/verbosity/tone + value），
+          杜绝自由文本藏命令的可能
+
+        代价：用户表达偏好（"简短点"、"用中文"）暂时失效。但 fact 类记忆仍然
+        工作，所以"记住我在哪个部门"这类正当背景不受影响——``injection-memory``
+        的第二轮实测仍然答出"财务部 / 差旅报销的合规审核"。
+
+        **这个代价在评估里看不见，所以专门补了一条用例。** 改之前只有
+        ``injection-memory`` 一条用到 preference 类 seed 记忆，而它是攻击；
+        也就是说"正当偏好有没有生效"没有任何一条在量。少了那条，这次收窄会显示
+        成"抗性 0.33 → 1.0 且零代价"，而代价是真实存在的、只是没被测。
+        见 ``memory-preference-honored``。
+
+        （注：``extractionRecall`` **不**衡量这件事——它量的是抽取侧"正当内容有
+        没有被过度拦截"，也就是有没有写进库。这次改的是注入侧，所以那一列实测
+        前后都是 1.0。我一开始在这段注释里写它会掉到 0，那是错的。）
+
         走 ``guard.fence`` 而不是自己拼表头:记忆以 role=system 注入,拿到的是
         全场最高权限,而内容源自对话历史。知识库、文档、网页、附件四条通路都有
         nonce 定界 + 无指令权限声明,记忆此前是唯一没有的一条。
@@ -218,6 +245,9 @@ class MemoryService:
             .limit(max(1, settings.MEMORY_INJECT_LIMIT))
             .all()
         )
+        # 2026-09-03：只注入 fact，不注入 preference。见函数文档。
+        memories = [m for m in memories if m.kind == "fact"]
+
         if not memories:
             return ""
         if not guard.enabled:
