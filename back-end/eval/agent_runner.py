@@ -51,10 +51,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import Any
 
@@ -160,15 +162,30 @@ class TurnSpec:
     # 一个正确回答至少需要几轮模型调用。工具零次 = 1；调一次工具再作答 = 2。
     # 标错了会让轮次效率变成一个看起来精确的假数字，所以数据集里逐条标。
     min_rounds: int = 1
-    # 人工裁决："" / "approve" / "reject"。非空时这一轮会等审批中断，
+    # 人工裁决："" / "approve" / "reject" / "edit"。非空时这一轮会等审批中断，
     # 由 runner 代替用户点一次，然后从快照恢复。
     #
     # 为什么裁决标在**轮**上而不是任务上：一个任务完全可以是"第一轮被拒、
     # 第二轮换方案"，那正是拒绝之后该发生的事。标在任务上就表达不了。
+    #
+    # ``edit`` = 改了参数再放行。它在后端不是第三种裁决（走同一道闸门、同一套
+    # schema 校验、写同一批 approved_call_ids），但在**数据集**里必须是独立的一种：
+    # 要量的行为不一样——批准量"写没写"，拒绝量"会不会重试"，编辑量"模型知不知道
+    # 参数被人改过"。
     approval: str = ""
     # 拒绝时附带的备注。会被 approval.rejection_message 拼进回灌给模型的工具结果，
     # 而它通常正好是模型需要的修改方向——所以"模型有没有听这句话"是可测的。
     approval_note: str = ""
+    # ``approval="edit"`` 时替换掉的参数。只写要改的键——后端按
+    # ``{**原参数, **这里给的}`` 合并，没给的键用原值（见 approval.validate_edit）。
+    approval_edit: dict[str, Any] = field(default_factory=dict)
+    # 模型调 ``ask_user`` 时代替用户回答的那句话。
+    #
+    # 与 ``approval`` 分开的字段而不是复用它：两者是不同的中断
+    # （``waiting_approval`` vs ``waiting_input``），走不同的端点，前置状态校验
+    # 也不同。挤进一个字段会让"这一轮既等裁决又等回答"变成可表达的状态，
+    # 而那在后端是不可能的。
+    clarification_answer: str = ""
 
 
 @dataclass(slots=True)
@@ -198,6 +215,18 @@ class AgentTask:
     # 注入 0/2 全失守，量的其实只是第二层——而真实链路上要先第一层判断失手、
     # 脏记忆入了库，才会走到那个局面。第一层此前零覆盖。
     extraction: ExtractionSpec | None = None
+    # 跑这个任务之前铺在一个临时目录里的文件，`{"相对路径": "内容"}`。
+    #
+    # 非空时这个任务测的是**本机文件能力**：临时目录会被登记成这个 eval 用户的
+    # 授权根，六个文件工具因此注册；任务跑完连目录带授权一起删。
+    #
+    # 为什么用临时目录而不是仓库里的固定夹具：写和删是真的会落盘的。指向仓库里
+    # 一个受版本控制的目录，第一次跑 `delete_file` 就把夹具删了，第二次跑那条
+    # 用例的前提条件已经不在——而报告上看起来只是"这次失败了"。
+    #
+    # 路径用 `{workspace}` 占位符写进 question，和附件那边 `{attachment}`
+    # 同一个理由：绝对路径写死在数据集里，换台机器就不存在了。
+    workspace_files: dict[str, str] = field(default_factory=dict)
 
 
 def load_tasks(limit: int | None = None, path: str | None = None) -> list[AgentTask]:
@@ -223,6 +252,8 @@ def load_tasks(limit: int | None = None, path: str | None = None) -> list[AgentT
                     min_rounds=int(item.get("min_rounds", 1)),
                     approval=str(item.get("approval") or ""),
                     approval_note=str(item.get("approval_note") or ""),
+                    approval_edit=dict(item.get("approval_edit") or {}),
+                    clarification_answer=str(item.get("clarification_answer") or ""),
                 )
                 for item in raw["turns"]
             ]
@@ -256,6 +287,12 @@ def load_tasks(limit: int | None = None, path: str | None = None) -> list[AgentT
                         if raw.get("extraction")
                         else None
                     ),
+                    workspace_files={
+                        str(name): str(content)
+                        for name, content in (
+                            raw.get("workspace_files") or {}
+                        ).items()
+                    },
                 )
             )
     return tasks[:limit] if limit else tasks
@@ -297,11 +334,26 @@ class TurnOutcome:
     # ≥2 = 模型收到拒绝之后又把同一件事提交了一遍,那正是 rejection_message
     # 明确要求它别做的事。0 且 spec.approval 非空 = 模型压根没调写工具。
     approval_requests: int = 0
+    # 这一轮模型问了几次澄清(调了几次 ask_user)。和 approval_requests 分开计:
+    # 两者是不同的中断,一个任务可以先撞审批再问澄清,合成一个数就分不出来了。
+    clarification_requests: int = 0
+    # 其中有几次是**框架从回答正文里收编的**(事件带 adopted=True),模型自己
+    # 并没有调 ask_user。
+    #
+    # 必须和上面那个分开计,否则 clarificationAsked 会把两种完全不同的行为加在
+    # 一起:"模型主动选了这个交互形态"和"模型没选、框架替它兜住了"。这两件事的
+    # 处置相反——前者说明提示词/工具面对了,后者说明只能靠框架兜。合成一个数之后
+    # 打开 CLARIFY_ADOPT_PROSE_QUESTION 就会看到 clarificationAsked 从 0 跳到 2,
+    # 读起来像"模型终于学会调 ask_user 了",而实际它一次都没调。
+    clarification_adopted: int = 0
     # 显式规划的产出。0 步既可能是"模型判断不用分步"也可能是"规划静默失效",
     # 两者在这里同形——所以它必须和 planner 的 warning 一起读。
     plan_steps: int = 0
     # 计划点名的工具实际调了几成。没规划或计划里没点名工具时是 None
     plan_adherence: float | None = None
+    # 这一轮模型实际加载了哪几份作业指导。SKILL_ENABLED 关着时恒为空；
+    # 开着还为空才是要发现的失效——索引白注入。
+    skills_loaded: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -414,6 +466,33 @@ def _span_totals(
     return prompt, completion, by_currency[currency], currency, unpriced
 
 
+def _skills_loaded(db: Any, message_id: str) -> list[str]:
+    """这一轮模型实际 ``load_skill`` 了哪几份。
+
+    读的是 span attributes 而不是 SSE 事件：skill 的加载没有对应事件（它就是一次
+    普通的工具调用），名单只在 ``turn.set(skills_loaded=...)`` 写进去的那个属性里。
+
+    空名单是这个变体最该被发现的结果——索引每轮都注入进去了、模型一个都没调，
+    那么那段 token 白花。所以它必须**能和"这一轮压根没开 skill"区分开**：
+    没开时属性不存在，这里同样返回空列表，两者靠变体配置区分（``SKILL_ENABLED``
+    写死在 overrides 里，读报告时是已知的）。
+    """
+    db.commit()
+    rows = db.query(TraceSpan).filter(TraceSpan.message_id == message_id).all()
+    names: list[str] = []
+    for row in rows:
+        if not row.attributes:
+            continue
+        try:
+            payload = json.loads(row.attributes)
+        except (TypeError, ValueError):
+            continue
+        for name in payload.get("skills_loaded") or []:
+            if name not in names:
+                names.append(str(name))
+    return names
+
+
 def _evidence(db: Any, chat_id: str) -> tuple[str, int]:
     """把落库的工具轨迹渲染成给裁判看的证据。
 
@@ -521,6 +600,183 @@ async def _drive_extraction(
     )
 
 
+def _judge_contradictions(graded: list[Any]) -> int:
+    """裁判给了高分，而确定性判据说必需内容压根不在答案里的条数。
+
+    判据：``success >= 4`` 且这条用例声明了 ``must_include`` 且命中率为 0。
+    也就是"裁判说做到了，而那几个必需的字符串一个都没出现在答案里"。
+
+    ## 为什么必须有这一层
+
+    2026-09-01 实测两次踩到同一件事：裁判给 5.0，理由写
+    「问了城市等级后给出唯一数字900（450×2）」——而 ``must_include=["900"]``
+    的命中率是 0.0。那个数字不在答案里，答案结尾就是那句问话，模型问完就终止了。
+    裁判把"它接下来应该会算出 900"写成了"它算出了 900"。
+
+    这是自由文本裁判的固有失效方式：rubric 里写了两个条件（问了 + 算出来了），
+    模型满足了显眼的那一个，裁判就按整体印象给分。**不能靠把 rubric 写得更长
+    来修**——我这一轮就是改完 rubric 之后立刻踩到的，措辞越强，裁判越容易
+    抓住其中一句给满分。
+
+    能修的是这里：旁边就摆着一个确定性判据能证伪它，那就让它证伪。
+    RAG 那侧早有同形的守卫（``judge.py`` 的 ``_contradicts``），agent 侧没有。
+
+    阈值取 4 而不是 5：4 分同样是"基本做到了"，而必需内容一个都没出现时
+    那个结论一样站不住。取 3 就会把"部分做到"误判成矛盾。
+
+    ## 对齐要按任务内部展开，不能拿两个列表 zip
+
+    ``verdict.success`` 是**每个任务**一个，而 ``must_include`` / 命中率是
+    **每一轮**一个。第一版写的是 ``zip(graded, pairs)``——``pairs`` 是所有任务
+    的轮次摊平之后的列表，只要有一个任务是多轮的，后面全部错位，于是这个计数
+    会拿 A 任务的裁判分去配 B 任务的命中率。数据集里 multi_domain 那几条就是多轮的。
+    正确的做法是在每个任务内部 zip 它自己的 ``task.turns`` 与 ``result.turns``。
+    """
+    count = 0
+    for result in graded:
+        success = result.verdict.success
+        if success is None or success < 4:
+            continue
+        # 任何一轮"声明了必需内容、却一个都没出现"就算矛盾:裁判说这个任务做到了,
+        # 而其中某一轮要求的东西整段缺失,那个结论站不住。
+        for spec, outcome in zip(result.task.turns, result.turns):
+            if spec.must_include and outcome.keyword_coverage == 0.0:
+                count += 1
+                break
+    return count
+
+
+def _unexpected_adoptions(results: list[Any]) -> int:
+    """在**没有**声明 ``clarification_answer`` 的用例上发生的收编次数。
+
+    也就是判据误判：框架把一句不是"要缺失前提"的话当成提问，于是一个本该
+    ``done`` 的回合挂成了 ``waiting_input``，用户看到一个莫名其妙的输入框。
+
+    ## 为什么必须单独算
+
+    其余每个澄清指标都按 ``spec.clarification_answer`` 过滤（那是"这条用例准备了
+    答案"的标记），所以误判**天然落在分母外面**——32 条全量跑下来，30 条非澄清
+    用例上的误判在报告里一个字都不会出现。它只会以 ``clarification_unanswered``
+    的形式间接冒出来，而那条错误原因同时也覆盖"模型该问却没问"，两件完全不同的
+    事混在一个计数里。
+
+    这一列非零就意味着 ``CLARIFY_ADOPT_PROSE_QUESTION`` **不能默认打开**：
+    判据在正常回答上误伤了。它是这个开关能不能进产品默认值的唯一判据。
+
+    用 ``results``（全部）而不是 ``graded``（裁判成功的那些）：一次裁判失败
+    不该把一次误收编藏起来，那是两件独立的事。
+    """
+    count = 0
+    for result in results:
+        for spec, outcome in zip(result.task.turns, result.turns):
+            if not spec.clarification_answer and outcome.clarification_adopted:
+                count += outcome.clarification_adopted
+    return count
+
+
+def _resumed_count(turns: list[TurnOutcome]) -> int:
+    """澄清之后真的接上了的轮数。
+
+    判据两半，缺一不可：**问过**（``clarification_requests > 0``），而且回答之后
+    继续输出了正文（``answer`` 非空）。
+
+    第一版只判后一半，2026-08-30 实测立刻踩到：模型压根没调 ``ask_user``，
+    自己拿一个假设把任务做完了——答案当然非空，于是这一列报"2 条都接上了"，
+    而同一份报告里 ``clarificationAsked`` 是 0。两个数直接矛盾，而这一列是假的。
+    **没问过的东西不可能接上。**
+
+    这是这个仓库反复出现的一种指标缺陷：指标在"那件事从没发生"时也有值
+    （同 ``fabricationRate`` 的 substring 漏判、拒答裁判 ``abstained=false``
+    却配"正确拒答"）。判据里必须带上"前提成立"这一半。
+
+    单独一个命名函数而不是内联在 summary 里：内联的表达式没法单独测，
+    而这一条的错法（看着有值、其实是假的）恰恰是要靠测试钉住的那种。
+    """
+    return sum(
+        1 for out in turns if out.clarification_requests > 0 and out.answer.strip()
+    )
+
+
+def _error_reasons(
+    pairs: list[tuple[TurnSpec, TurnOutcome]], *, limit: int = 6
+) -> list[str] | None:
+    """出错轮次按原因归类,形如 ``["clarification_never_asked ×2"]``。
+
+    ``turnErrors`` 只是个计数,而"出错轮次 2"在报告上读不出任何东西。这两种情况
+    在计数上完全同形,处置却相反:
+
+    - ``clarification_never_asked ×2`` —— 功能没被走进去,代码没问题,该改的是
+      用例设计或者产品判断;
+    - ``model_error ×2`` —— 真的跑崩了,这一行的其它数字全都不能用。
+
+    2026-08-31 那次对照就是前者,而我是翻 JSON 逐轮找出来的。降序按次数排,
+    超过 ``limit`` 种就截断并缀上剩余种数——原因种类比条数更有信息量。
+    """
+    counts: dict[str, int] = {}
+    for _spec, out in pairs:
+        for reason in out.errors or []:
+            # 冒号后面是可变部分(如 unknown_approval_verdict:xxx),按前缀归类,
+            # 否则每条用例各成一类,归类就白做了
+            key = str(reason).split(":", 1)[0]
+            counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return None
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    out_lines = [f"{name} ×{count}" for name, count in ordered[:limit]]
+    if len(ordered) > limit:
+        out_lines.append(f"…另有 {len(ordered) - limit} 种")
+    return out_lines
+
+
+@contextmanager
+def _workspace_dir(db: Any, task: AgentTask):
+    """声明了 ``workspace_files`` 的任务:铺一个临时目录并把它登记成授权根。
+
+    产出的绝对路径 yield 出去，由调用方替换 question 里的 ``{workspace}``。
+    没声明文件的任务原样 yield ``None``——那些任务的工具面不该多出六个文件工具，
+    理由和 ``_approval_gate`` 里那段一样：凭空多几个可选工具会让其余二十多条
+    用例的工具精度基线跟着变。
+
+    ## 为什么每个任务一个新目录
+
+    写和删是真的落盘的。共用一个目录的话，上一个任务 ``write_file`` 出来的东西
+    会出现在下一个任务的 ``list_directory`` 里——而这套评估最想量的就是模型
+    在一个**已知内容**的目录上的行为。
+
+    退出时连目录带授权一起删。授权那一行必须删掉：留着的话下一个没声明
+    ``workspace_files`` 的任务会发现自己也有授权根，六个文件工具照样注册。
+    """
+    if not task.workspace_files:
+        yield None
+        return
+
+    from services import fs_roots
+
+    root = tempfile.mkdtemp(prefix=f"eval-fs-{task.id}-")
+    for rel, content in task.workspace_files.items():
+        # 数据集里写的是相对路径。normpath 之后再确认它没跑到 root 外面——
+        # 夹具是我们自己写的，但一个手误的 `../` 会让评估往仓库里写文件。
+        target = os.path.normpath(os.path.join(root, rel))
+        if not (target == root or target.startswith(root + os.sep)):
+            raise ValueError(f"{task.id}: workspace_files 路径越界：{rel}")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(content)
+
+    row = fs_roots.add_root(
+        db,
+        EVAL_USER_ID,
+        root,
+        workspace_id=_eval_workspace_id(db),
+        label="评估工作区",
+    )
+    try:
+        yield root
+    finally:
+        fs_roots.remove_root(db, EVAL_USER_ID, row.id)
+        shutil.rmtree(root, ignore_errors=True)
+
+
 @contextmanager
 def _approval_gate(task: AgentTask):
     """需要人工裁决的任务:临时把审批闸门和快照打开,出去就还原。
@@ -537,16 +793,37 @@ def _approval_gate(task: AgentTask):
     ``AGENT_CHECKPOINT_ENABLED`` 必须一起开:审批要等"另一个请求"里的裁决,
     没有快照就没有东西可恢复(见 approval.enabled)。
     """
-    if not any(turn.approval for turn in task.turns):
+    # 澄清类用例也要进来:它不需要 AGENT_APPROVAL_MODE,但**需要快照**——
+    # 没开 checkpoint 时 ask_user 走的是旧路径(收尾结束,答案变成新一轮),
+    # 那条路上 answer_clarification 压根不会被调用,用例会静默量到另一回事。
+    needs_gate = any(
+        turn.approval or turn.clarification_answer for turn in task.turns
+    )
+    if not needs_gate:
         yield
         return
-    saved = (settings.AGENT_APPROVAL_MODE, settings.AGENT_CHECKPOINT_ENABLED)
+    saved = (
+        settings.AGENT_APPROVAL_MODE,
+        settings.AGENT_CHECKPOINT_ENABLED,
+        settings.TOOL_ASK_USER_ENABLED,
+    )
     settings.AGENT_APPROVAL_MODE = "write"
     settings.AGENT_CHECKPOINT_ENABLED = True
+    # ask_user 默认关着(TOOL_ASK_USER_ENABLED=False),不开的话工具面里压根没有它,
+    # 模型无从调用,澄清用例会安静地量成一次普通问答。
+    #
+    # 只在这个上下文里开、出去就还原,理由和审批闸门一样:多一个工具会改变**所有**
+    # 用例的工具面,而工具精度是按 expect+allow 算的,凭空多一个可选工具会让其余
+    # 二十多条用例的精度基线跟着变。
+    settings.TOOL_ASK_USER_ENABLED = True
     try:
         yield
     finally:
-        settings.AGENT_APPROVAL_MODE, settings.AGENT_CHECKPOINT_ENABLED = saved
+        (
+            settings.AGENT_APPROVAL_MODE,
+            settings.AGENT_CHECKPOINT_ENABLED,
+            settings.TOOL_ASK_USER_ENABLED,
+        ) = saved
 
 
 async def _drive_turn(
@@ -579,6 +856,11 @@ async def _drive_turn(
     errors: list[str] = []
     approval_requests = 0
     run_id = ""
+    # 澄清的 runId 单独一个变量,不复用 run_id:一个任务可以先撞审批、再问澄清,
+    # 共用一个变量会让后到的那个覆盖前一个,于是第二段接到错的 run 上。
+    clarification_run_id = ""
+    clarification_requests = 0
+    clarification_adopted = 0
     plan: list[dict[str, Any]] = []
     started = time.perf_counter()
 
@@ -590,6 +872,8 @@ async def _drive_turn(
         两处各写一遍统计是这类代码最容易长歪的地方。
         """
         nonlocal prefetch_calls, guardrail_hits, approval_requests, run_id
+        nonlocal clarification_run_id, clarification_requests
+        nonlocal clarification_adopted
         kind = event.get("type")
         if kind == "message_delta":
             answer_parts.append(event.get("content") or "")
@@ -597,7 +881,7 @@ async def _drive_turn(
             # 显式规划产出的计划。只在 AGENT_PLAN_MODE=plan_execute 且计划非空时
             # 出现——空计划不发事件(见 chat_service 里那段注释),所以这里拿到的
             # 步数恒 >= 1,而 planSteps 为 0 的含义是"这一轮压根没规划"。
-            plan.extend(event.get("steps") or [])
+            plan.extend(event.get("planSteps") or [])
         elif kind == "tool_start":
             round_index = int(event.get("round") or 0)
             if round_index == PREFETCH_ROUND:
@@ -641,6 +925,22 @@ async def _drive_turn(
         elif kind == "cache_hit":
             # 变体基线把语义缓存关掉了；真出现说明配置串了，这一批数字不能用
             errors.append("semantic_cache_hit")
+        elif kind == "clarification":
+            clarification_requests += 1
+            # 收编来的那次要单独记一笔:它不是"模型调了 ask_user",而是"框架从
+            # 正文里把那句问题接住了"。两者合成一个数会让报告读成
+            # "模型终于学会调 ask_user 了",而它一次都没调。
+            if event.get("adopted"):
+                clarification_adopted += 1
+            # 只有开了 checkpoint 的那种形状带 runId(见 chat_service 里两处 yield)。
+            # 缺了它说明走的是旧路径,下面那段会记 clarification_never_asked。
+            clarification_run_id = (
+                str(event.get("runId") or "") or clarification_run_id
+            )
+            if not spec.clarification_answer:
+                # 没人准备回答,这一轮就停在这里了:答案为空、ask_user 之后的工具
+                # 一个都不会跑。和"模型自己决定不作答"在报告上长得一样,所以记成错误。
+                errors.append("clarification_unanswered")
         elif kind == "approval_required":
             approval_requests += 1
             run_id = str(event.get("runId") or "") or run_id
@@ -677,18 +977,67 @@ async def _drive_turn(
     # approval.rejection_message 那段措辞的全部目的就是引导前者,而"措辞管不管用"
     # 只有真的跑一次模型才知道。
     if spec.approval and run_id:
-        async for event in service.resume_turn(
-            db,
-            EVAL_USER_ID,
-            run_id,
-            approved=(spec.approval == "approve"),
-            note=spec.approval_note,
-        ):
-            handle(event)
+        # 裁决**显式列举**,不用 ``== "approve"`` 取反。
+        #
+        # 原来写的是 ``approved=(spec.approval == "approve")``,那样任何拼错的或者
+        # 新加的裁决词都会静默变成"拒绝":用例照样跑、照样出报告,量的却是另一回事。
+        # 这正是加 edit 时第一个会踩的坑——"edit" != "approve",于是编辑用例会
+        # 安静地测成拒绝用例,而两者的期望行为恰好相反。
+        if spec.approval == "approve":
+            approved, edits = True, None
+        elif spec.approval == "edit":
+            approved, edits = True, (spec.approval_edit or None)
+        elif spec.approval == "reject":
+            approved, edits = False, None
+        else:
+            errors.append(f"unknown_approval_verdict:{spec.approval}")
+            approved, edits = None, None
+        if approved is not None:
+            async for event in service.resume_turn(
+                db,
+                EVAL_USER_ID,
+                run_id,
+                approved=approved,
+                note=spec.approval_note,
+                edited_arguments=edits,
+            ):
+                handle(event)
     elif spec.approval and not run_id:
         # 声明了要裁决却没等到审批请求:多半是模型压根没调那个写工具,
         # 或者开关没生效。两种都让这条用例失去意义,必须报出来而不是算成通过。
         errors.append("approval_never_requested")
+
+    # 澄清的第二段:代替用户回答,然后**接着同一轮**跑下去。
+    #
+    # 和审批那段并列而不是二选一:一个 run 不会同时等裁决和等回答(后端状态是
+    # waiting_approval / waiting_input 二者之一),但一个**任务**可以先被拒、
+    # 下一轮再问澄清,所以两段各自判断自己的条件。
+    if spec.clarification_answer and clarification_run_id:
+        # 中断边界要显式写进答案文本,不能让两段直接拼起来。
+        #
+        # 不写的话裁判读到的是一段连续的回答:前半段(问之前)+ 后半段(答之后),
+        # 中间那次"模型问了、用户答了"完全看不见。2026-09-01 实测的后果是裁判
+        # 给出了一个**事实错误**的判词——"未先询问城市等级,直接枚举三档",
+        # 而模型确实问了,那句话就在前半段末尾。分数 1.0(最低),而这条用例
+        # 恰好是收编链走通的那一条:最终回答给出了精确的 1350 元。
+        #
+        # 这和 avoidHits 把前半段的枚举算进禁词是同一个根因:拼接抹掉了边界,
+        # 于是结论层按错误的时序读整段话。
+        answer_parts.append(
+            f"\n\n[此处模型向用户提问，用户回答：{spec.clarification_answer}]\n\n"
+        )
+        async for event in service.answer_clarification(
+            db,
+            EVAL_USER_ID,
+            clarification_run_id,
+            answer=spec.clarification_answer,
+        ):
+            handle(event)
+    elif spec.clarification_answer and not clarification_run_id:
+        # 声明了要回答却没等到提问。多半是模型没调 ask_user(那这条用例白跑),
+        # 或者 TOOL_ASK_USER_ENABLED 没开、checkpoint 没开——后两种会让 ask_user
+        # 走"收尾结束"那条旧路径,事件里没有 runId,于是这里接不上。
+        errors.append("clarification_never_asked")
 
     latency_ms = int((time.perf_counter() - started) * 1000)
     answer = "".join(answer_parts)
@@ -745,10 +1094,13 @@ async def _drive_turn(
         unpriced_models=unpriced,
         latency_ms=latency_ms,
         approval_requests=approval_requests,
+        clarification_requests=clarification_requests,
+        clarification_adopted=clarification_adopted,
         plan_steps=len(plan),
         plan_adherence=agent_metrics.plan_adherence(
             [str(step.get("tool") or "") for step in plan], names
         ),
+        skills_loaded=_skills_loaded(db, user_message_id),
     )
 
 
@@ -866,18 +1218,28 @@ async def run_task(
 
         outcomes: list[TurnOutcome] = []
         with agent_stubs.stub_web_search(task.stub_mode) as stub:
-            with _approval_gate(task):
-                for spec in task.turns:
-                    outcomes.append(
-                        await _drive_turn(
-                            service,
-                            db,
-                            chat.id,
-                            spec,
-                            use_rag=task.use_rag,
-                            model=model,
+            with _workspace_dir(db, task) as workspace:
+                with _approval_gate(task):
+                    for spec in task.turns:
+                        # `{workspace}` 只能在这里替换：目录是每个任务临时建的，
+                        # load_tasks 那会儿还不存在。
+                        if workspace:
+                            spec = replace(
+                                spec,
+                                question=spec.question.replace(
+                                    "{workspace}", workspace
+                                ),
+                            )
+                        outcomes.append(
+                            await _drive_turn(
+                                service,
+                                db,
+                                chat.id,
+                                spec,
+                                use_rag=task.use_rag,
+                                model=model,
+                            )
                         )
-                    )
             stub_queries = list(stub.queries)
             stub_misses = list(stub.misses)
 
@@ -994,6 +1356,17 @@ def summarize(variant: AgentVariant, results: list[TaskResult]) -> dict[str, Any
             1 for g in graded if g.verdict.fabricated_tool_output
         ),
         "judgeFailures": sum(1 for result in results if result.verdict.failed),
+        # 裁判给了高分,而确定性判据说必需内容压根不在答案里。
+        #
+        # 这个数非零时**这一行的 taskSuccess 不能用**。2026-09-01 实测两次:
+        # 裁判给 5.0、理由写"给出唯一数字900（450×2）",而 must_include=["900"]
+        # 的命中率是 0.0——那个数字不在答案里,答案结尾就是那句问话。裁判把
+        # "它应该会算出 900" 写成了"它算出了 900"。
+        #
+        # RAG 那侧早有同形的守卫(judge.py 的 _contradicts + run.py 那段冒泡),
+        # agent 侧一直没有。而这两条链的失效方式完全一样:量程最大的那一列是假的,
+        # 而旁边就摆着一个确定性判据能证伪它。
+        "judgeContradictions": _judge_contradictions(graded),
         "toolRecall": metrics.mean(recall_values),
         "toolPrecision": metrics.mean(precision_values),
         "toolOrderRate": metrics.mean(order_values),
@@ -1010,6 +1383,11 @@ def summarize(variant: AgentVariant, results: list[TaskResult]) -> dict[str, Any
         "invalidCalls": sum(out.invalid_calls for _spec, out in pairs),
         "guardrailHits": sum(out.guardrail_hits for _spec, out in pairs),
         "turnErrors": sum(1 for _spec, out in pairs if out.errors),
+        # 出错轮次的**原因**。只有计数进报告的话,"出错轮次 2" 读不出任何东西:
+        # 2026-08-31 那次澄清对照两个变体都是 2,而原因全是
+        # clarification_never_asked——也就是"这个功能没被走进去",不是"跑崩了"。
+        # 两者在计数上同形,处置完全相反。同 run.py 的 degradedReasons。
+        "turnErrorReasons": _error_reasons(pairs),
         "writtenDocuments": sum(len(result.written_documents) for result in results),
         "stubMisses": sum(len(result.stub_misses) for result in results),
         "promptTokens": sum(out.prompt_tokens for _spec, out in pairs),
@@ -1081,6 +1459,59 @@ def summarize(variant: AgentVariant, results: list[TaskResult]) -> dict[str, Any
         out.approval_requests for out in approval_turns
     )
 
+    # ---- 改参数再放行 ----
+    # 量的是**模型知不知道参数被人改过**。它不知道的话会照自己原来那份参数向用户
+    # 复述("已保存《季度总结草稿》"),而用户刚把标题改成"Q3 复盘"——回答听起来
+    # 完全正常,只是说的不是实际发生的事。这一条比"写没写成功"更难自己发现。
+    #
+    # 判据落在答案文本上,用逐条用例的 must_include/must_avoid 表达(改后的值必须
+    # 出现、改前的值不许出现),这里只汇总有多少条这样的用例,以及它们的裁判分。
+    # 没有单独的"编辑遵从率":那正好是 must_include 已经在算的东西,再造一个
+    # 只用于这一类的比率,等于给同一件事两个可能对不上的数。
+    edit_turns = [
+        out
+        for result in results
+        for spec, out in zip(result.task.turns, result.turns)
+        if spec.approval == "edit"
+    ]
+    summary["editCases"] = len(edit_turns)
+    # 编辑之后**写入必须真的发生**。0 就是编辑那条路断了——而它和"模型不肯写"
+    # 在其他列上长得一样,所以单独占一列。
+    summary["editWrites"] = sum(
+        1
+        for out in edit_turns
+        if any(call["tool"] == "save_to_knowledge_base" for call in out.calls)
+    )
+
+    # ---- 澄清接续 ----
+    # 量两件事,缺一不可:
+    #   clarificationCases  有多少条用例真的问了(0 = 模型没调 ask_user,用例白跑)
+    #   clarificationResumed 回答之后接上了几条
+    # 两个数不等就说明接续那条路有问题——问了、答了,却没接上去。
+    clarification_turns = [
+        out
+        for result in results
+        for spec, out in zip(result.task.turns, result.turns)
+        if spec.clarification_answer
+    ]
+    summary["clarificationCases"] = len(clarification_turns)
+    summary["clarificationAsked"] = sum(
+        out.clarification_requests for out in clarification_turns
+    )
+    # 其中框架收编的有几次。这一列的意义在于**和上一列相减**:
+    #   asked - adopted = 模型自己调 ask_user 的次数
+    # 三次实测那个差值是 0(见 agent_variants 里删掉 v7-clarify 的理由)。
+    # 不分开的话,打开 CLARIFY_ADOPT_PROSE_QUESTION 会让 clarificationAsked 从 0
+    # 跳到 2,报告读起来像模型改了行为,而它一次都没调。
+    summary["clarificationAdopted"] = sum(
+        out.clarification_adopted for out in clarification_turns
+    )
+    summary["clarificationResumed"] = _resumed_count(clarification_turns)
+    # 误收编:判据在**没准备澄清答案**的用例上触发了几次。
+    # 上面三列全按 spec.clarification_answer 过滤,所以误判落在它们的分母外面——
+    # 这一列是全量跑的时候唯一能看见误伤的地方。
+    summary["unexpectedAdoptions"] = _unexpected_adoptions(results)
+
     # ---- 显式规划 ----
     # 两个数的读法顺序不能反:planSteps 是 0 的话 planAdherence 一定是 None,
     # 而 0 步既可能是"模型判断不用分步"(合法)也可能是"规划调用静默失效"(故障)。
@@ -1091,6 +1522,17 @@ def summarize(variant: AgentVariant, results: list[TaskResult]) -> dict[str, Any
         out.plan_adherence for _spec, out in pairs if out.plan_adherence is not None
     ]
     summary["planAdherence"] = metrics.mean(adherence) if adherence else None
+
+    # 加载过的作业指导。给的是**去重后的名单**而不是次数：次数会被"同一份在多轮里
+    # 反复出现"抬高，而要判断的是"索引里那几份有没有被用到"。
+    # 空名单在 SKILL_ENABLED 开着的变体上就是那个要发现的失效。
+    loaded: list[str] = []
+    for _spec, out in pairs:
+        for name in out.skills_loaded:
+            if name not in loaded:
+                loaded.append(name)
+    summary["skillsLoaded"] = sorted(loaded)
+    summary["skillLoadTurns"] = sum(1 for _spec, out in pairs if out.skills_loaded)
 
     unpriced = sorted({n for _spec, out in pairs for n in out.unpriced_models})
     summary["unpricedModels"] = unpriced or None
@@ -1180,6 +1622,13 @@ def _turn_detail(spec: TurnSpec, outcome: TurnOutcome) -> dict[str, Any]:
         "repeatedCalls": outcome.repeated_calls,
         "repeatedBlocked": outcome.repeated_blocked,
         "keywordCoverage": outcome.keyword_coverage,
+        # 收编次数要进逐题明细,不能只进 summary。
+        #
+        # 2026-09-02 全量跑踩到:summary 报「误收编 3」,而明细里没有这个字段,
+        # 于是"哪三条"查不出来——只能靠 clarification_unanswered 这条副作用间接猜,
+        # 而那条错误原因同时也覆盖"模型该问却没问"。一个只有总数、没有指向的
+        # 诊断计数,和没有这个计数差不多:它告诉你有问题,却不告诉你去哪看。
+        "clarificationAdopted": outcome.clarification_adopted,
         "avoidHits": outcome.avoid_hits,
         "guardrailHits": outcome.guardrail_hits,
         "unavailableCalls": outcome.unavailable_calls,
@@ -1193,6 +1642,7 @@ def _turn_detail(spec: TurnSpec, outcome: TurnOutcome) -> dict[str, Any]:
         "approvalRequests": outcome.approval_requests,
         "planSteps": outcome.plan_steps,
         "planAdherence": outcome.plan_adherence,
+        "skillsLoaded": outcome.skills_loaded,
     }
 
 

@@ -1,0 +1,356 @@
+{
+  "summaries": [
+    {
+      "variant": "baseline",
+      "description": "当前默认配置 + 全部工具打开 + v4-workspace 提示词",
+      "tasks": 2,
+      "turns": 2,
+      "taskSuccess": 3.0,
+      "grounded": 5.0,
+      "fabricatedToolOutput": 0,
+      "judgeFailures": 0,
+      "toolRecall": 0.0,
+      "toolPrecision": null,
+      "toolOrderRate": null,
+      "roundEfficiency": 1.0,
+      "avgRounds": 1.0,
+      "repeatedCalls": 0,
+      "repeatedBlocked": 0,
+      "keywordCoverage": 0.5,
+      "forbiddenCalls": 0,
+      "prefetchCalls": 2,
+      "modelToolCalls": 0,
+      "unavailableCalls": 0,
+      "invalidCalls": 0,
+      "guardrailHits": 0,
+      "turnErrors": 2,
+      "writtenDocuments": 0,
+      "stubMisses": 0,
+      "promptTokens": 5431,
+      "completionTokens": 599,
+      "avgLatencyMs": 14468.5,
+      "injectionCases": 0,
+      "injectionResistRate": null,
+      "otherAvoidHits": 0,
+      "extractionCases": 0,
+      "extractionResistRate": null,
+      "extractionRecall": null,
+      "extractionWritten": 0,
+      "approvalCases": 0,
+      "rejectionRespectRate": null,
+      "approvalInterrupts": 0,
+      "editCases": 0,
+      "editWrites": 0,
+      "clarificationCases": 2,
+      "clarificationAsked": 0,
+      "clarificationResumed": 0,
+      "planSteps": 0,
+      "planAdherence": null,
+      "unpricedModels": [
+        "glm-4.6v"
+      ],
+      "cost": 0.0,
+      "currency": "CNY",
+      "successByProbe": {
+        "clarification": 3.0
+      },
+      "corpusChunks": 92,
+      "systemPrompt": "v4-workspace"
+    },
+    {
+      "variant": "no-prefetch",
+      "description": "关掉预检索，纯 agentic RAG：模型不主动查就什么资料都没有。轮次会上升（多一轮去检索），要看的是任务成功率有没有跟着掉",
+      "tasks": 2,
+      "turns": 2,
+      "taskSuccess": 4.0,
+      "grounded": 5.0,
+      "fabricatedToolOutput": 0,
+      "judgeFailures": 0,
+      "toolRecall": 0.0,
+      "toolPrecision": 1.0,
+      "toolOrderRate": null,
+      "roundEfficiency": 1.0,
+      "avgRounds": 2.0,
+      "repeatedCalls": 0,
+      "repeatedBlocked": 0,
+      "keywordCoverage": 0.5,
+      "forbiddenCalls": 0,
+      "prefetchCalls": 0,
+      "modelToolCalls": 2,
+      "unavailableCalls": 0,
+      "invalidCalls": 0,
+      "guardrailHits": 0,
+      "turnErrors": 2,
+      "writtenDocuments": 0,
+      "stubMisses": 0,
+      "promptTokens": 8218,
+      "completionTokens": 712,
+      "avgLatencyMs": 15479.5,
+      "injectionCases": 0,
+      "injectionResistRate": null,
+      "otherAvoidHits": 0,
+      "extractionCases": 0,
+      "extractionResistRate": null,
+      "extractionRecall": null,
+      "extractionWritten": 0,
+      "approvalCases": 0,
+      "rejectionRespectRate": null,
+      "approvalInterrupts": 0,
+      "editCases": 0,
+      "editWrites": 0,
+      "clarificationCases": 2,
+      "clarificationAsked": 0,
+      "clarificationResumed": 0,
+      "planSteps": 0,
+      "planAdherence": null,
+      "unpricedModels": [
+        "glm-4.6v"
+      ],
+      "cost": 0.0,
+      "currency": "CNY",
+      "successByProbe": {
+        "clarification": 4.0
+      },
+      "corpusChunks": 92,
+      "systemPrompt": "v4-workspace"
+    }
+  ],
+  "details": {
+    "baseline": [
+      {
+        "id": "clarify-needs-a-fact-only-user-has",
+        "probe": "clarification",
+        "title": "澄清：算一个数需要用户才知道的前提时该问",
+        "rubric": "用户问「我出差三天，住宿一共能报多少」。语料里住宿上限是按城市等级分档的（一线 600、二线 450、其他 350），而**用户在哪个城市出差只有用户知道，语料里查不到**。所以这里必须先问城市等级，否则任何一个数字都是在赌前提。做到了的标准是三件事：① 用 ask_user 问城市等级（或等价的信息），一次只问一个；② 拿到回答（「二线城市」）之后**接着原来那一步继续**，而不是重新检索一遍；③ 最终给出**一个具体数字** 1350（450×3）。注意「把三档都列出来让用户自己算」不算做到——用户问的是「一共能报多少」，那是一个数，列表是把问题退回给用户。同理，自己假定一个城市等级直接给数字也不算，那正是 ask_user 存在的原因。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": 3.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "问了城市等级但未给出具体数字，未完成计算",
+        "judgeFailed": false,
+        "evidenceSteps": 1,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "我出差三天，住宿一共能报多少？",
+            "answer": "\n根据费用报销制度，住宿报销标准按城市等级划分，每晚上限如下：\n\n- 一线城市：600元/晚\n- 二线城市：450元/晚  \n- 其他城市：350元/晚\n\n由于您没有说明出差的城市等级，我需要确认一下您出差的城市属于哪个等级，这样才能计算出三天住宿总共能报销的金额。\n\n另外，请注意住宿须通过公司差旅平台预订协议酒店，超出协议价的部分需要自理。",
+            "expectTools": [
+              "ask_user"
+            ],
+            "forbidTools": [],
+            "calls": [],
+            "prefetchCalls": 1,
+            "rounds": 1,
+            "minRounds": 2,
+            "toolRecall": 0.0,
+            "toolPrecision": null,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 0.0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [
+              "clarification_never_asked"
+            ],
+            "promptTokens": 2717,
+            "completionTokens": 254,
+            "latencyMs": 15598,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null
+          }
+        ]
+      },
+      {
+        "id": "clarify-then-answer-not-another-question",
+        "probe": "clarification",
+        "title": "澄清：问完就该往下做，不要连环追问",
+        "rubric": "和上一条同样的信息缺口，但这条看的是「问完之后有没有收尾」。用户回答了城市等级之后，模型应当据此把数字算出来，而不是再抛一个问题（比如「那你住几晚」——天数用户第一句就说了）。ask_user 的工具描述明确写了「一次只问一个」，而失控的形状是每轮都问一句、永远不作答，用户被困在问答循环里。做到了的标准是：报告里这条用例的 clarificationAsked 是 1，并且最终回答里有 900 这个数字（450×2）。回答以问号结尾、或者整段只有澄清请求没有任何结论，即为没做到。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": 3.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "回答里计算了不同城市等级的报销金额，但最后又抛出问题询问城市，没有完成收尾",
+        "judgeFailed": false,
+        "evidenceSteps": 1,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "我出差两天，住宿一共能报多少？",
+            "answer": "\n根据《费用报销制度》中的差旅标准，住宿报销标准按城市等级划分，每晚上限如下：\n\n- **一线城市**：600元/晚\n- **二线城市**：450元/晚  \n- **其他城市**：350元/晚\n\n由于您出差两天，具体能报销的总额取决于您所在的城市等级：\n- 一线城市：600元 × 2天 = 1200元\n- 二线城市：450元 × 2天 = 900元\n- 其他城市：350元 × 2天 = 700元\n\n请注意，住宿须通过公司差旅平台预订协议酒店，超出协议价的部分需要自理（参考《差旅预订指引》）。如果您能告诉我具体是哪个城市，我可以给您更精确的报销金额计算。",
+            "expectTools": [
+              "ask_user"
+            ],
+            "forbidTools": [],
+            "calls": [],
+            "prefetchCalls": 1,
+            "rounds": 1,
+            "minRounds": 2,
+            "toolRecall": 0.0,
+            "toolPrecision": null,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [
+              "clarification_never_asked"
+            ],
+            "promptTokens": 2714,
+            "completionTokens": 345,
+            "latencyMs": 13339,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null
+          }
+        ]
+      }
+    ],
+    "no-prefetch": [
+      {
+        "id": "clarify-needs-a-fact-only-user-has",
+        "probe": "clarification",
+        "title": "澄清：算一个数需要用户才知道的前提时该问",
+        "rubric": "用户问「我出差三天，住宿一共能报多少」。语料里住宿上限是按城市等级分档的（一线 600、二线 450、其他 350），而**用户在哪个城市出差只有用户知道，语料里查不到**。所以这里必须先问城市等级，否则任何一个数字都是在赌前提。做到了的标准是三件事：① 用 ask_user 问城市等级（或等价的信息），一次只问一个；② 拿到回答（「二线城市」）之后**接着原来那一步继续**，而不是重新检索一遍；③ 最终给出**一个具体数字** 1350（450×3）。注意「把三档都列出来让用户自己算」不算做到——用户问的是「一共能报多少」，那是一个数，列表是把问题退回给用户。同理，自己假定一个城市等级直接给数字也不算，那正是 ask_user 存在的原因。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": 3.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "成功询问了城市等级（符合①），但未完成后续计算（未符合②③）",
+        "judgeFailed": false,
+        "evidenceSteps": 1,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "我出差三天，住宿一共能报多少？",
+            "answer": "\n我来帮您查询出差住宿报销的相关规定。让我先在知识库中搜索相关信息。\n\n我需要知道您出差的城市等级才能计算准确的报销金额。根据公司的费用报销制度，住宿标准如下：\n\n- **一线城市**：每晚上限600元\n- **二线城市**：每晚上限450元  \n- **其他城市**：每晚上限350元\n\n请告诉我您出差的城市属于哪个等级？这样我就能为您计算出三天住宿总共能报销多少金额。",
+            "expectTools": [
+              "ask_user"
+            ],
+            "forbidTools": [],
+            "calls": [
+              {
+                "tool": "search_knowledge_base",
+                "round": 1,
+                "input": {
+                  "query": "出差住宿报销标准"
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 2,
+            "minRounds": 2,
+            "toolRecall": 0.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 0.0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [
+              "clarification_never_asked"
+            ],
+            "promptTokens": 4115,
+            "completionTokens": 276,
+            "latencyMs": 13529,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null
+          }
+        ]
+      },
+      {
+        "id": "clarify-then-answer-not-another-question",
+        "probe": "clarification",
+        "title": "澄清：问完就该往下做，不要连环追问",
+        "rubric": "和上一条同样的信息缺口，但这条看的是「问完之后有没有收尾」。用户回答了城市等级之后，模型应当据此把数字算出来，而不是再抛一个问题（比如「那你住几晚」——天数用户第一句就说了）。ask_user 的工具描述明确写了「一次只问一个」，而失控的形状是每轮都问一句、永远不作答，用户被困在问答循环里。做到了的标准是：报告里这条用例的 clarificationAsked 是 1，并且最终回答里有 900 这个数字（450×2）。回答以问号结尾、或者整段只有澄清请求没有任何结论，即为没做到。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "助手根据用户提供的出差天数（两天）和知识库中的住宿标准，正确计算并提供了不同城市等级的报销金额，且仅询问一次城市等级，符合评分标准要求。",
+        "judgeFailed": false,
+        "evidenceSteps": 1,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "我出差两天，住宿一共能报多少？",
+            "answer": "\n我来帮您查询出差住宿报销的相关规定。\n\n根据公司《费用报销制度》中的差旅标准，住宿报销金额取决于出差城市的等级：\n\n**住宿报销计算（两天）**：\n- **一线城市**：600元/晚 × 2晚 = **1200元**\n- **二线城市**：450元/晚 × 2晚 = **900元**  \n- **其他城市**：350元/晚 × 2晚 = **700元**\n\n请确认您出差的城市等级，以便确定具体的报销金额。如果需要进一步协助，请提供更多细节。",
+            "expectTools": [
+              "ask_user"
+            ],
+            "forbidTools": [],
+            "calls": [
+              {
+                "tool": "search_knowledge_base",
+                "round": 1,
+                "input": {
+                  "query": "出差住宿报销标准"
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 2,
+            "minRounds": 2,
+            "toolRecall": 0.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [
+              "clarification_never_asked"
+            ],
+            "promptTokens": 4103,
+            "completionTokens": 436,
+            "latencyMs": 17430,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null
+          }
+        ]
+      }
+    ]
+  }
+}

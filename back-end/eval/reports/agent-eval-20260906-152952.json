@@ -1,0 +1,216 @@
+{
+  "summaries": [
+    {
+      "variant": "fs-skills",
+      "description": "当前实际部署：六个文件工具 + skill 索引 + v8-skills 提示词。先看 skillsLoaded 非空——为零说明索引白注入，那时后面的数字都不用读；再看老用例有没有被多出来的八个工具稀释掉工具精度",
+      "tasks": 2,
+      "turns": 2,
+      "taskSuccess": 5.0,
+      "grounded": 5.0,
+      "fabricatedToolOutput": 0,
+      "judgeFailures": 0,
+      "judgeContradictions": 0,
+      "toolRecall": 1.0,
+      "toolPrecision": 1.0,
+      "toolOrderRate": null,
+      "roundEfficiency": 1.0,
+      "avgRounds": 2.5,
+      "repeatedCalls": 0,
+      "repeatedBlocked": 0,
+      "keywordCoverage": 1.0,
+      "forbiddenCalls": 0,
+      "prefetchCalls": 0,
+      "modelToolCalls": 3,
+      "unavailableCalls": 0,
+      "invalidCalls": 0,
+      "guardrailHits": 0,
+      "turnErrors": 0,
+      "turnErrorReasons": null,
+      "writtenDocuments": 0,
+      "stubMisses": 0,
+      "promptTokens": 8514,
+      "completionTokens": 899,
+      "avgLatencyMs": 7819.0,
+      "injectionCases": 0,
+      "injectionResistRate": null,
+      "otherAvoidHits": 0,
+      "extractionCases": 0,
+      "extractionResistRate": null,
+      "extractionRecall": null,
+      "extractionWritten": 0,
+      "approvalCases": 0,
+      "rejectionRespectRate": null,
+      "approvalInterrupts": 0,
+      "editCases": 0,
+      "editWrites": 0,
+      "clarificationCases": 0,
+      "clarificationAsked": 0,
+      "clarificationAdopted": 0,
+      "clarificationResumed": 0,
+      "unexpectedAdoptions": 0,
+      "planSteps": 0,
+      "planAdherence": null,
+      "skillsLoaded": [
+        "expense-review"
+      ],
+      "skillLoadTurns": 2,
+      "unpricedModels": [
+        "glm-4.6v"
+      ],
+      "cost": null,
+      "currency": null,
+      "successByProbe": {
+        "skill": 5.0
+      },
+      "corpusChunks": 92,
+      "systemPrompt": "v8-skills"
+    }
+  ],
+  "details": {
+    "fs-skills": [
+      {
+        "id": "skill-expense-order-norag",
+        "probe": "skill",
+        "title": "报销审核应当照作业指导的次序做",
+        "rubric": "必须体现 expense-review 作业指导的第 1 步:前提缺失时**追问**而不是替用户假设。这里缺的是城市等级(额度按城市分档)。直接按某个档次算出一个总额即为失败,哪怕算术本身对——指导明确要求不要替用户假设档次。",
+        "useRag": false,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "成功按指导要求追问了缺失的城市和日期前提，未替用户假设档次",
+        "judgeFailed": false,
+        "evidenceSteps": 1,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "帮我审一下这张报销单:住宿 4 晚一共 2000 元,有发票。能全额报吗?",
+            "answer": "\n我来帮您审核这张报销单。首先让我加载相关的审核指导。\n\n根据报销审核流程，我需要先确认几个关键信息才能帮您审核：\n\n1. **出差城市**：您出差的城市是哪个？不同城市等级有不同的住宿额度上限。\n2. **出差日期**：您出差的日期是什么时候？这决定了适用哪一版报销标准。\n\n请提供这两个信息，我就可以帮您核对住宿费用是否在额度范围内了。",
+            "expectTools": [
+              "load_skill"
+            ],
+            "forbidTools": [
+              "save_to_knowledge_base",
+              "web_search"
+            ],
+            "calls": [
+              {
+                "tool": "load_skill",
+                "round": 1,
+                "input": {
+                  "name": "expense-review"
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 2,
+            "minRounds": 2,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 3173,
+            "completionTokens": 350,
+            "latencyMs": 6266,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": [
+              "expense-review"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "skill-attachment-read-norag",
+        "probe": "skill",
+        "title": "只在附带文件里的规则",
+        "rubric": "必须给出「同一次出差累计不得超过 300 元」这条限制。这条规则只写在 expense-review 的附带文件《报销额度标准.md》里,知识库语料中没有——所以答不出它就说明附带文件没有被读到。",
+        "useRag": false,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "回答准确提供了「同一次出差累计不得超过 300 元」的限制，且该信息仅来自工具证据中的《报销额度标准.md》，完全符合评分标准要求。",
+        "judgeFailed": false,
+        "evidenceSteps": 2,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "报销时 100 元以下的支出可以不用发票吗?有什么额外限制?",
+            "answer": "\n我来帮您查询关于报销政策的具体规定。让我先加载相关的报销审核作业指导。\n\n我来帮您查询关于100元以下支出的报销政策。让我先查看报销额度标准文件。\n\n根据报销额度标准，100元以下的支出可以不用发票，但需要满足以下条件：\n\n**可以不用发票的情况：**\n- 单笔金额在100元以下\n- 可以用收款凭证替代发票\n\n**额外限制：**\n- 同一次出差累计不得超过300元\n\n也就是说，虽然单笔100元以下可以用收款凭证代替发票，但如果同一次出差中多次发生100元以下的支出，累计金额不能超过300元，超过部分仍需要发票。\n\n需要注意的是，这仅适用于餐饮、交通等日常费用，具体还要看费用类别和出差情况。如果您需要更详细的报销指导，请告诉我具体的费用类别和出差情况。",
+            "expectTools": [
+              "load_skill",
+              "read_skill_file"
+            ],
+            "forbidTools": [
+              "save_to_knowledge_base",
+              "web_search"
+            ],
+            "calls": [
+              {
+                "tool": "load_skill",
+                "round": 1,
+                "input": {
+                  "name": "expense-review"
+                }
+              },
+              {
+                "tool": "read_skill_file",
+                "round": 2,
+                "input": {
+                  "skill": "expense-review",
+                  "filename": "报销额度标准.md"
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 3,
+            "minRounds": 3,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 5341,
+            "completionTokens": 549,
+            "latencyMs": 9372,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": [
+              "expense-review"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

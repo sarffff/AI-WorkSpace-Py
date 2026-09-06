@@ -26,6 +26,16 @@
   和成本，不是成功率。
 - ``no-structured-retry`` 结构化输出重试的对照组。
 
+删掉过一个变体，理由记在这里，别再加回来：``prompt-v7-clarify``（v4 + 一段
+"缺前提就调 ``ask_user``、不要在正文里问"的策略）。2026-08-30/31 三次实测，
+``clarificationAsked`` 始终是 0，任务成功从 3.0 掉到 2.0，每轮多付 338 token。
+换了两个配置（``baseline`` / ``no-prefetch``）、改过一轮用例设计，结论一致：
+模型认出了缺前提、也把问题问了出来，但**问在正文里**。原因不是它不知道有这个
+工具，而是它手里有更便宜的策略——前提只有三个离散取值时直接枚举，用户不用多跑
+一轮。往提示词里加更强的措辞是同一条死路，已经走过两次。要让这条链真的被走进去
+得靠框架强制中断（``CLARIFY_ADOPT_PROSE_QUESTION``），而不是指望模型自愿选一个
+对它更贵的交互形态。
+
 注意子代理的工具调用也会计入 ``expect_tools`` / ``forbid_tools``（见
 ``agent_runner`` 里对 ``agent_step`` 的处理）：任务集问的是「这一轮该不该查
 知识库」，而不是「该由谁去查」。谁去查属于委派策略，由 delegate 的出现次数
@@ -52,6 +62,17 @@ _BASE: dict[str, Any] = {
     "TOOL_WEB_SEARCH_ENABLED": True,
     "TOOL_READ_ATTACHMENT_ENABLED": True,
     "TOOL_WRITE_KNOWLEDGE_ENABLED": True,
+    # ---- 本机文件与作业指导：必须显式写 off ----
+    # 这两条漏掉的后果和委派那条一模一样,而且更容易发生:当前 .env 两个都开着。
+    # 开着时每个变体都会静默多出**八个**工具(六个文件 + load_skill +
+    # read_skill_file),工具精度是按 expect+allow 算的,于是全部 37 条用例的精度
+    # 基线一起变——报告上看不出任何异常,只是数字跟 08-30 那批不再可比。
+    #
+    # 要量它们的效果跑 ``fs-skills`` 变体,两边相减。
+    "TOOL_FS_ENABLED": False,
+    "TOOL_FS_WRITE_ENABLED": False,
+    "TOOL_FS_DELETE_ENABLED": False,
+    "SKILL_ENABLED": False,
     # ---- 跨回合记忆 ----
     "TOOL_HISTORY_ENABLED": True,
     "TOOL_HISTORY_TOKEN_BUDGET": 600,
@@ -85,6 +106,19 @@ _BASE: dict[str, Any] = {
     # ``agent_runner._approval_gate`` 按任务临时开闸,只对声明了 ``approval``
     # 的那几条用例生效,退出即还原。按变体开会把其余 20 多条用例一起废掉。
     "AGENT_APPROVAL_MODE": "off",
+    # 正文提问的收编。必须显式写死:它直接改变回合的终止方式——本该 done 的一轮
+    # 变成 waiting_input,于是任务成功、轮次、token 全都变了。本地 .env 打开它的话
+    # 每个变体都会静默带上收编跑,而报告上看不出任何异常。
+    #
+    # baseline 必须是 False——它是对照组:同一批用例在"不收编"下的表现,才是
+    # 判断收编值不值的基准。要量它的效果就跑 ``adopt-prose-question`` 变体
+    # (那边全局打开),两边相减。
+    #
+    # 全局打开确实会让**每一条**用例的正文提问都进判据,而不只是澄清那两条。
+    # 这是刻意的:判据是启发式的,它在其余 30 条用例上误判几次,正是这个变体
+    # 要暴露的东西。误判的表现很显眼——本该 done 的用例挂成 waiting_input、
+    # 答案为空,「出错轮次的原因」那一节会记 clarification_unanswered。
+    "CLARIFY_ADOPT_PROSE_QUESTION": False,
     # ---- 检索 ----
     "RAG_PREFETCH": True,
     "RAG_HYBRID": True,
@@ -158,6 +192,21 @@ AGENT_VARIANTS: dict[str, AgentVariant] = {
         name="prompt-v3-lean",
         description="最短的那一版提示词，看压缩到极限之后先坏在哪个探针上",
         overrides={**_BASE, "PROMPT_CHAT_SYSTEM_VERSION": "v3-lean"},
+    ),
+    "adopt-prose-question": AgentVariant(
+        name="adopt-prose-question",
+        description=(
+            "把回答正文里那句问题收编成一次真的澄清中断（框架侧强制，不指望模型"
+            "自己调 ask_user）。这是 prompt-v7-clarify 失败之后换的路子："
+            "三次实测证明模型认出了缺前提、也把问题问了出来，但始终问在正文里。"
+            "该盯三个数，顺序不能反：① 「其中框架收编」非零——为零说明判据没认出来"
+            "（判据保守，宁可漏，见 services/prose_question.py）；"
+            "② 「澄清接续」跟上——收编了却接不上说明 role=user 那条回灌路径有问题；"
+            "③ 任务成功与轮次。收编必然多一轮往返，换来的是模型手里有**完整的**"
+            "工具结果（4000 字/条）而不是轨迹回灌那份 240 字摘要。"
+            "成功率不动而轮次上去，就说明这些用例本来不需要问"
+        ),
+        overrides={**_BASE, "CLARIFY_ADOPT_PROSE_QUESTION": True},
     ),
     "no-prefetch": AgentVariant(
         name="no-prefetch",
@@ -275,6 +324,39 @@ AGENT_VARIANTS: dict[str, AgentVariant] = {
             "非零——为零就说明规划压根没产出，那时后面的数字都不用读"
         ),
         overrides={**_BASE, "AGENT_PLAN_MODE": "plan_execute"},
+    ),
+    # 2026-09-06 加。这一条量的是**当前实际部署**：文件工具 + skill + v8 提示词。
+    #
+    # 三样一起开而不是拆成三个变体，是因为它们在产品里就是一起开的，而拆开跑要
+    # 三倍的钱换一个我们暂时不需要的归因——先确认这一整套有没有掉东西，掉了再拆。
+    #
+    # 要看的顺序：
+    #   1. `skillsLoaded` 非空。这是 AGENT_STATUS 里点名要盯的失效——索引每轮都
+    #      注入进去了、模型一个都没调，那么这套东西白花钱。为零时后面的数字
+    #      都不用读，和 plan-execute 看 planSteps 同一个道理。
+    #   2. 其余 37 条老用例**不该变差**。多出八个工具会稀释工具面，模型可能
+    #      在纯知识库问题上去翻本机文件——那会同时压低工具精度和轮次效率。
+    #   3. 文件类用例本身的成功率。
+    "fs-skills": AgentVariant(
+        name="fs-skills",
+        description=(
+            "当前实际部署：六个文件工具 + skill 索引 + v8-skills 提示词。"
+            "先看 skillsLoaded 非空——为零说明索引白注入，那时后面的数字都不用读；"
+            "再看老用例有没有被多出来的八个工具稀释掉工具精度"
+        ),
+        overrides={
+            **_BASE,
+            "TOOL_FS_ENABLED": True,
+            "TOOL_FS_WRITE_ENABLED": True,
+            # 删除仍然关着：确认令牌那道门要模型在**用户的原话**里找确认词，
+            # 而数据集里的提问是我们写的，开着它量到的是夹具的措辞，不是模型的判断。
+            "TOOL_FS_DELETE_ENABLED": False,
+            "SKILL_ENABLED": True,
+            "PROMPT_CHAT_SYSTEM_VERSION": "v8-skills",
+            # 文件任务比知识库任务更耗轮次（列目录 → 读 → 再读），6 轮会把
+            # 多步任务卡在中途，而那看起来像"模型没做完"。线上就是 10。
+            "AGENT_MAX_TOOL_ROUNDS": 10,
+        },
     ),
 }
 
