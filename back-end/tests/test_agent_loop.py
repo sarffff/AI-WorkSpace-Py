@@ -648,3 +648,70 @@ def test_disabled_tool_history_restores_the_amnesiac_behaviour(db_real, monkeypa
 
 
 
+
+
+# ========== 事前规划的事件契约 ==========
+
+
+# ``ScriptedAdapter`` 自己就收 purpose 了（2026-09-05 并进 conftest），
+# 规划那次调用不再需要一个本地子类来吞它。
+_PlannerAdapter = ScriptedAdapter
+
+
+def test_计划事件的键名是planSteps(db, monkeypatch):
+    """计划通过 SSE 发出去时键名必须是 ``planSteps``，不能是 ``steps``。
+
+    这不是命名洁癖：``steps`` 在 SSE 里已经被 ``agent_state`` 的子代理步骤**数**
+    占了（一个 number）。同一个键在同一个联合类型里一处是数字、一处是对象数组，
+    前端要么类型断言要么按事件类型分流——而写错的表现是计划步数显示成工具步数，
+    看起来像个完全正常的数字，没有任何报错。
+
+    这条测试存在的另一个理由是它是唯一一条**穿过 SSE** 的规划测试：
+    test_planner.py 全部直接调 build_plan，键名改掉它们一条都不会红。
+    """
+    monkeypatch.setattr(settings, "AGENT_PLAN_MODE", "plan_execute")
+    monkeypatch.setattr(settings, "TOOL_CALCULATE_ENABLED", True)
+    monkeypatch.setattr(settings, "RAG_PREFETCH", False)
+    adapter = _PlannerAdapter(
+        [
+            # 第一次调用是规划(structured，走 complete)
+            {"text": '[{"goal": "先算出总额", "tool": "calculate"}]'},
+            # 之后是正常的回答轮
+            {"text": "总额是 300 元。"},
+        ]
+    )
+    service = ChatService(model_adapter=adapter)
+    service._knowledge_service = FakeKnowledgeService()
+
+    events = run(
+        collect(
+            service.stream_ai_response(db, "u1", "c1", "两笔 100 和 200 一共多少", use_rag=False)
+        )
+    )
+
+    plans = [event for event in events if event["type"] == "plan"]
+    assert len(plans) == 1
+    assert plans[0]["planSteps"] == [{"goal": "先算出总额", "tool": "calculate"}]
+    # 旧键名不能同时还在:留着它等于让前端两种读法都能过,改动就白挡了
+    assert "steps" not in plans[0]
+
+
+def test_空计划不发事件(db, monkeypatch):
+    """模型判断"直接答就行"是正确输出，那时不该给前端推一张空卡片。
+
+    空计划与"规划挂了"在返回值上同形（都是空列表），两者都走这条路——区别由
+    planner 里那条 warning 承担，不由事件承担。
+    """
+    monkeypatch.setattr(settings, "AGENT_PLAN_MODE", "plan_execute")
+    monkeypatch.setattr(settings, "TOOL_CALCULATE_ENABLED", True)
+    monkeypatch.setattr(settings, "RAG_PREFETCH", False)
+    adapter = _PlannerAdapter([{"text": "[]"}, {"text": "你好"}])
+    service = ChatService(model_adapter=adapter)
+    service._knowledge_service = FakeKnowledgeService()
+
+    events = run(
+        collect(service.stream_ai_response(db, "u1", "c1", "你好", use_rag=False))
+    )
+
+    assert [event for event in events if event["type"] == "plan"] == []
+    assert events[-1]["content"] == "你好"

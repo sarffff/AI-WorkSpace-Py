@@ -245,3 +245,291 @@ def test_delegation_variants_switch_the_prompt_with_the_mode():
             assert variant.overrides["PROMPT_CHAT_SYSTEM_VERSION"] == want, (
                 f"{name} 用 {mode} 模式，提示词该是 {want}"
             )
+
+
+# ========== 澄清指标不能自相矛盾 ==========
+
+
+def _outcome(**kw):
+    """一份最小的 TurnOutcome，只填这几条测试要用的字段。"""
+    from eval.agent_runner import TurnOutcome
+
+    base = dict(
+        question="q",
+        answer="",
+        calls=[],
+        prefetch_calls=0,
+        rounds=1,
+        tool_recall=None,
+        tool_precision=None,
+        forbidden_hits=0,
+        round_efficiency=None,
+        order_ok=None,
+        keyword_coverage=None,
+        avoid_hits=0,
+        repeated_calls=0,
+        repeated_blocked=0,
+        guardrail_hits=0,
+        unavailable_calls=0,
+        invalid_calls=0,
+        errors=[],
+        prompt_tokens=0,
+        completion_tokens=0,
+        cost=None,
+        currency=None,
+        unpriced_models=set(),
+        latency_ms=0,
+    )
+    base.update(kw)
+    return TurnOutcome(**base)
+
+
+def test_never_asking_cannot_count_as_resumed():
+    """没问过澄清，就不可能"接上"——这一列必须是 0。
+
+    2026-08-30 实测踩到的：模型压根没调 ``ask_user``，自己拿一个假设把任务做完了。
+    第一版 ``clarificationResumed`` 只判"答案非空"，于是报了「2 条都接上了」，
+    而同一份报告里 ``clarificationAsked`` 是 0。两个数直接矛盾，而那一列是假的。
+
+    这是这个项目反复出现的一种指标缺陷：**指标在那件事从没发生时也有值**
+    （同 fabricationRate 的 substring 漏判、拒答裁判的 abstained 自相矛盾）。
+    判据必须带上"前提成立"这一半。
+    """
+    from eval import agent_runner
+
+    asked = _outcome(answer="接上之后的正文", clarification_requests=1)
+    never = _outcome(answer="没问就直接答完了", clarification_requests=0)
+
+    assert agent_runner._resumed_count([asked, never]) == 1, (
+        "没问过的那条不能算接上"
+    )
+    assert agent_runner._resumed_count([never]) == 0
+    # 问了但答案是空的也不算：那是接续真的失败了
+    assert agent_runner._resumed_count([_outcome(clarification_requests=1)]) == 0
+
+
+class _FakeVerdict:
+    def __init__(self, success):
+        self.success = success
+        self.grounded = None
+        self.failed = False
+        self.fabricated_tool_output = False
+
+
+class _FakeTask:
+    def __init__(self, turns):
+        self.turns = turns
+        self.probe = "clarification"
+
+
+class _FakeResult:
+    def __init__(self, success, turn_specs, turn_outcomes):
+        self.verdict = _FakeVerdict(success)
+        self.task = _FakeTask(turn_specs)
+        self.turns = turn_outcomes
+
+
+def test_裁判高分配上必需内容缺失算矛盾():
+    """裁判说做到了，而 must_include 一个都没命中——那个分数被确定性判据证伪。
+
+    2026-09-01 实测原话：裁判给 5.0、理由写「问了城市等级后给出唯一数字900
+    （450×2）」，而答案结尾就是那句问话，900 压根不在里面。裁判把"它接下来
+    应该会算出 900"写成了"它算出了 900"。
+    """
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    spec = TurnSpec(question="q", must_include=["900"])
+    contradicting = _FakeResult(5.0, [spec], [_outcome(keyword_coverage=0.0)])
+    assert agent_runner._judge_contradictions([contradicting]) == 1
+
+
+def test_命中了就不算矛盾():
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    spec = TurnSpec(question="q", must_include=["900"])
+    ok = _FakeResult(5.0, [spec], [_outcome(keyword_coverage=1.0)])
+    assert agent_runner._judge_contradictions([ok]) == 0
+
+
+def test_低分不算矛盾():
+    """裁判自己就给了低分，那和确定性判据是一致的，不是矛盾。"""
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    spec = TurnSpec(question="q", must_include=["900"])
+    low = _FakeResult(1.0, [spec], [_outcome(keyword_coverage=0.0)])
+    assert agent_runner._judge_contradictions([low]) == 0
+
+
+def test_没声明必需内容的用例不进这个判据():
+    """抽取类用例判据是确定性的、不叫裁判，没有 must_include 可比。"""
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    spec = TurnSpec(question="q")
+    none = _FakeResult(5.0, [spec], [_outcome(keyword_coverage=None)])
+    assert agent_runner._judge_contradictions([none]) == 0
+
+
+def test_多轮任务不能按摊平下标对齐():
+    """``verdict.success`` 是每任务一个，``must_include`` 是每轮一个。
+
+    第一版写的是 ``zip(graded, pairs)``，而 ``pairs`` 是所有任务的轮次摊平之后的
+    列表——只要有一个任务是多轮的，后面全部错位，于是拿 A 任务的裁判分去配 B 任务
+    的命中率。数据集里 multi_domain 那几条就是多轮的。
+
+    这里用"第一个任务两轮、第二个任务一轮"钉住：摊平对齐的实现会把第二个任务的
+    裁判分配到第一个任务的第二轮上，从而给出不同的答案。
+    """
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    two_turn = _FakeResult(
+        5.0,
+        [TurnSpec(question="a"), TurnSpec(question="b", must_include=["900"])],
+        [_outcome(keyword_coverage=None), _outcome(keyword_coverage=0.0)],
+    )
+    one_turn = _FakeResult(
+        1.0, [TurnSpec(question="c", must_include=["1350"])], [_outcome(keyword_coverage=0.0)]
+    )
+
+    # 第一个任务:高分 + 第二轮必需内容缺失 → 矛盾。第二个:低分 → 不算。
+    assert agent_runner._judge_contradictions([two_turn, one_turn]) == 1
+
+
+def test_一个任务里多轮缺失只记一次():
+    """判的是"这个任务的裁判分不可用",不是"缺了几处"。"""
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    result = _FakeResult(
+        4.0,
+        [TurnSpec(question="a", must_include=["1"]), TurnSpec(question="b", must_include=["2"])],
+        [_outcome(keyword_coverage=0.0), _outcome(keyword_coverage=0.0)],
+    )
+    assert agent_runner._judge_contradictions([result]) == 1
+
+
+def test_非澄清用例上的收编算误判():
+    """判据误伤：正常回答被当成提问，本该 done 的回合挂成了 waiting_input。
+
+    其余三个澄清指标全按 ``spec.clarification_answer`` 过滤（"这条用例准备了
+    答案"），所以误判**天然落在它们的分母外面**——32 条全量跑下来，30 条非澄清
+    用例上的误伤在报告里一个字都看不到，只会以 clarification_unanswered 的形式
+    间接冒出来，而那条错误原因同时也覆盖"模型该问却没问"。
+
+    这一列是 CLARIFY_ADOPT_PROSE_QUESTION 能不能默认打开的唯一判据。
+    """
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    misfire = _FakeResult(
+        5.0, [TurnSpec(question="q")], [_outcome(clarification_adopted=1)]
+    )
+    assert agent_runner._unexpected_adoptions([misfire]) == 1
+
+
+def test_澄清用例上的收编不算误判():
+    """那是这个功能该做的事，不是误伤。"""
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    intended = _FakeResult(
+        5.0,
+        [TurnSpec(question="q", clarification_answer="二线城市")],
+        [_outcome(clarification_adopted=1)],
+    )
+    assert agent_runner._unexpected_adoptions([intended]) == 0
+
+
+def test_裁判失败不该把误收编藏起来():
+    """用 results 而不是 graded：两件事独立。
+
+    一条用例可以既裁判失败、又误收编。按 graded 过滤的话那次误伤就消失了，
+    而"开关能不能默认打开"这个结论恰恰取决于它。
+    """
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    failed = _FakeResult(
+        None, [TurnSpec(question="q")], [_outcome(clarification_adopted=1)]
+    )
+    failed.verdict.failed = True
+    assert agent_runner._unexpected_adoptions([failed]) == 1
+
+
+def test_收编次数不能混进模型主动提问():
+    """``clarificationAsked`` 与 ``clarificationAdopted`` 必须分开。
+
+    合成一个数之后，打开 CLARIFY_ADOPT_PROSE_QUESTION 会让 clarificationAsked
+    从 0 跳到 2，报告读起来像"模型终于学会调 ask_user 了"——而它一次都没调，
+    那 2 次是框架从回答正文里接住的。两者的处置相反：前者说明提示词/工具面对了，
+    后者说明只能靠框架兜。
+    """
+    from eval.agent_runner import TurnOutcome
+
+    adopted = _outcome(clarification_requests=1, clarification_adopted=1)
+    self_asked = _outcome(clarification_requests=1, clarification_adopted=0)
+
+    assert isinstance(adopted, TurnOutcome)
+    # 模型自己调的次数 = asked - adopted
+    assert adopted.clarification_requests - adopted.clarification_adopted == 0
+    assert self_asked.clarification_requests - self_asked.clarification_adopted == 1
+
+
+def test_收编来的也算接上了():
+    """接续判据看的是"问过 + 答案非空",收编来的那次同样满足前一半。
+
+    收编的目的就是让那一轮能接着跑,所以它必须能进 clarificationResumed——
+    否则报告会显示"收编了 2 次、接上 0 条",看起来像回灌那条路断了。
+    """
+    from eval import agent_runner
+
+    adopted = _outcome(
+        answer="接上之后的正文", clarification_requests=1, clarification_adopted=1
+    )
+    assert agent_runner._resumed_count([adopted]) == 1
+
+
+def test_出错原因按次数归类():
+    """``turnErrors`` 只是计数,"出错轮次 2" 读不出该做什么。
+
+    2026-08-31 实测两个变体都是 2,原因全是 clarification_never_asked——功能没被
+    走进去,不是跑崩了。这两种情况在计数上同形而处置相反。
+    """
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    spec = TurnSpec(question="q")
+    pairs = [
+        (spec, _outcome(errors=["clarification_never_asked"])),
+        (spec, _outcome(errors=["clarification_never_asked"])),
+        (spec, _outcome(errors=["model_error"])),
+    ]
+    reasons = agent_runner._error_reasons(pairs)
+    assert reasons == ["clarification_never_asked ×2", "model_error ×1"], (
+        "按次数降序,次数必须带上——只列种类看不出规模"
+    )
+
+
+def test_没出错时返回None而不是空列表():
+    """空列表和 None 在渲染层是两回事：None 才让整段消失。"""
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    assert agent_runner._error_reasons([(TurnSpec(question="q"), _outcome())]) is None
+
+
+def test_冒号后的可变部分归到同一类():
+    """``unknown_approval_verdict:xxx`` 每条用例的后缀都不同,不归类就每条各成一类。"""
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    spec = TurnSpec(question="q")
+    pairs = [
+        (spec, _outcome(errors=["unknown_approval_verdict:maybe"])),
+        (spec, _outcome(errors=["unknown_approval_verdict:later"])),
+    ]
+    assert agent_runner._error_reasons(pairs) == ["unknown_approval_verdict ×2"]

@@ -24,9 +24,12 @@ from routers import (
     feedback_router,
     memory_router,
     workspace_router,
+    fs_router,
+    skill_router,
 )
 from services import approval
 from services import prompt_library
+from services import skill_library
 from services import ingest_clean
 from services import retriever
 from services import subagent
@@ -81,6 +84,8 @@ app.include_router(metrics_router.router)
 app.include_router(feedback_router.router)
 app.include_router(memory_router.router)
 app.include_router(workspace_router.router)
+app.include_router(fs_router.router)
+app.include_router(skill_router.router)
 
 # 静态文件服务：附件上传后的访问入口
 os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
@@ -261,6 +266,10 @@ async def startup():
     # 提示词模板有问题（占位符对不上、条件段没闭合、默认版本已归档）就在这里
     # 起不来，而不是等第一个用户提问时才在 500 里暴露。
     prompt_library.validate()
+    # skill 同理：缺 frontmatter、目录名和 name 不一致、正文空——宁可在这里起不来，
+    # 也不要等第一个用户提问才发现某份 SOP 静默地从索引里消失了（不报错，
+    # 只是永远不被选中）。
+    skill_library.validate()
     _check_ingest_backend()
     _adopt_orphaned_documents()
     # 工具是按开关注册的，而"开关开了但没配 key 的 web_search 根本不注册"这类

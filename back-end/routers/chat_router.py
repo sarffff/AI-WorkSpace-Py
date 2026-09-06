@@ -19,6 +19,7 @@ from services.memory_service import memory_service
 from services import approval
 from services import checkpoint_store
 from services import approval_audit
+from services import fs_tools
 from services import prompt_library
 from services import usage_guard
 from services.settings_service import is_model_allowed, load_preferences
@@ -548,10 +549,20 @@ async def pending_runs(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """当前用户所有等待审批的执行。
+    """当前用户所有**在等人**的执行：等裁决的，以及等回答的。
 
-    刷新页面之后靠它把审批卡片找回来。这是可恢复执行与"挂一个长连接等用户点"
+    刷新页面之后靠它把卡片找回来。这是可恢复执行与"挂一个长连接等用户点"
     最直观的区别:中断活在数据库里,不活在那条已经断掉的 SSE 连接里。
+
+    三种中断走同一个列表接口,靠 ``kind`` 分派:它们要问的是同一个问题
+    ("这个用户现在有没有什么事停着等他"),而前端拿到之后只是渲染不同的卡片。
+    分成两个接口的话,前端要发两个请求再合并排序。
+
+    ``kind`` 的三个取值：``tool_approval`` 等裁决，``user_input`` 等回答（模型调了
+    ``ask_user``），``prose_question`` 也等回答（模型在正文里问了，框架收编的，
+    见 ``chat_service._maybe_adopt_prose_question``）。后两者的**恢复端点相同**
+    （``/answer``），差别只在卡片文案：收编来的那句问题在上面的回答里已经出现过
+    一次了。
     """
     # 顺带把超时的清掉。放在读路径上而不是起一个后台调度器:项目里没有 worker
     # 进程,而这个列表本来就要查这批数据。副作用是"一直没人打开审批列表"时清理
@@ -573,8 +584,38 @@ async def pending_runs(
                 "updatedAt": run.updated_at.isoformat() if run.updated_at else None,
                 "tool": request.tool if request else None,
                 "reason": request.reason if request else "",
+                # 哪一种中断。前端据此决定渲染审批卡片还是澄清卡片,并决定
+                # 该调 /resume(带裁决)还是 /answer(带一句话)——两个端点的载荷
+                # 没有交集,分派错了会拿到 409。
+                #
+                # 缺省成 tool_approval 而不是 None:这个列表在加入 waiting_input
+                # 之前只可能是审批,老快照的 interrupt_request 里没有 kind 字段
+                # (InterruptRequest 后来才加的),缺省到审批就等于保持原行为。
+                "kind": (request.kind if request else None) or "tool_approval",
+                # diff 在这一条路上也要给：刷新页面之后卡片是从这里重新拉回来的，
+                # 少了它的话"刷新一下"会让 diff 消失，而用户会以为那是两种不同的
+                # 审批请求。diff 是**此刻**重算的而不是快照里存的——文件可能在
+                # 等待审批期间被人改过，那时该显示的是针对当前内容的改动。
                 "preview": (
-                    approval.build_preview(request.arguments) if request else {}
+                    approval.build_preview(
+                        request.arguments,
+                        fs_tools.preview_extra(
+                            db, current_user.id, request.tool, request.arguments
+                        ),
+                    )
+                    if request
+                    else {}
+                ),
+                # user_input / prose_question 时问题在 arguments["question"] 里。
+                # 单独抬一个字段出来,免得前端去 preview 里按键名捞——preview 是给人
+                # 看的展示层,它的键会随 build_preview 的截断规则变。
+                #
+                # 两种 kind 都要覆盖:漏掉 prose_question 的话刷新之后卡片没有标题,
+                # 用户看到一个空的输入框却不知道在问什么。
+                "question": (
+                    str(request.arguments.get("question") or "")
+                    if request and request.kind in ("user_input", "prose_question")
+                    else ""
                 ),
             }
         )
@@ -605,12 +646,18 @@ def _continuation_sse(
        （"我来把这份整理好保存进知识库"）。不接的话数据库里的回答比用户看到的少一句。
     3. **assistant id 是 uuid5(user_message_id) 算出来的。** 与被打断那次请求
        一致，所以一问一答不会留下两条 assistant 消息。
+    4. **断线要标 ``interrupted``。** 和 ``/completions/stream`` 同一个理由，见
+       下面 ``finally`` 那段。恢复流一样会断，而它断在第 3 轮和新回合断在第 3 轮
+       是同一件事。
     """
 
     async def event_generator():
         full_response = ""
         failed = False
         interrupted = False
+        # 走到了任何一条收尾路径。区分"正常结束"与"客户端断线导致生成器被回收"
+        # ——同 stream_completions,理由见那边 finally 里的注释。
+        settled = False
         try:
             async for event in stream:
                 payload = {**event, "chat_id": chat_id}
@@ -628,6 +675,9 @@ def _continuation_sse(
                     break
 
             if interrupted:
+                # 又停了一次(第二个写操作要审批,或者模型拿到答案后又问一句)。
+                # 状态已经是 waiting_* 了,不是断线。
+                settled = True
                 return
             answer = prefix + full_response
             if not failed and answer.strip() and assistant_message_id:
@@ -656,14 +706,24 @@ def _continuation_sse(
                         ensure_ascii=False,
                     )
                 }
+            settled = True
         except Exception:
             logger.exception("%s failed for run %s", what, run_id)
+            settled = True
             yield {
                 "data": json.dumps(
                     {"type": "error", "error": f"{what}失败，请稍后重试。"},
                     ensure_ascii=False,
                 )
             }
+        finally:
+            # 恢复流断线时和新回合断线时要走同一条路。少了这一段,一次"恢复到
+            # 一半又断了"的执行会停在 ``running`` 直到孤儿回收(约 780 秒)——
+            # 而静默重连等不了那么久,于是用户点了同意、看着它转、然后什么都没有,
+            # 十三分钟内也接不回来。断线修复当初只落在 /completions/stream 上,
+            # 三个恢复端点全都漏了。
+            if not settled:
+                checkpoint_store.mark_interrupted(run_id)
 
     return EventSourceResponse(event_generator())
 

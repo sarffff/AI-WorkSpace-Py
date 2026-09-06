@@ -73,16 +73,25 @@ class InterruptRequest:
 
     # ``tool_approval``：等一次裁决（同意/改了再同意/拒绝）。
     # ``user_input``：等一句回答（模型调了 ask_user）。
+    # ``prose_question``：等一句回答，但模型**没有调工具**——它把问题写在回答
+    #   正文里了，框架把那句话收编成了一次中断（见 services/prose_question.py，
+    #   开关 CLARIFY_ADOPT_PROSE_QUESTION）。
     #
-    # 用同一个 dataclass 承载两种中断，是因为它们要的机制完全一样：落快照、
-    # 跨 HTTP 请求、恢复时重建工具面并拨回余额。分成两个类会让 checkpoint_store
-    # 和 resume 路径各写两遍。差别只在恢复时回灌什么，那是 resume 的事。
-    kind: Literal["tool_approval", "user_input"]
+    # 用同一个 dataclass 承载三种中断，是因为它们要的机制完全一样：落快照、
+    # 跨 HTTP 请求、恢复时重建工具面并拨回余额。分成三个类会让 checkpoint_store
+    # 和 resume 路径各写三遍。差别只在恢复时回灌什么，那是 resume 的事。
+    #
+    # ``prose_question`` 必须和 ``user_input`` 分开，不能复用后者：它没有
+    # ``tool_call_id``（压根没有那次工具调用），所以答案不能以 ``role=tool``
+    # 回灌——那会造出一条挂在不存在的 tool_call 上的消息，多数供应商直接报 400。
+    # 它的答案走 ``role=user``，见 chat_service.answer_clarification。
+    kind: Literal["tool_approval", "user_input", "prose_question"]
     tool: str
     # 完整参数，审批界面据此展示"到底要写什么/删什么"；
-    # ``user_input`` 时这里是 {"question": "..."}
+    # ``user_input`` / ``prose_question`` 时这里是 {"question": "..."}
     arguments: dict[str, Any]
-    # 这次调用在本轮 pending_calls 里的下标。恢复时要从这里接着跑
+    # 这次调用在本轮 pending_calls 里的下标。恢复时要从这里接着跑。
+    # ``prose_question`` 没有待跑的调用，这里是 0（pending_calls 也是空的）。
     call_index: int
     tool_call_id: str | None = None
     reason: str = ""
@@ -179,6 +188,10 @@ class TurnState:
     breaker_consecutive: dict[str, int] = field(default_factory=dict)
     breaker_tripped: list[str] = field(default_factory=list)
     delegations_used: int = 0
+    # 本回合已加载的 skill 名。跟着快照走，所以审批中断之后接着跑时
+    # "已经加载过"这件事不会丢——丢了的话模型第二次调 load_skill 会拿回一份
+    # 完整正文，而它已经在上文里，等于白付一次几千字的预算。
+    loaded_skills: list[str] = field(default_factory=list)
 
     # ---- 中断 ----
     interrupt: dict[str, Any] | None = None
@@ -200,6 +213,14 @@ class TurnState:
     # ask_user 的回答，call_key -> 用户原话（已过 mask_markup）。
     # 和 edited_arguments 同一个思路：主循环每轮重跑，答案不能只活在闭包里。
     clarification_answers: dict[str, str] = field(default_factory=dict)
+    # 这一回合是否已经收编过一次"正文里的问题"（见 chat_service
+    # ._maybe_adopt_prose_question）。
+    #
+    # 必须存进快照，不能是循环里的局部变量：收编发生在一次请求里，而下一次收编
+    # 的判断发生在**恢复之后那个请求**里。少了它，模型每轮在正文里问一句就会被
+    # 收编一次，用户被困在问答循环里出不来——这正是 ask_user 的工具描述里
+    # "一次只问一个"要防的形状，只是这次由框架自己造成。
+    prose_question_adopted: bool = False
     # 用户拒绝时留下的话。会随拒绝结果回灌给模型——那通常正好是它需要的
     # 修改方向（"别写进知识库，先给我看看"）
     interrupt_note: str = ""

@@ -175,6 +175,123 @@ def test_agent_report_omits_the_section_when_fully_priced():
     assert "计价缺口" not in markdown
 
 
+def _agent_summary(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "variant": "baseline",
+        "tasks": 32,
+        "turns": 66,
+        "unpricedModels": None,
+        "successByProbe": {},
+    }
+    base.update(overrides)
+    return base
+
+
+def test_零提问但有用例时那一行必须渲染出来():
+    """本轮要修的那个洞。
+
+    2026-08-31 实测 ``clarificationAsked`` 是 0 而用例有 2 条,也就是"模型没走
+    这条路"。这个数当时只存在于 JSON 里:报告的 Markdown 里一个字都没有,我是从
+    JSON 手抄出来的。分子为 0 恰恰是最该被看见的情况——一个"分子为 0 就不渲染"
+    的实现会把唯一有信息量的那种结果藏起来。
+    """
+    markdown = run_agent.render_markdown(
+        {
+            "summaries": [
+                _agent_summary(clarificationCases=2, clarificationAsked=0,
+                               clarificationResumed=0)
+            ]
+        }
+    )
+    assert "## 人在环路的中断链" in markdown
+    assert "0 / 2 用例" in markdown
+    assert "澄清提问" in markdown
+
+
+def test_没有这类用例时整行不渲染():
+    """``0 / 0`` 会被读成"功能坏了",而真相是这批任务里没有这类用例。
+
+    判据只能落在**表格行**上,不能用 ``"澄清提问" not in markdown``:那四个字
+    在下方「读法」里是常驻正文,于是那种写法永远失败。同一种子串碰撞在这个仓库
+    里已经绊过三次(``省略`` / ``语料分块数``),所以这里直接对行首取。
+    """
+    markdown = run_agent.render_markdown(
+        {"summaries": [_agent_summary(clarificationCases=0, clarificationAsked=0)]}
+    )
+    assert not [
+        line for line in markdown.splitlines() if line.startswith("| 澄清提问")
+    ]
+    assert "## 人在环路的中断链" not in markdown
+
+
+def test_编辑与审批链同样进报告():
+    markdown = run_agent.render_markdown(
+        {
+            "summaries": [
+                _agent_summary(
+                    approvalCases=2,
+                    approvalInterrupts=2,
+                    editCases=1,
+                    editWrites=1,
+                )
+            ]
+        }
+    )
+    assert "改参放行" in markdown
+    assert "1 / 1 用例" in markdown
+    assert "审批" in markdown
+    assert "2 / 2 用例" in markdown
+
+
+def test_多变体各占一列():
+    markdown = run_agent.render_markdown(
+        {
+            "summaries": [
+                _agent_summary(variant="baseline", clarificationCases=2,
+                               clarificationAsked=0),
+                _agent_summary(variant="no-prefetch", clarificationCases=2,
+                               clarificationAsked=2),
+            ]
+        }
+    )
+    row = next(
+        line for line in markdown.splitlines() if line.startswith("| 澄清提问")
+    )
+    assert "0 / 2 用例" in row
+    assert "2 / 2 用例" in row
+
+
+def test_出错轮次的原因进报告():
+    """「出错轮次 2」读不出是跑崩了还是功能没被走进去,而两者处置相反。"""
+    markdown = run_agent.render_markdown(
+        {
+            "summaries": [
+                _agent_summary(
+                    turnErrors=2,
+                    turnErrorReasons=["clarification_never_asked ×2"],
+                )
+            ]
+        }
+    )
+    assert "## 出错轮次的原因" in markdown
+    assert "clarification_never_asked ×2" in markdown
+
+
+def test_没出错时不渲染原因段():
+    markdown = run_agent.render_markdown(
+        {"summaries": [_agent_summary(turnErrors=0, turnErrorReasons=None)]}
+    )
+    assert "## 出错轮次的原因" not in markdown
+
+
+def test_读法里讲清了零的三种含义():
+    """三条链的 0 含义不同,合并成一句"功能坏了"就是把结论读错。"""
+    markdown = run_agent.render_markdown(
+        {"summaries": [_agent_summary(clarificationCases=2, clarificationAsked=0)]}
+    )
+    assert "在回答正文里问了同一个问题" in markdown
+
+
 # ========== 读法 ==========
 
 

@@ -14,7 +14,7 @@ from typing import Any, AsyncGenerator
 
 import pytest
 
-from config import settings
+from config import Settings, settings
 from services.model_adapter import (
     ModelAdapter,
     ModelCompletion,
@@ -32,27 +32,28 @@ from services.model_adapter import (
 #
 # 需要测另一个取值的测试自己 monkeypatch——那样意图写在测试里，而不是隐含在
 # 谁的 .env 里。
+# ``TOOL_* / AGENT_* / CLARIFY_*`` 整族**不在这个字典里逐个列**，由
+# ``_FEATURE_FLAG_PREFIXES`` 统一钉成 config.py 的代码默认值。
+#
+# 为什么改成整族：这个坑在这个文件里已经记过两次（最初的 AGENT_APPROVAL_MODE，
+# 2026-08-24 又补 TOOL_CALCULATE / TOOL_WEB_SEARCH），2026-09-05 打开
+# read_attachment / delete_knowledge / ask_user / fetch_web_page 之后它第三次
+# 出现，红的又是同一批与改动无关的测试。逐个补的做法保证了"下次开一个新开关，
+# 再红一次"——而开关只会越来越多。
+#
+# 钉成**代码默认值**而不是"测试想要的值"：这一条踩过。先按"写知识库的测试需要它"
+# 把 TOOL_WRITE_KNOWLEDGE 钉成 True，结果那条断言"没开开关就不注册"的测试挂了——
+# 把开关钉开等于把它要测的前提抹掉。真正需要工具面的测试自己 monkeypatch
+# （见 test_service_security._enable_save_tool）。
 _PINNED_FLAGS = {
-    # 审批门会让工具调用在 tool_start 之前中断，断言"工具执行了什么"的测试全部受影响
-    "AGENT_APPROVAL_MODE": "off",
-    # 检查点会额外落库，且 resume 路径有自己的测试
-    "AGENT_CHECKPOINT_ENABLED": False,
-    # 全部钉成 config.py 里的代码默认值，而不是"测试想要的值"。
+    # 这两个是**字符串**型的开关，按类型钉 bool 的那条规则覆盖不到它们。
     #
-    # 这一条踩过：先按"写知识库的测试需要它"钉成 True，结果
-    # test_new_tools_not_registered_by_default 挂了——那条断言的恰恰是"没开开关
-    # 就不注册"，把开关钉开等于把它要测的前提抹掉。真正需要工具面的测试自己
-    # monkeypatch（见 test_service_security._enable_save_tool），它们缺的只是
-    # 上面那个审批开关。
-    "TOOL_WRITE_KNOWLEDGE_ENABLED": False,
-    # 2026-08-24 补这两个：本地 .env 把它们打开之后，三条与工具面无关的测试开始红
-    # （test_plain_chat_runs_one_round_without_tools 断言 tools == []、
-    # test_unknown_tool_is_invalid_arguments_and_loop_continues、
-    # test_new_tools_not_registered_by_default 断言注册表为空）。
-    # 症状与上面 AGENT_APPROVAL_MODE 那条一模一样，也就是这个 fixture 的文档开头
-    # 描述的那个坑本身——只是当时漏钉了这两个开关。同样钉成 config.py 的代码默认值。
-    "TOOL_CALCULATE_ENABLED": False,
-    "TOOL_WEB_SEARCH_ENABLED": False,
+    # ``AGENT_APPROVAL_MODE=write`` 会让工具调用停在审批门前，断言"工具执行了什么"
+    # 的测试全部受影响，而报错是 `assert 0 == 1`，完全没提审批。
+    # ``AGENT_PLAN_MODE=plan_execute`` 会在每个回合前多插一次辅助模型调用，
+    # 把 ScriptedAdapter 的剧本错位一格——那时"第一轮"拿到的是规划那次的脚本。
+    "AGENT_APPROVAL_MODE": "off",
+    "AGENT_PLAN_MODE": "off",
     # 2026-08-28 补：模型名也得钉。``chat_service`` 到处是
     # ``model or settings.LLM_MODEL``，所以任何不显式传模型的测试，实际参与
     # 判断的都是本地 .env 里的模型名。视觉那两条测试就是这么红的：白名单写
@@ -79,15 +80,47 @@ _PINNED_FLAGS = {
     "USAGE_GUARD_ENABLED": False,
 }
 
+# 整族钉住的前缀。这些是"打开一个能力"的开关，而能力一旦打开就会改变工具面、
+# 中断行为或轮次结构——也就是最容易让无关测试变红的那一类配置。
+#
+# 取值来自 ``Settings.model_fields[name].default``，即**类定义里写的默认值**，
+# 完全不经过 .env。不用新建一个 ``Settings()`` 实例来取：pydantic-settings 的
+# 构造过程本身就会去读 .env，那样取回来的还是开发机上的值。
+# 按**类型**而不是按名字前缀：``bool`` 型配置就是功能开关，这是一条不依赖命名的
+# 判据。
+#
+# 前缀那版（``TOOL_ / AGENT_ / CLARIFY_``）在 2026-09-05 加 skill 时第四次踩到同一个
+# 坑——``SKILL_ENABLED`` 是个新前缀，于是它读的还是本地 .env，三条与 skill 毫无关系
+# 的测试变红（断言"不开 RAG 时不下发工具"之类）。前缀清单保证了"下次再加一族新开关，
+# 再红一次"，而开关只会越来越多。
+#
+# 取值来自 ``Settings.model_fields[name].default``，即**类定义里写的默认值**，
+# 完全不经过 .env。不用新建一个 ``Settings()`` 实例来取：pydantic-settings 的构造
+# 过程本身就会去读 .env，那样取回来的还是开发机上的值。
+def _code_default_flags() -> dict[str, object]:
+    return {
+        name: field.default
+        for name, field in Settings.model_fields.items()
+        if isinstance(field.default, bool)
+    }
+
 
 @pytest.fixture(autouse=True)
 def _pin_feature_flags(monkeypatch):
     """把功能开关钉到测试假定的值，隔离本地 .env。
 
     autouse：漏掉一个测试就会重新引入"结果取决于谁的 .env"这件事。
-    只钉 ``_PINNED_FLAGS`` 里列出的键，其余配置照旧从环境读。
+
+    两层，后者覆盖前者：
+
+    1. **所有 bool 型配置** → config.py 的代码默认值。按类型判定，所以新加的开关
+       自动被覆盖，不必记得来这里登记一次。
+    2. ``_PINNED_FLAGS`` → 需要偏离代码默认值的那几个（模型名、提示词版本、
+       用量闸门、以及 ``AGENT_APPROVAL_MODE`` 这类非 bool 的开关）。
+
+    需要测另一个取值的测试自己 monkeypatch，那样意图写在测试里。
     """
-    for name, value in _PINNED_FLAGS.items():
+    for name, value in {**_code_default_flags(), **_PINNED_FLAGS}.items():
         if hasattr(settings, name):
             monkeypatch.setattr(settings, name, value)
 
@@ -134,7 +167,19 @@ class ScriptedAdapter(ModelAdapter):
         temperature: float = 0.7,
         max_tokens: int = 2048,
         top_p: float = 1.0,
+        purpose: str = "chat",
     ) -> ModelCompletion:
+        """``purpose`` 必须收下，即使这里用不上它。
+
+        所有走 ``structured.request_structured`` 的辅助调用（规划、记忆抽取、
+        指代消解、历史摘要）都会传这个参数。不收的话那些调用一律 TypeError，
+        而调用方**普遍会把异常吞成"没产出"然后静默降级**——于是测试看到的是
+        "规划没发生"，报错信息里一个字都不提签名不匹配。
+
+        2026-09-05 发现：``AGENT_PLAN_MODE=plan_execute`` 打开之后，除了
+        test_agent_loop 里那两条用了本地子类的用例，**所有集成测试里的规划路径
+        从来没被真正走过**——每次都是 TypeError → 退回纯 ReAct → 断言照样通过。
+        """
         chunks = [
             chunk
             async for chunk in self.stream_completion(

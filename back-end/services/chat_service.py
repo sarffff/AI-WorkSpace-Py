@@ -12,10 +12,12 @@ from redis_service import redis_service
 from services.clock import naive_now
 from services.conversation_context import ConversationContextBuilder
 from services.feedback_service import feedback_service
+from services import fs_tools
 from services import guardrails
 from services.guardrails import guard, mask_markup
 from services.knowledge_service import KnowledgeService
 from services.memory_service import memory_service
+from services import prose_question
 from services.model_adapter import (
     ModelAdapter,
     ModelCompletion,
@@ -24,6 +26,9 @@ from services.model_adapter import (
 )
 from services import prompt_library
 from services.semantic_cache import semantic_cache
+from services import skill_library
+from services import skill_service
+from services import skill_tools
 from services.telemetry import (
     SpanKind,
     current_trace_id,
@@ -64,6 +69,7 @@ class _ToolResultBudget:
     """
 
     def __init__(self, total: int, per_call: int) -> None:
+        self._total = max(0, total)
         self._remaining = max(0, total)
         self._per_call = max(0, per_call)
 
@@ -90,8 +96,136 @@ class _ToolResultBudget:
         if len(text) <= limit:
             self._remaining -= len(text)
             return text
-        self._remaining = 0
+        # 扣掉**实际注入的那些字符**，不是把余额归零。
+        #
+        # 2026-09-05 修。原来这里是 ``self._remaining = 0``：一个超过单次上限的结果
+        # 只注入 per_call 个字符，却把总预算剩下的全部作废。旧配置下很少撞到——
+        # 知识库分块本来就短；打开文件工具之后 ``search_files`` 一次轻易过 4000，
+        # 于是**一次搜索就把整回合的预算清零**，后面几轮全部拿到"预算已用尽"。
+        #
+        # 表现极难归因：模型答得含糊，工具轨迹里那次搜索显示成功，而"为什么它不
+        # 接着读文件"没有任何线索。
+        self._remaining -= limit
         return text[:limit] + f"\n\n[结果过长已截断，原始长度 {len(text)} 字符]"
+
+    def refund(self, chars: int) -> int:
+        """把回收来的字符还回余额，返回实际退款额。
+
+        用于往轮结果被压缩之后（见 ``_compact_stale_tool_results``）。**只能在
+        messages 里那份文本真的变短之后调用**：计数器和上下文必须同步，
+        否则退款就是凭空多出来的额度，而模型实际付的 token 一点没少。
+
+        退款不会超过已经花掉的部分，也就不会让余额涨过初始总量。
+        """
+        if chars <= 0:
+            return 0
+        headroom = self._total - self._remaining
+        actual = min(chars, max(0, headroom))
+        self._remaining += actual
+        return actual
+
+
+# 结果只在**产出它的那一轮**有用的工具。它们回答的是"东西在哪"，
+# 而模型拿到答案、真的去读了那个文件之后，那份清单就是纯占位的字符。
+#
+# 不含 ``read_file``：文件正文是模型推理的依据本身，压掉它等于让模型忘记自己读过
+# 什么，下一轮它只能再读一遍——那比不回收更贵。
+# 也不含 ``search_knowledge_base``：检索到的分块是回答的**证据**，回答里还要标引用。
+#
+# **``load_skill`` 永远不能加进来。** 它的结果是模型正在遵守的作业指导——压掉它
+# 等于在执行到一半的时候把规程收走，而模型不会说"我忘了"，它会接着用自己的通用
+# 做法把事情做完，看起来一切正常。``read_skill_file`` 同理（模板被压掉之后
+# 产出的东西会悄悄不符合模板）。这两个也不该靠"重新加载一次"补救：
+# ``_LoadedSkills`` 会拒绝第二次加载。
+_RECLAIMABLE_TOOLS = frozenset({"list_directory", "search_files", "list_knowledge_documents"})
+
+# 压缩后留在上下文里的占位文本。必须说清"还能再调一次"——
+# 只写"已省略"的话模型会以为那次调用没拿到东西，于是改变策略而不是重新调用。
+_COMPACTED_TEMPLATE = "[{name} 的结果已从上下文移出以腾出预算（原 {chars} 字符）。需要的话再调用一次。]"
+
+
+def _compact_stale_tool_results(
+    messages: list[dict[str, Any]],
+    budget: _ToolResultBudget,
+) -> int:
+    """把往轮的导航类工具结果压成一行，把腾出来的字符退还预算。返回退款额。
+
+    ## 为什么需要它
+
+    预算原来**只减不增**：第一轮那份目录列表到第五轮还在占着字符，而模型早就不
+    需要它了。轮次上限从 6 提到 10 之后这件事从"浪费"变成"卡死"——多出来的四轮
+    没有预算可花，等于白给。
+
+    ## 只压往轮，不碰本轮
+
+    调用点在轮首、本轮 assistant 消息追加**之前**，所以此刻 messages 末尾那组
+    tool 消息属于上一轮。保留最后一组：模型刚看到的东西不能在它眼前消失，
+    那会让"我上一轮查到了什么"变成一个它答不出的问题。
+
+    ## 工具名从 messages 里取，不从 writes
+
+    第一版是从 ``state.writes`` 建 ``call_id → name`` 映射的，而那是错的：
+    ``writes`` **每轮开头都被清空**（它只记本轮已完成的调用，为的是恢复幂等，
+    见循环里那句 ``state.writes = []``）。轮首压缩时它必然是空的，于是映射建不起来、
+    一条都压不掉——而函数本身不报错，单元测试里手工累积 writes 也测不出来。
+    症状是"回收完全没有发生"，但预算数字看起来只是紧了一点。
+
+    ``messages`` 里的 assistant 消息本来就带 ``tool_calls[].id`` 与
+    ``.function.name``，那份数据跨轮一直在，也跟着快照走。
+
+    ## 为什么按 assistant 消息分组定轮次边界
+
+    序列形状是固定的 ``assistant(带 tool_calls) → 一批 tool 消息``，
+    数一下带 tool_calls 的 assistant 消息就知道边界，不需要额外的轮次字段。
+
+    ## 幂等
+
+    压缩会把 ``messages`` 里那份文本真的换掉，而 messages 进快照。所以恢复后再跑
+    一遍这个函数，已压过的消息按占位文本前缀认出来、不会二次退款。计数器与上下文
+    必须同步这一条，全靠"先改文本再退款"这个顺序。
+    """
+    if not messages:
+        return 0
+
+    # call_id → 工具名。tool 消息本身只有 tool_call_id，名字在发起它的那条
+    # assistant 消息里。同时找出最后一组的起点：它之后的 tool 消息属于上一轮，
+    # 是模型刚看到的东西，一律保留。
+    names: dict[str, str] = {}
+    last_group_start = -1
+    for index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        calls = message.get("tool_calls")
+        if not calls:
+            continue
+        last_group_start = index
+        for call in calls:
+            call_id = call.get("id")
+            name = (call.get("function") or {}).get("name")
+            if call_id and name:
+                names[str(call_id)] = str(name)
+
+    reclaimed = 0
+    for index, message in enumerate(messages):
+        if index > last_group_start >= 0:
+            break  # 到了要保留的那一组
+        if message.get("role") != "tool":
+            continue
+        content = message.get("content") or ""
+        # 已经压过的不再退第二次款
+        if content.startswith("[") and "已从上下文移出以腾出预算" in content:
+            continue
+        name = names.get(str(message.get("tool_call_id")), "")
+        if name not in _RECLAIMABLE_TOOLS:
+            continue
+        placeholder = _COMPACTED_TEMPLATE.format(name=name, chars=len(content))
+        saved = len(content) - len(placeholder)
+        if saved <= 0:
+            continue  # 本来就比占位文本还短，压它只会变长
+        message["content"] = placeholder
+        reclaimed += saved
+
+    return budget.refund(reclaimed)
 
 
 @dataclass(slots=True)
@@ -163,6 +297,9 @@ class _TurnContext:
     turn: Any
     delegations: _Delegations | None = None
     gated: frozenset[str] = frozenset()
+    # 本回合已加载的 skill。工具处理器就地往它的 names 里追加，
+    # sync_to 负责把那份名单落进快照。
+    loaded_skills: Any = None
 
     def sync_to(self, state: agent_state.TurnState) -> None:
         """把守卫余额写回 state。每次快照之前调。"""
@@ -175,6 +312,11 @@ class _TurnContext:
         state.breaker_tripped = tripped
         if self.delegations is not None:
             state.delegations_used = self.delegations.used
+        # 已加载的 skill 名要落快照。少了这一句，审批中断之后接着跑时模型第二次
+        # 调 load_skill 会拿回一份完整正文——而它已经在上文里，等于白付一次
+        # 几千字的预算，而且模型会以为自己拿到了两份不同的指导。
+        if self.loaded_skills is not None:
+            state.loaded_skills = list(self.loaded_skills.names)
 
     def restore_from(self, state: agent_state.TurnState) -> None:
         """把 state 里的余额灌回守卫。重建 context 之后立刻调。"""
@@ -501,6 +643,8 @@ class ChatService:
         use_rag: bool,
         citation_sink: list[dict] | None = None,
         approvals: workspace_tools._ToolApprovals | None = None,
+        loaded_skills: list[str] | None = None,
+        skill_sink: list[Any] | None = None,
     ) -> list[ToolDefinition]:
         """本轮下发给模型的工具面。
 
@@ -518,6 +662,33 @@ class ChatService:
         tools.extend(
             workspace_tools.build(db, scope, self._get_knowledge_service(), approvals)
         )
+        # 本机文件系统工具。按 **user_id** 而不是 workspace_id：授权是本机行为
+        # （用户在自己机器上点了一次系统对话框），而工作区是多人共享的——按工作区
+        # 给的话，一个成员授权的目录会让同工作区的另一个人"有权"读它，而那个人
+        # 机器上可能根本没有这个路径（理由写在 models.WorkspaceRoot）。
+        #
+        # 没授权任何目录时 build 返回空列表，一个都不注册。
+        tools.extend(
+            fs_tools.build(
+                db,
+                scope.user_id,
+                # 删本机文件与删知识库文档共用同一个确认令牌：判据都是"用户原话里
+                # 明确要求过删除"，而那件事和删的是什么无关。
+                delete_granted=bool(approvals and approvals.delete_granted),
+            )
+        )
+        # Skill 工具。按 **workspace_id**：作业指导是组织资产，不跟人走
+        # （和文件夹授权恰好相反，对比写在 models.WorkspaceSkill 里）。
+        #
+        # ``already_loaded`` 让恢复后的回合知道哪些已经加载过了。返回的
+        # ``_LoadedSkills`` 由调用方接住，回合内的加载会就地写进它的 names，
+        # 循环再把那份名单同步回 state。
+        skill_defs, loaded = skill_tools.build(
+            db, scope.workspace_id, already_loaded=loaded_skills
+        )
+        tools.extend(skill_defs)
+        if skill_sink is not None:
+            skill_sink.append(loaded)
         return tools
 
     def _approvals_for(
@@ -1149,7 +1320,18 @@ class ChatService:
         )
         scope.history = history
         approvals = self._approvals_for(prompt, history)
-        base_tools = self._create_tools(db, scope, use_rag, citations, approvals)
+        # skill_sink 接住 _LoadedSkills：它由工具处理器就地改写（加载一份就
+        # append 一个名字），而 _TurnContext.sync_to 负责把那份名单落进快照。
+        skill_sink: list[Any] = []
+        base_tools = self._create_tools(
+            db,
+            scope,
+            use_rag,
+            citations,
+            approvals,
+            loaded_skills=None,
+            skill_sink=skill_sink,
+        )
         # ---- 多代理:委派 ----
         # 子代理的运行时拿的是**未经角色过滤的**完整工具集合,按角色过滤发生在
         # SubAgentRunner._schemas_for(下发哪些 schema)和它的执行前检查(越权拦截)
@@ -1284,12 +1466,26 @@ class ChatService:
             if memory_block:
                 memory_messages = [{"role": "system", "content": memory_block}]
 
+        # ---- skill 索引 ----
+        # 同记忆块一个道理：独立 system 消息，不拼进主系统提示词。提示词是带版本
+        # 管理的"代码"，skill 索引是逐工作区增长的"数据"——混在一起会让同一版
+        # 提示词在不同工作区之间表现不可比，也破坏语义缓存按 prompt_ref 分桶。
+        #
+        # 只放名字和一句描述，正文由模型调 load_skill 按需取：一个企业几十个 SOP
+        # 全塞进去的话每轮都要付这笔固定成本，而其中至多一个和当前问题有关。
+        skill_messages: list[dict[str, Any]] = []
+        if skill_library.enabled():
+            skill_block = skill_service.build_index_block(db, scope.workspace_id)
+            if skill_block:
+                skill_messages = [{"role": "system", "content": skill_block}]
+
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
                 "content": self._system_prompt(system_template, prefetched),
             },
             *memory_messages,
+            *skill_messages,
             *context.messages,
             # 轨迹紧贴当前问题:它讲的是"刚刚做过什么",离问题越近越不容易被
             # 当成更早的对话内容
@@ -1321,7 +1517,12 @@ class ChatService:
             turn.set(plan_steps=len(plan) or None)
             if plan:
                 messages.append({"role": "user", "content": planner.format_steps(plan)})
-                yield {"type": "plan", "steps": plan}
+                # 键名是 planSteps 而不是 steps:``steps`` 在 SSE 里已经被子代理的
+                # 步骤数占了(agent_state 事件带的那个 number)。同一个键在同一个
+                # 联合类型里一处是数字、一处是对象数组,前端要么类型断言要么按
+                # 事件类型分流,两种都是等着被写错的形状——而写错的表现是计划步数
+                # 显示成工具步数,看起来像个正常数字。
+                yield {"type": "plan", "planSteps": plan}
         # ---- 状态与协作者分离 ----
         # state 是能进数据库、能跨请求的那一半;context 是持有会话与客户端的那一半。
         # 改动之前两者混在同一批局部变量里,所以没有任何一个子集是可以存下来的。
@@ -1356,6 +1557,7 @@ class ChatService:
             turn=turn,
             delegations=delegations,
             gated=frozenset(approval.gated_tools()),
+            loaded_skills=skill_sink[0] if skill_sink else None,
         )
         if checkpoint_store.enabled():
             checkpoint_store.start_run(
@@ -1401,6 +1603,9 @@ class ChatService:
         emitted_any = state.emitted_any
         force_final = state.force_final
         round_index = state.round_index
+        # 本次进入循环累计退了多少字符。**不进 state**：恢复是新建 trace 的，
+        # 埋点本来就按 trace 分段，跨请求累加会把两段执行的数混成一个。
+        reclaimed_total = 0
         # 恢复进来时本轮的工具还没跑完:跳过模型调用,直接进工具执行段。
         resuming = bool(state.pending_calls) and state.pending_index < len(
             state.pending_calls
@@ -1421,9 +1626,39 @@ class ChatService:
             if not resuming:
                 round_index += 1
                 state.round_index = round_index
-                # 本轮内创建的所有 span(模型调用、工具、检索)都会自动带上轮次
-                set_span_defaults(round=round_index)
                 turn.set(rounds=round_index)
+            # 本轮内创建的所有 span(模型调用、工具、检索)都会自动带上轮次。
+            #
+            # 在 if/else **之外**,不在"新一轮"那条分支里:恢复进来时轮次号是从
+            # 快照读出来的、模型调用早就做完了,但那一轮的工具还要在这里跑完,
+            # 而它们的 span 一样需要轮次归因。放在分支里的话被恢复那一轮的工具
+            # span 全都没有 round——审批恢复与澄清恢复恰好是最需要归因的两种情形,
+            # 而 _resume_loop 每次新建 trace,trace.defaults 是空的,拿不到旧值。
+            #
+            # 放在自增**之后**读 round_index,而不是在分支里写 round_index + 1:
+            # 后者把自增逻辑抄了第二遍,以后改自增就会让 span 上的轮次悄悄错位。
+            set_span_defaults(round=round_index)
+            if not resuming:
+                # 往轮的导航类结果压成一行，把字符退还预算。
+                #
+                # 位置：轮首、本轮 assistant 消息追加**之前**——所以此刻 messages
+                # 末尾那组 tool 消息属于上一轮，会被保留（模型刚看到的东西不能在
+                # 它眼前消失）。
+                #
+                # 没有这一段，预算就只减不增：第一轮那份目录列表到第十轮还占着
+                # 字符，而轮次上限提到 10 之后多出来的四轮没有预算可花，等于白给。
+                reclaimed = _compact_stale_tool_results(messages, budget)
+                if reclaimed:
+                    # 累加而不是覆盖：turn.set 是覆盖语义，每轮直接写 reclaimed
+                    # 的话埋点里只剩最后一轮那次的数，而想知道的是整回合一共退了
+                    # 多少——那才能回答"回收到底有没有用"。
+                    reclaimed_total += reclaimed
+                    turn.set(budget_reclaimed=reclaimed_total)
+                # 加载了哪些作业指导。这个数回答的是"skill 到底有没有被用上"——
+                # 索引注入了不等于被选中，而"注入了几十条描述、模型一个都没调"
+                # 恰好是最该被发现的失效模式（提示词写得再好也白搭）。
+                if ctx.loaded_skills is not None and ctx.loaded_skills.names:
+                    turn.set(skills_loaded=list(ctx.loaded_skills.names))
                 # 最后一轮不再下发工具 schema:模型只能作答,循环必然终止。
                 is_final_round = force_final or round_index >= max_rounds
                 if is_final_round and round_index > 1:
@@ -1481,9 +1716,24 @@ class ChatService:
                     remainder = completion.content[completion.streamed_length :]
                     if remainder.strip():
                         yield {"type": "message_delta", "content": remainder}
-                        self._finish_run(db, state, status="done")
-                        return
-                    if emitted_any:
+                    if remainder.strip() or emitted_any:
+                        # 正文里问了问题就收编成一次澄清中断,而不是收尾。
+                        #
+                        # 判断放在两条出口**之上**:文本走流式还是走 remainder 补发,
+                        # 是适配器的实现细节,不是语义差别。第一版只挂在 remainder
+                        # 那条分支上,于是"适配器已经流完"的情况(测试替身、以及线上
+                        # 大多数真实流式响应)全部静默不收编——功能看起来做完了,
+                        # 实际只在一半的路径上生效。
+                        #
+                        # **文本先发后挂**:用户看得到模型讲了什么,再看到输入框。
+                        # 反过来(先挂起、不发文本)会让那句问题失去上下文,
+                        # 用户不知道自己为什么被问。
+                        adopted = await self._maybe_adopt_prose_question(
+                            db, state, ctx, completion.content, round_index
+                        )
+                        if adopted is not None:
+                            yield adopted
+                            return
                         self._finish_run(db, state, status="done")
                         return
                     # 不把空输出当成一条成功的 assistant 消息,给用户可见的错误提示。
@@ -1526,9 +1776,22 @@ class ChatService:
                 is_final_round = force_final or round_index >= max_rounds
                 resuming = False
 
-            # 本轮有几次调用什么新东西都没带回来(工具挂了,或者是重复调用)。
+            # 本轮有几次调用什么新东西都没带回来(工具挂了、重复调用、或被拒绝)。
             # 全都是的话继续循环只会原地转圈,下面据此强制收敛。
-            barren_count = 0
+            #
+            # 恢复时要**从 writes 里把断点之前那几次的结论捞回来**,不能从 0 起算:
+            # 下面拿它和 len(pending_calls) 比,而 pending_calls 是**整轮**的调用,
+            # 断点之前那几次已经跑过、不在这次的 for 循环里。从 0 起算的话
+            # "整轮全都没带回新东西"这个判据在恢复轮上永远不成立——多调用的那一轮
+            # 会漏判,收敛保证被削弱一档(仍有 max_rounds 兜底,不会失控)。
+            _barren = {
+                ToolStatus.UNAVAILABLE.value,
+                ToolStatus.REPEATED.value,
+                ToolStatus.REJECTED.value,
+            }
+            barren_count = sum(
+                1 for write in state.writes if write.get("status") in _barren
+            )
 
             # 从 pending_index 起跑:恢复时前面那几个已经执行过了,它们的结果
             # 由 replay_writes 摆回了 messages。重跑一遍就是让那几次检索的钱
@@ -1630,7 +1893,16 @@ class ChatService:
                             "type": "approval_required",
                             "runId": state.run_id,
                             "tool": call.name,
-                            "preview": approval.build_preview(arguments),
+                            # 文件操作额外带一段 diff。必须服务端算：前端没有文件
+                            # 访问权，它手里只有"把 old_text 换成 new_text"这样的
+                            # 参数，那看不出这次改动到底动了什么——而用户正要在
+                            # 那个界面上点同意。算不出来时返回空字典，审批照常进行。
+                            "preview": approval.build_preview(
+                                arguments,
+                                fs_tools.preview_extra(
+                                    db, state.user_id, call.name, arguments
+                                ),
+                            ),
                             "reason": request.reason,
                             "round": round_index,
                             "checkpoint": seq,
@@ -1892,6 +2164,94 @@ class ChatService:
             # AGENT_CHECKPOINT_KEEP 兜着——它本来就是为这个存在的。
             checkpoint_store.put(db, state)
 
+    async def _maybe_adopt_prose_question(
+        self,
+        db: Session,
+        state: agent_state.TurnState,
+        ctx: "_TurnContext",
+        answer: str,
+        round_index: int,
+    ) -> dict[str, Any] | None:
+        """模型在正文里问了问题时，把它收编成一次澄清中断。
+
+        返回要 yield 的事件，或者 ``None``（不收编，调用方照常收尾）。
+
+        ## 为什么要有这个东西
+
+        ``ask_user`` 那条链从做完起没被走进去过一次：三次实测
+        ``clarificationAsked`` 都是 0，而模型确实认出了缺前提、也把问题问了出来，
+        只是问在正文里。理由见 ``services/prose_question.py`` 的模块文档串。
+
+        ## 五个前置条件，缺一不收编
+
+        1. ``CLARIFY_ADOPT_PROSE_QUESTION`` 打开（默认关，判据是启发式的）；
+        2. 快照可用。没有快照就没有"接着这一轮跑"，收编只会让回合白白终止一次，
+           比不收编更糟；
+        3. 这一轮**还没有**收编过。否则模型每轮问一句、每次都被收编，用户被困在
+           问答循环里——这正是 ``ask_user`` 工具描述里"一次只问一个"要防的事；
+        4. 判据认得出来（保守，宁可漏）；
+        5. 摘得出一句非空的问题。前端那张卡片靠它显示标题。
+
+        ## 顺序：先把 assistant 消息追进 messages，再落快照
+
+        少了这一步，恢复时模型会看到一条用户回答，而它前面**没有那句问题**——
+        那是一段读不通的对话，模型只能重新猜用户在回答什么。
+        """
+        if not settings.CLARIFY_ADOPT_PROSE_QUESTION:
+            return None
+        if not checkpoint_store.enabled():
+            return None
+        # 一轮只收编一次。这个标记跟着快照走,所以恢复之后仍然有效。
+        if state.prose_question_adopted:
+            return None
+        if not prose_question.looks_like_question_to_user(answer):
+            return None
+        question = prose_question.extract_question(answer)
+        if not question:
+            return None
+
+        # 模型这次的回答要进 messages。恢复时用户那句答案接在它后面,
+        # 两条合起来才是一段读得通的对话。
+        state.messages.append({"role": "assistant", "content": answer})
+        ctx.sync_to(state)
+        state.phase = "pre_tools"
+        state.status = "waiting_input"
+        state.prose_question_adopted = True
+        # 没有待跑的调用:这一轮的工具早就跑完了,模型给的是最终回答。
+        # pending_calls 留空 → 恢复时 _drive_loop 的 resuming 为 False,
+        # 自然从新的一轮开始,而 messages 里带着完整的工具结果。
+        state.pending_calls = []
+        state.pending_index = 0
+        request = agent_state.InterruptRequest(
+            kind="prose_question",
+            tool="",
+            arguments={"question": question},
+            call_index=0,
+            tool_call_id=None,
+            reason=question,
+        )
+        state.interrupt = request.to_dict()
+        seq = checkpoint_store.put(db, state, interrupt=state.interrupt)
+        checkpoint_store.update_run(
+            db,
+            state.run_id,
+            status="waiting_input",
+            rounds=round_index,
+            bump_interrupts=True,
+        )
+        ctx.turn.set(interrupted="prose_question", clarification=True)
+        return {
+            "type": "clarification",
+            "runId": state.run_id,
+            "question": question,
+            "round": round_index,
+            "checkpoint": seq,
+            "resumable": True,
+            # 前端据此区分"模型主动调了 ask_user"和"框架收编了正文里那句问题"。
+            # 两者的卡片文案该不一样:后者的问题已经在上面的回答里出现过一次了。
+            "adopted": True,
+        }
+
     @staticmethod
     def _finish_run(
         db: Session,
@@ -1957,7 +2317,7 @@ class ChatService:
             yield {"type": "error", "error": "这次执行的状态快照已不可用，无法恢复。"}
             return
         request = state.interrupt_request
-        if request is None or request.kind != "user_input":
+        if request is None or request.kind not in ("user_input", "prose_question"):
             yield {"type": "error", "error": "中断请求已损坏，无法恢复。"}
             return
 
@@ -1971,14 +2331,26 @@ class ChatService:
         # 用户的原话要过 mask_markup 再进 messages。它会以 role=tool 的身份出现，
         # 而模型对 tool 内容的信任度比 user 更高——这个位置更值得防注入，
         # 不是更不值得。
-        # 键必须和循环里的 ``ask_key`` 一致：轮次 + 下标，不用 tool_call_id
-        # （理由见那边的注释）。
-        state.clarification_answers = {
-            **state.clarification_answers,
-            f"r{state.round_index}c{request.call_index}": (
-                guardrails.mask_markup(cleaned)[: settings.TOOL_RESULT_MAX_CHARS]
-            ),
-        }
+        masked = guardrails.mask_markup(cleaned)[: settings.TOOL_RESULT_MAX_CHARS]
+
+        if request.kind == "prose_question":
+            # 收编来的中断没有那次工具调用，所以答案不能以 role=tool 回灌——
+            # 那会造出一条挂在不存在的 tool_call_id 上的消息，多数供应商直接报 400。
+            # 走 role=user：模型上一条 assistant 消息（含它那句问题）已经在
+            # messages 末尾了（收编时追加的），这条答案接在后面正好读得通。
+            #
+            # pending_calls 是空的，所以 _drive_loop 的 ``resuming`` 为 False，
+            # 恢复即从新的一轮开始——而 messages 里带着**完整的**工具结果
+            # （每条上限 TOOL_RESULT_MAX_CHARS），不是轨迹回灌那份 240 字摘要。
+            # 这就是收编换来的东西。
+            state.messages.append({"role": "user", "content": masked})
+        else:
+            # 键必须和循环里的 ``ask_key`` 一致：轮次 + 下标，不用 tool_call_id
+            # （理由见那边的注释）。
+            state.clarification_answers = {
+                **state.clarification_answers,
+                f"r{state.round_index}c{request.call_index}": masked,
+            }
         state.interrupt = None
         state.phase = "pre_tools"
         state.status = "running"
@@ -2158,8 +2530,17 @@ class ChatService:
                     "max_tokens": state.max_tokens,
                     "top_p": state.top_p,
                 }
+                # 从快照读回已加载的 skill 名：恢复之后模型不该被允许把同一份
+                # 指导再加载一遍（正文已经在 messages 里了）。
+                skill_sink: list[Any] = []
                 base_tools = self._create_tools(
-                    db, scope, state.use_rag, citations, approvals
+                    db,
+                    scope,
+                    state.use_rag,
+                    citations,
+                    approvals,
+                    loaded_skills=list(state.loaded_skills),
+                    skill_sink=skill_sink,
                 )
                 runtime, delegations = self._build_tool_surface(
                     base_tools,
@@ -2179,6 +2560,7 @@ class ChatService:
                     turn=turn,
                     delegations=delegations,
                     gated=frozenset(approval.gated_tools()),
+                    loaded_skills=skill_sink[0] if skill_sink else None,
                 )
                 # 顺序要紧：先 replay（它会按 writes 把余额算到中断那一刻），
                 # 再 restore（把算出来的余额灌进守卫对象）。反过来就白算了。
@@ -2283,8 +2665,17 @@ class ChatService:
                     "max_tokens": state.max_tokens,
                     "top_p": state.top_p,
                 }
+                # 从快照读回已加载的 skill 名：恢复之后模型不该被允许把同一份
+                # 指导再加载一遍（正文已经在 messages 里了）。
+                skill_sink: list[Any] = []
                 base_tools = self._create_tools(
-                    db, scope, state.use_rag, citations, approvals
+                    db,
+                    scope,
+                    state.use_rag,
+                    citations,
+                    approvals,
+                    loaded_skills=list(state.loaded_skills),
+                    skill_sink=skill_sink,
                 )
                 runtime, delegations = self._build_tool_surface(
                     base_tools,
@@ -2304,6 +2695,7 @@ class ChatService:
                     turn=turn,
                     delegations=delegations,
                     gated=frozenset(approval.gated_tools()),
+                    loaded_skills=skill_sink[0] if skill_sink else None,
                 )
                 # 守卫余额直接从快照灌:post_tools 的快照里 writes 已经清空
                 # (本轮收尾时清的),而余额、重复计数、熔断状态都是那一刻的真值。

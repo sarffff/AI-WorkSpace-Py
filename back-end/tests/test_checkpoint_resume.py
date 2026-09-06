@@ -22,6 +22,7 @@ from typing import Any
 from conftest import collect, run
 from config import settings
 from models import AgentCheckpoint, AgentRun, MessageToolStep
+from services import checkpoint_store
 
 from tests.test_sse_contract import make_service, enable_delegation
 from tests.test_service_security import RecordingKnowledge, _seed_workspace
@@ -185,6 +186,68 @@ def test_resume_approved_executes_and_finishes(db_real, monkeypatch):
     run_row = db_real.query(AgentRun).filter(AgentRun.id == run_id).first()
     assert run_row.status == "done"
     assert run_row.finished_at is not None
+
+
+def test_恢复轮的收敛判定要算上断点之前那几次(db_real, monkeypatch):
+    """"整轮都没带回新东西"这个判据在**恢复轮**上也必须成立。
+
+    ``barren_count`` 拿来和 ``len(pending_calls)`` 比，而 ``pending_calls`` 是
+    **整轮**的调用。断点之前那几次已经跑过、不在恢复那一趟的 for 循环里，所以
+    从 0 起算的话这个判据在多调用的恢复轮上**永远不成立**——一轮里两个调用、
+    第一个工具没带回东西、第二个被用户拒绝，两个都是白跑，却不会强制收敛。
+    收敛保证因此少一档（仍有 ``max_rounds`` 兜底，所以是削弱而不是失控）。
+
+    这里造的就是那个形状：``AGENT_REPEAT_LIMIT=1`` 让第一个 calculate 直接被
+    当成重复拦下（``repeated``，白跑一次），第二个 ``save_to_knowledge_base``
+    停在审批闸门；恢复时拒绝它（``rejected``，也是白跑）。两个都白跑 = 强制收敛
+    = 下一轮**不下发任何工具 schema**。
+
+    断言落在"末轮拿到的 tools 是空的"上：那是 ``force_final`` 唯一可观察的后果。
+    修复之前它是非空的（模型还能再调一轮），而回答本身两种情况下都能出来
+    ——所以只看回答是看不出这个 bug 的。
+    """
+    enable_checkpoints(monkeypatch)
+    # 1 = 第一次调用就算重复。造"这次调用白跑了"最省事的办法。
+    monkeypatch.setattr(settings, "AGENT_REPEAT_LIMIT", 1)
+    admin_id = seed_admin(db_real)
+    knowledge = RecordingKnowledge()
+    service, adapter = make_service(
+        [
+            {
+                "tool_calls": [
+                    ("calculate", {"expression": "1+1"}),
+                    ("save_to_knowledge_base", {"name": "要点", "content": "正文"}),
+                ]
+            },
+            {"text": "两件事都没做成，我说一下原因。"},
+        ],
+        knowledge,
+    )
+    first = run(
+        collect(
+            service.stream_ai_response(
+                db_real, admin_id, "c1", "算一下再存起来", use_rag=True, message_id="m-user"
+            )
+        )
+    )
+    run_id = next(e for e in first if e["type"] == "approval_required")["runId"]
+    # 前提：断点之前那次确实白跑了（被当成重复拦下，没有真的执行）
+    assert next(e for e in first if e["type"] == "tool_result")["status"] == "repeated"
+
+    resumed = run(
+        collect(
+            service.resume_turn(db_real, admin_id, run_id, approved=False, note="都别做")
+        )
+    )
+
+    assert next(
+        e for e in resumed if e["type"] == "tool_result"
+    )["status"] == "rejected"
+    assert knowledge.uploaded == []
+    # 两次调用都白跑 → 强制收敛 → 末轮一个 schema 都不下发
+    assert adapter.calls[-1]["tools"] == [], (
+        "整轮都没带回新东西，末轮不该还拿得到工具"
+    )
 
 
 def test_resume_rejected_feeds_reason_back_to_model(db_real, monkeypatch):
@@ -1114,3 +1177,330 @@ def test_ask_user_still_finishes_when_checkpoints_are_off(db_real, monkeypatch):
 
     event = next(e for e in events if e["type"] == "clarification")
     assert "resumable" not in event, "没开 checkpoint 就不该声称可续"
+
+
+# ========== 收编正文里那句问题 ==========
+#
+# ask_user 那条链从做完起没被走进去过一次：三次实测（2026-08-30/31，baseline 与
+# no-prefetch 两种配置、改过一轮用例设计、补过一版 v7-clarify 提示词）
+# clarificationAsked 始终是 0。模型认出了缺前提、也把问题问了出来，但**问在正文
+# 里**——那一轮以 status=done 正常收尾，没有快照，用户的回答变成新一轮，上一轮的
+# 工具结果只能靠轨迹回灌带过去（压成 240 字/步、总预算 600 token 的摘要）。
+#
+# 所以改由框架把那句问题收编成一次真的中断。判据在 services/prose_question.py。
+
+_PROSE_ASK = (
+    "根据费用报销制度，二线城市住宿每晚上限 450 元。"
+    "请问您出差的城市属于哪个等级？这样我才能算出总额。"
+)
+
+
+def _adopted_prose_question(db_real, monkeypatch, *, before_ask=None, answer_text=None):
+    """跑到"正文提问被收编"处。``before_ask`` 是问之前先跑的工具调用。"""
+    enable_checkpoints(monkeypatch, approval_mode="off")
+    monkeypatch.setattr(settings, "CLARIFY_ADOPT_PROSE_QUESTION", True)
+    admin_id = seed_admin(db_real)
+    scripted = []
+    if before_ask:
+        scripted.append({"tool_calls": before_ask})
+    # 注意这里**没有** ask_user：模型直接给最终回答，问题写在正文里。
+    scripted.append({"text": answer_text or _PROSE_ASK})
+    scripted.append({"text": "二线城市三天共 1350 元。"})
+    service, adapter = make_service(scripted, RecordingKnowledge())
+    first = run(
+        collect(
+            service.stream_ai_response(
+                db_real, admin_id, "c1", "我出差三天住宿能报多少",
+                use_rag=True, message_id="m-user",
+            )
+        )
+    )
+    return service, adapter, first, admin_id
+
+
+def test_正文里的问题被收编成澄清中断(db_real, monkeypatch):
+    """模型没调任何工具，回答正文里问了一句——run 该落 waiting_input。"""
+    _service, _adapter, first, _admin = _adopted_prose_question(db_real, monkeypatch)
+
+    event = next(e for e in first if e["type"] == "clarification")
+    assert event["question"] == "请问您出差的城市属于哪个等级？"
+    assert event.get("resumable") is True
+    assert event.get("adopted") is True, "前端要据此区分模型主动问和框架收编"
+    run_row = db_real.query(AgentRun).filter(AgentRun.id == event["runId"]).first()
+    assert run_row.status == "waiting_input"
+    assert run_row.finished_at is None, "挂起不是终态"
+
+
+def test_收编之前先把回答文本发出去(db_real, monkeypatch):
+    """先发文本再挂起。反过来那句问题就没有上下文，用户不知道为什么被问。"""
+    _service, _adapter, first, _admin = _adopted_prose_question(db_real, monkeypatch)
+
+    kinds = types_of(first)
+    assert "message_delta" in kinds
+    assert kinds.index("message_delta") < kinds.index("clarification")
+    streamed = "".join(
+        e["content"] for e in first if e["type"] == "message_delta"
+    )
+    assert "450" in streamed, "模型讲的内容要照常给用户看到"
+
+
+def test_关掉开关就照常收尾(db_real, monkeypatch):
+    """对照组。默认关闭，判据是启发式的，误判代价不对称。"""
+    enable_checkpoints(monkeypatch, approval_mode="off")
+    monkeypatch.setattr(settings, "CLARIFY_ADOPT_PROSE_QUESTION", False)
+    admin_id = seed_admin(db_real)
+    service, _adapter = make_service([{"text": _PROSE_ASK}], RecordingKnowledge())
+
+    events = run(
+        collect(
+            service.stream_ai_response(
+                db_real, admin_id, "c1", "问一下", use_rag=True, message_id="m-user"
+            )
+        )
+    )
+
+    assert not [e for e in events if e["type"] == "clarification"]
+    row = db_real.query(AgentRun).order_by(AgentRun.started_at.desc()).first()
+    assert row.status == "done"
+
+
+def test_收编之后接着这一轮跑且工具结果完整(db_real, monkeypatch):
+    """**这条是走 option 2 的全部理由。**
+
+    收编换来的是完整工具结果（每条上限 TOOL_RESULT_MAX_CHARS，默认 4000 字），
+    而不收编时只有轨迹回灌那份 240 字/步的摘要。断言落在模型最后一次被调用时
+    手里的 messages 上。
+    """
+    service, adapter, first, admin_id = _adopted_prose_question(
+        db_real, monkeypatch, before_ask=[("calculate", {"expression": "450*3"})]
+    )
+    run_id = next(e for e in first if e["type"] == "clarification")["runId"]
+
+    resumed = run(
+        collect(
+            service.answer_clarification(db_real, admin_id, run_id, answer="二线城市")
+        )
+    )
+
+    assert types_of(resumed)[0] == "clarification_answered"
+    messages = adapter.calls[-1]["messages"]
+    tool_contents = [m["content"] for m in messages if m["role"] == "tool"]
+    assert any("1350" in c for c in tool_contents), (
+        f"问之前算出来的结果丢了：{tool_contents}"
+    )
+    assert "".join(
+        e["content"] for e in resumed if e["type"] == "message_delta"
+    ) == "二线城市三天共 1350 元。"
+
+
+def test_收编来的答案走role_user而不是role_tool(db_real, monkeypatch):
+    """没有那次工具调用，所以答案不能挂在 tool_call_id 上。
+
+    走 role=tool 会造出一条挂在不存在的 tool_call 上的消息，多数供应商直接报 400。
+    这一条和 ask_user 那条路**刚好相反**（那边必须走 tool），所以要分别钉住。
+    """
+    service, adapter, first, admin_id = _adopted_prose_question(db_real, monkeypatch)
+    run_id = next(e for e in first if e["type"] == "clarification")["runId"]
+
+    run(
+        collect(
+            service.answer_clarification(db_real, admin_id, run_id, answer="二线城市")
+        )
+    )
+
+    messages = adapter.calls[-1]["messages"]
+    assert messages[-1]["role"] == "user"
+    assert "二线城市" in messages[-1]["content"]
+    # 模型那句问话要在答案前面，否则恢复后是一段读不通的对话
+    assert messages[-2]["role"] == "assistant"
+    assert "哪个等级" in messages[-2]["content"]
+
+
+def test_一轮只收编一次(db_real, monkeypatch):
+    """否则模型每轮问一句、每次都被收编，用户困在问答循环里出不来。
+
+    这正是 ask_user 工具描述里"一次只问一个"要防的形状，只是这次由框架造成。
+    标记必须跟着快照走：第二次判断发生在**恢复之后那个请求**里。
+    """
+    enable_checkpoints(monkeypatch, approval_mode="off")
+    monkeypatch.setattr(settings, "CLARIFY_ADOPT_PROSE_QUESTION", True)
+    admin_id = seed_admin(db_real)
+    # 两次回答**都是**问句：第一次该收编，第二次不该。
+    service, _adapter = make_service(
+        [{"text": _PROSE_ASK}, {"text": _PROSE_ASK}], RecordingKnowledge()
+    )
+    first = run(
+        collect(
+            service.stream_ai_response(
+                db_real, admin_id, "c1", "算一下", use_rag=True, message_id="m-user"
+            )
+        )
+    )
+    run_id = next(e for e in first if e["type"] == "clarification")["runId"]
+
+    resumed = run(
+        collect(
+            service.answer_clarification(db_real, admin_id, run_id, answer="二线城市")
+        )
+    )
+
+    assert not [e for e in resumed if e["type"] == "clarification"], (
+        "同一回合第二次正文提问不该再被收编"
+    )
+    row = db_real.query(AgentRun).filter(AgentRun.id == run_id).first()
+    assert row.status == "done"
+
+
+def test_客套话不会被收编(db_real, monkeypatch):
+    """误判的代价：一个已经答完的回合被挂起，用户看到莫名其妙的输入框。"""
+    enable_checkpoints(monkeypatch, approval_mode="off")
+    monkeypatch.setattr(settings, "CLARIFY_ADOPT_PROSE_QUESTION", True)
+    admin_id = seed_admin(db_real)
+    service, _adapter = make_service(
+        [{"text": "二线城市三天共 1350 元。还需要我帮您查别的吗？"}],
+        RecordingKnowledge(),
+    )
+
+    events = run(
+        collect(
+            service.stream_ai_response(
+                db_real, admin_id, "c1", "算一下", use_rag=True, message_id="m-user"
+            )
+        )
+    )
+
+    assert not [e for e in events if e["type"] == "clarification"]
+    row = db_real.query(AgentRun).order_by(AgentRun.started_at.desc()).first()
+    assert row.status == "done"
+
+
+# ========== 刷新之后还找得回来 ==========
+
+
+def test_waiting_input_shows_up_in_the_pending_list(db_real, monkeypatch):
+    """澄清也要出现在"在等人"的列表里，否则刷新一次卡片就永久消失。
+
+    ``list_pending`` 原来只查 ``waiting_approval``。症状很隐蔽：run 照样躺在库里、
+    照样会被 ``expire_stale_runs`` 超时清掉（那个函数两个状态都覆盖），只是用户
+    再也看不到它，也没有任何入口把它接回去——一次刷新就等于把这一轮悄悄丢掉。
+
+    这是这个项目反复出现的形状：新增了一个状态，只在一半的地方登记。
+    """
+    _service, _adapter, first, admin_id = _asked_clarification(db_real, monkeypatch)
+    run_id = next(e for e in first if e["type"] == "clarification")["runId"]
+
+    pending = checkpoint_store.list_pending(db_real, admin_id)
+
+    assert [r.id for r in pending] == [run_id]
+    assert pending[0].status == "waiting_input"
+
+
+def test_收编来的中断刷新之后也找得回来(db_real, monkeypatch):
+    """收编是第三种中断状态，同样要在待恢复列表里登记。
+
+    "新增了一个状态、只在一半的地方登记"这个形状在这个仓库里已经出现过多次
+    （``list_pending`` 漏 ``waiting_input`` 那次就是）。收编走的是同一个
+    ``waiting_input``，所以列表天然覆盖；这里钉住的是 ``question`` 字段——
+    路由那边按 ``kind`` 决定要不要抬这个字段，漏掉 ``prose_question`` 的话
+    刷新之后卡片没有标题，用户看到一个空输入框却不知道在问什么。
+    """
+    _service, _adapter, first, admin_id = _adopted_prose_question(db_real, monkeypatch)
+    run_id = next(e for e in first if e["type"] == "clarification")["runId"]
+
+    pending = checkpoint_store.list_pending(db_real, admin_id)
+    assert [r.id for r in pending] == [run_id]
+
+    state = checkpoint_store.latest(db_real, run_id)
+    request = state.interrupt_request
+    assert request.kind == "prose_question"
+    assert request.arguments["question"] == "请问您出差的城市属于哪个等级？"
+    assert request.tool_call_id is None, "收编来的中断没有那次工具调用"
+
+
+def test_pending_list_keeps_carrying_approvals(db_real, monkeypatch):
+    """加了 waiting_input 不能把原来的审批挤掉——两种都要在。"""
+    service, _adapter = make_service(
+        [
+            {"tool_calls": [("save_to_knowledge_base", {"title": "T", "content": "C"})]},
+            {"text": "存好了。"},
+        ],
+        RecordingKnowledge(),
+    )
+    enable_checkpoints(monkeypatch, approval_mode="write")
+    admin_id = seed_admin(db_real)
+    events = run(
+        collect(
+            service.stream_ai_response(
+                db_real, admin_id, "c1", "存一下", use_rag=True, message_id="m-user"
+            )
+        )
+    )
+    run_id = next(e for e in events if e["type"] == "approval_required")["runId"]
+
+    pending = checkpoint_store.list_pending(db_real, admin_id)
+
+    assert [r.id for r in pending] == [run_id]
+    assert pending[0].status == "waiting_approval"
+
+
+def test_partial_edit_keeps_untouched_arguments_intact(db_real, monkeypatch):
+    """只回传改过的键，没回传的用原值——**不能**要求客户端把全部键发回来。
+
+    这条挡的是一个静默的数据损坏：弹窗里的参数来自 ``build_preview``，它对字符串
+    做了两件有损的事（``mask_markup`` 中和标记语法，再截断到 800 字并补 ``…``）。
+    如果契约要求回传全部键，那么一次"只改标题"的编辑会顺手把两千字正文覆盖成
+    八百字的脱敏版本——而用户以为自己只动了标题，模型也照样报告"已保存"。
+
+    合并方向 ``{**original, **edited}`` 本来就保住了没回传的键，所以接受部分编辑
+    不放松任何保护。
+    """
+    service, _adapter, run_id, admin_id, knowledge = _interrupted_save(
+        db_real, monkeypatch
+    )
+
+    run(
+        collect(
+            service.resume_turn(
+                db_real,
+                admin_id,
+                run_id,
+                approved=True,
+                # 只给 name，content 完全不提
+                edited_arguments={"name": "Q3 复盘"},
+            )
+        )
+    )
+
+    assert len(knowledge.uploaded) == 1
+    filename, content, _workspace = knowledge.uploaded[0]
+    assert "Q3 复盘" in filename, f"改过的键没生效：{filename}"
+    assert content == "正文".encode(), (
+        f"没回传的键被弄坏了：{content!r}——合并方向本该用原值兜住它"
+    )
+
+
+def test_partial_edit_still_rejects_invented_keys(db_real, monkeypatch):
+    """放开缺键不等于放开加键——后者仍然要挡。
+
+    两者挡的东西不一样：加键说明客户端在拼一个模型从没提议过的调用形状，
+    而用户在弹窗里同意的是模型那一次调用。缺键只是"这个键我没改"。
+    """
+    service, _adapter, run_id, admin_id, knowledge = _interrupted_save(
+        db_real, monkeypatch
+    )
+
+    events = run(
+        collect(
+            service.resume_turn(
+                db_real,
+                admin_id,
+                run_id,
+                approved=True,
+                edited_arguments={"workspace_id": "w9"},
+            )
+        )
+    )
+
+    assert events[0]["type"] == "error"
+    assert "不能新增参数" in events[0]["error"]
+    assert knowledge.uploaded == []

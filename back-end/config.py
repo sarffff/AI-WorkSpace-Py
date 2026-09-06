@@ -65,11 +65,27 @@ class Settings(BaseSettings):
     # ========== Agent 循环配置 ==========
     # 单次回答中允许的最大模型轮次。最后一轮不再提供工具,强制模型给出最终回答,
     # 因此实际可用的工具轮次为 AGENT_MAX_TOOL_ROUNDS - 1。
-    AGENT_MAX_TOOL_ROUNDS: int = 6
+    # 2026-09-05: 6 → 10。打开文件工具之后 6 是硬天花板:一次最小的改文件任务
+    # (search_files 定位 → read_file 看当前内容 → edit_file 改 → read_file 复核)
+    # 就用掉 4 个可用工具轮(末轮不下发 schema,所以可用轮是 max-1),而 edit_file
+    # 因 old_text 对不上失败一次就没有余量了——那是最常见的失败,不是边缘情况。
+    #
+    # 提上限必须和预算回收一起做(见 chat_service._compact_stale_tool_results):
+    # 预算原来只减不增,光提轮次的话多出来的四轮没有字符可花,等于白给。
+    AGENT_MAX_TOOL_ROUNDS: int = 10
     # 单个工具结果注入上下文的字符上限
     TOOL_RESULT_MAX_CHARS: int = 4000
-    # 一次回答中所有工具结果的总字符预算,防止多轮累积撑爆上下文窗口
-    TOOL_RESULT_TOTAL_CHARS: int = 12000
+    # 一次回答中所有工具结果的总字符预算,防止多轮累积撑爆上下文窗口。
+    #
+    # 2026-09-05: 12000 → 20000。这个数原本是按 6 轮定的通用护栏,轮次提到 10 之后
+    # 它成了新的瓶颈:实测一个九轮的文件任务(列目录 ×2 → 搜索 → 读 ×2 → 改 → 读
+    # → 搜索 → 读)在第 9 轮恰好把 12000 用尽,而 read_file 那几次每次 2920 字、
+    # 合计就占掉 11680——文件正文是刻意不回收的(它是模型推理的依据本身,
+    # 见 _compact_stale_tool_results)。
+    #
+    # 20000 字符 ≈ 7000-10000 token(中文 2-3 字/token),相对 HISTORY_TOKEN_BUDGET
+    # 的 4000 token 是同一量级,离常见的 128k 上下文窗口还很远。
+    TOOL_RESULT_TOTAL_CHARS: int = 20000
     # 同一个 (工具, 参数) 在一次回答里最多执行几次,第 N 次起不再执行,改为回灌
     # 一句纠正说明。轮次上限和字符预算都管不到这件事:重复调用每次都是合法调用、
     # 都在预算内,只是拿回来的东西一模一样。0 表示关闭检测(退回改动前的行为)。
@@ -203,6 +219,27 @@ class Settings(BaseSettings):
     # 澄清工具：模型拿不准用户意图或关键参数缺失时，把问题抛回给用户，而不是
     # 硬猜一个参数去调工具。代价是每个澄清问题要等用户回话，回合在此终止。
     TOOL_ASK_USER_ENABLED: bool = False
+    # 把回答正文里那句问题**收编**成一次真的澄清中断。
+    #
+    # 为什么需要它：ask_user 那条链（挂起 → 快照 → /answer → 接着同一轮跑）从做完
+    # 起没有被走进去过一次。三次实测（2026-08-30/31，baseline 与 no-prefetch 两种
+    # 配置、改过一轮用例设计、补过一版专门讲策略的提示词 v7-clarify），
+    # clarificationAsked 始终是 0。模型不是不知道有这个工具（闸门内实测
+    # ask_user in enabled_names() 为 True），而是**认出了缺前提、也把问题问了出来，
+    # 但问在正文里**。往提示词里加更强的措辞是同一条死路，走过两次，第二次还把
+    # 任务成功从 3.0 压到 2.0。所以改由框架收编，而不是指望模型自愿选一个对它
+    # 更贵的交互形态。
+    #
+    # 收编换来的是：messages 连同**完整的工具结果**（每条上限
+    # TOOL_RESULT_MAX_CHARS，默认 4000 字）落进快照，答案回来接着这一轮跑。
+    # 不收编则退回轨迹回灌，那是压成 240 字/步、总预算 600 token 的摘要
+    # （见 tool_history.render_block），模型据摘要判断细节不够时会重新检索一次。
+    #
+    # 默认关闭，因为判据是启发式的（见 services/prose_question.py），而误判的代价
+    # 不对称：漏判只是退回今天的行为，误判会把一个已经答完的回合挂成 waiting_input，
+    # 用户看到一个莫名其妙的输入框。要打开它得先有 CHECKPOINT_ENABLED——没有快照
+    # 就没有"接着这一轮跑"，收编只会让回合白白终止一次。
+    CLARIFY_ADOPT_PROSE_QUESTION: bool = False
     # 网页抓取：把模型给出的 URL 抓成纯文本再过护栏。和 web_search 的区别是
     # 抓正文而不是看摘要，SSRF 面也因此更大，默认关闭。
     TOOL_WEB_FETCH_ENABLED: bool = False
@@ -210,6 +247,68 @@ class Settings(BaseSettings):
     WEB_FETCH_MAX_BYTES: int = 200 * 1024
     WEB_FETCH_MAX_CHARS: int = 8000
     WEB_FETCH_TIMEOUT_SECONDS: float = 10.0
+
+    # ========== 本机文件系统工具 ==========
+    # 让 agent 在**用户授权过的本机文件夹**里列目录、读文件、按内容搜索,
+    # 以及(各自另有开关)写、改、删。
+    #
+    # 授权不在这里配:它是 per-user 的一张表(workspace_roots,迁移 0013),由用户在
+    # 界面上点系统对话框选目录。原因是这个后端的数据模型是多租户的(邀请码 +
+    # admin/member),而"读哪个文件夹"是本机行为——写死一个根目录的话,一旦这个
+    # 后端被部署给团队,所有成员读到的就是**服务器**的磁盘,不是自己的电脑。
+    #
+    # 所以主开关打开、但某个用户没授权任何目录时,这些工具对他**一个都不注册**。
+    #
+    # 全部安全性压在 fs_roots.resolve_within_roots 的路径沙箱上:路径是模型写的,
+    # 而模型可能在复述它刚读到的文件或网页里夹带的字符串。逃逸测试见
+    # tests/test_fs_roots.py。
+    TOOL_FS_ENABLED: bool = False
+    # 写与改。读的失败模式是拿到错的内容,写的失败模式是改坏用户的东西,
+    # 不该由同一个开关控制。需要审批闸门(AGENT_APPROVAL_MODE)一起开。
+    TOOL_FS_WRITE_ENABLED: bool = False
+    # 删除单个文件。不删目录——递归删除的爆炸半径和删一个文件不是一个量级,
+    # 而模型少写一层路径的代价是整个子树没了。
+    # 打开后还要求确认令牌(用户原话里说过要删)+ 审批闸门,缺一不执行。
+    TOOL_FS_DELETE_ENABLED: bool = False
+    # 列目录一次最多返回几项。一个几千个文件的目录会把整轮预算吃光
+    FS_LIST_MAX_ENTRIES: int = 200
+    # 单个文件允许读取的字节上限。超过即拒,并建议改用 search_files 定位
+    FS_READ_MAX_BYTES: int = 2 * 1024 * 1024
+    # 一次 read_file 最多返回多少行 / 多少字符。
+    #
+    # 两个上限都要:行数管住"文件很长",字符数管住"某几行极长"(压缩过的 JS
+    # 一行能有几十万字符)。TOOL_RESULT_MAX_CHARS 默认 4000,给到 3500 是留出
+    # 行号前缀与那句"还有多少行未读"的余量。
+    FS_READ_MAX_LINES: int = 400
+    FS_READ_MAX_CHARS: int = 3500
+    # 按内容搜索:最多返回几处命中、最多扫几个文件、每处摘要多少字符
+    FS_SEARCH_MAX_MATCHES: int = 40
+    FS_SEARCH_MAX_FILES: int = 400
+    FS_SEARCH_SNIPPET_CHARS: int = 160
+
+    # ========== Skill（作业指导） ==========
+    # 一份 skill 回答"这件事在本组织该怎么做"——报销怎么审、季度报告怎么写。
+    # 它是**指令**不是工具:加载之后由当前这个代理照着做,不带独立的执行上下文
+    # (那是子代理角色的事,见 agent_roles 与 skill_library 的模块文档)。
+    #
+    # 两层:内置(back-end/skills/ 跟代码版本化,可带附带文件)+ 工作区
+    # (workspace_skills 表,admin 在界面上写,不改代码不重启)。同名时工作区盖内置。
+    #
+    # 索引(名字 + 一句描述)进独立 system 消息,正文由模型调 load_skill 按需取。
+    # 不全量注入:一个企业几十个 SOP 全塞进去的话每轮都要付这笔固定成本,
+    # 而其中至多一个和当前问题有关。
+    SKILL_ENABLED: bool = False
+    # 一回合最多加载几份。没有上限时模型会把索引里每一个都加载一遍再开始干活,
+    # 那是最贵的一种"稳妥"。
+    SKILL_MAX_LOADS: int = 3
+    # 索引里最多列几条。超出时如实说明被截断——不说的话模型会以为清单是完整的
+    SKILL_INDEX_MAX_ITEMS: int = 40
+    # 单份 skill 正文的字符上限(写入时校验)。给到 8000 而不是更小:
+    # 一份完整的审核流程带上判据与例外,几千字是正常的
+    SKILL_MAX_CHARS: int = 8000
+    # 附带文件注入上下文的字符上限。比 FS_READ_MAX_CHARS 略大:
+    # 模板类文件通常要完整看,截一半的模板不如不给
+    SKILL_ATTACHMENT_MAX_CHARS: int = 4000
 
     # ========== 视觉 ==========
     # 能接收 image_url 内容块的模型白名单(逗号分隔)。留空即关闭多模态,

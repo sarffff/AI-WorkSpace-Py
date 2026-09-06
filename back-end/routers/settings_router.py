@@ -14,7 +14,14 @@ from services.settings_service import (
     save_preferences,
 )
 from services.web_search import web_search_client
-from services import agent_roles, approval, file_types, subagent
+from services import (
+    agent_roles,
+    approval,
+    file_types,
+    fs_roots,
+    fs_tools,
+    subagent,
+)
 
 router = APIRouter(prefix="/settings", tags=["设置"])
 
@@ -79,6 +86,17 @@ async def get_settings(
             # 以及"这个扩展名走内联还是走知识库"的分派都由它决定。
             # 前端不再自己维护扩展名清单，理由见 services/file_types.py。
             "fileTypes": file_types.payload(),
+            # 本机文件能力。报的是"工具真的注册了吗"而不是单个开关值——和
+            # webSearch 同一个道理：``TOOL_FS_ENABLED`` 开着但用户一个文件夹都
+            # 没授权时那六个工具根本不注册，只报开关值会让界面摆出一个点开是空的
+            # 文件树。``hasRoots`` 只给真假,不给路径：本机绝对路径是这个用户机器上
+            # 的信息,列目录时他自己会看到,没必要出现在一个"能力清单"里。
+            "fs": {
+                "enabled": fs_tools.enabled(),
+                "hasRoots": fs_roots.has_roots(db, current_user.id),
+                "writeEnabled": app_settings.TOOL_FS_WRITE_ENABLED,
+                "deleteEnabled": app_settings.TOOL_FS_DELETE_ENABLED,
+            },
         },
     }
 

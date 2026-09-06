@@ -539,3 +539,95 @@ class MessageFeedback(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime)
     # 是否已被导出进评估数据集,避免每次导出都重复追加同一条
     exported_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class WorkspaceRoot(Base):
+    """一个被授权给文件系统工具的本机目录。
+
+    文件系统工具（``list_directory`` / ``read_file`` / ``search_files`` /
+    ``write_file`` / ``edit_file`` / ``delete_file``）只能在这张表里登记过的目录
+    之下工作。一个用户名下没有任何一行时，这些工具**根本不注册**——没有沙箱根，
+    它们除了报错什么都做不了，而注册一个每轮都失败的工具只会白烧上下文
+    （同 ``workspace_tools.build`` 里那条理由）。
+
+    ## 判据是 user_id，不是 workspace_id
+
+    授权是**本机行为**：用户在自己那台机器上点了一次系统对话框。而工作区是多人
+    共享的（邀请码加入、admin/member 两种角色）。按工作区授权的话，一个成员选的
+    目录会让同工作区的另一个人"有权"读它——而那个人的机器上可能根本没有这个路径，
+    或者更糟，有一个同路径但内容完全不同的目录。
+
+    ``workspace_id`` 存下来是为了回答"这次授权是在哪个工作区的上下文里给的"，
+    它不参与权限判断。
+
+    ## path 原样存
+
+    不在入库时做规范化改写。``fs_roots.resolve_within_roots`` 每次校验都对两边
+    重新 ``realpath``——那才是符号链接会变的地方，入库时解析一次并不能保证之后
+    那个链接指向的还是同一处。存原样也让界面上显示的与用户当初选的是同一个字符串。
+    """
+
+    __tablename__ = "workspace_roots"
+    __table_args__ = (
+        # 同一个人重复授权同一个目录是幂等的，而不是攒出两行让撤销只撤掉一半
+        UniqueConstraint("user_id", "path", name="uq_workspace_roots_user_path"),
+        Index("ix_workspace_roots_user_id", "user_id"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    workspace_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # 512 而不是 255：Windows 长路径 + 中文目录名很容易超过 255 字节，而截断的
+    # 后果是沙箱根变成一个**不同的目录**——前缀校验照样通过，只是通过的是错的那个
+    path: Mapped[str] = mapped_column(String(512), nullable=False)
+    label: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class WorkspaceSkill(Base):
+    """一个工作区自己写的 skill（作业指导）。
+
+    skill 回答"这件事在本组织该怎么做"。内置 skill 在 ``back-end/skills/`` 里跟
+    代码版本化，这张表装的是各家自己的 SOP——admin 在界面上写，不改代码不重启。
+
+    ## 判据是 workspace_id，和 WorkspaceRoot 相反
+
+    两者的对比正好说明判据是怎么定的：文件夹授权是**本机行为**（这台机器上的
+    这个目录，换个人就不成立），而 SOP 是**组织资产**（全公司同一套报销流程）。
+    按 user 存的话每个员工都要自己录一遍，而且会录出互相矛盾的版本——那时
+    "到底按谁的流程审"没有答案。
+
+    ## 同名盖掉内置
+
+    ``(workspace_id, name)`` 唯一，查找时工作区优先。不做"两份正文合并"：
+    拼在一起时哪一句生效取决于模型，而那不可预测。
+
+    ## description 是模型选 skill 的唯一依据
+
+    索引里只有名字和这一句（正文按需用 ``load_skill`` 取），所以它写不好就等于
+    这个 skill 不存在——不会报错，只是永远不被选中。
+    """
+
+    __tablename__ = "workspace_skills"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "name", name="uq_workspace_skills_ws_name"),
+        Index("ix_workspace_skills_workspace_id", "workspace_id"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    workspace_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+    description: Mapped[str] = mapped_column(String(255), nullable=False)
+    instructions: Mapped[str] = mapped_column(Text, nullable=False)
+    # 关掉而不是删掉：改坏一条 SOP 之后想先停用看看，比删了重录便宜
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # SOP 出问题时第一个要问的就是这个
+    created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )

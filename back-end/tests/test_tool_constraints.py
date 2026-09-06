@@ -354,8 +354,56 @@ def test_circuit_breaker_trips_tool_out_of_schema(db_real, monkeypatch):
 # ========== 默认不注册 ==========
 
 
-def test_new_tools_not_registered_by_default(db):
-    """新工具默认全关：没开开关就根本不注册。"""
+def test_关掉的工具根本不注册(db, monkeypatch):
+    """开关关掉的工具不注册，而不是注册一个返回"未启用"的版本。
+
+    每个开关都显式关掉，**不依赖 settings 的实际取值**。原来这个测试直接读
+    settings 并断言集合为空，那是在测部署用的 ``.env``——2026-09-05 把
+    read_attachment / delete / ask_user / fetch_web_page 打开之后它立刻红了，
+    而代码一行没动。它要保的性质是"关了就不注册"，那件事和部署配置无关。
+
+    为什么这条性质值得单独测：注册一个每轮都返回"该功能未启用"的占位版本，
+    模型每轮都会试一次，白烧一轮上下文还拿不到东西（理由写在 workspace_tools.build）。
+    """
+    for flag in (
+        "TOOL_CALCULATE_ENABLED",
+        "TOOL_WEB_SEARCH_ENABLED",
+        "TOOL_READ_ATTACHMENT_ENABLED",
+        "TOOL_WRITE_KNOWLEDGE_ENABLED",
+        "TOOL_DELETE_KNOWLEDGE_ENABLED",
+        "TOOL_ASK_USER_ENABLED",
+        "TOOL_WEB_FETCH_ENABLED",
+    ):
+        monkeypatch.setattr(settings, flag, False)
     scope = SimpleNamespace(user_id="u1", workspace_id="w1", is_admin=True, history=[])
     tools = workspace_tools.build(db, scope, FakeKnowledgeService())
     assert {tool.name for tool in tools} == set()
+
+
+def test_开着的工具都注册进来(db, monkeypatch):
+    """开关打开的工具确实出现在工具面里。
+
+    和上面那条成对：只有"关了就不注册"的话，一个恒返回空列表的 build 也能通过。
+    web_search 单独排除——它还要求 API key 配好，缺 key 时**故意**不注册
+    （那时它必然失败），所以它的注册条件不是单一开关。
+    """
+    for flag in (
+        "TOOL_CALCULATE_ENABLED",
+        "TOOL_READ_ATTACHMENT_ENABLED",
+        "TOOL_WRITE_KNOWLEDGE_ENABLED",
+        "TOOL_DELETE_KNOWLEDGE_ENABLED",
+        "TOOL_ASK_USER_ENABLED",
+        "TOOL_WEB_FETCH_ENABLED",
+    ):
+        monkeypatch.setattr(settings, flag, True)
+    monkeypatch.setattr(settings, "TOOL_WEB_SEARCH_ENABLED", False)
+    scope = SimpleNamespace(user_id="u1", workspace_id="w1", is_admin=True, history=[])
+    tools = workspace_tools.build(db, scope, FakeKnowledgeService())
+    assert {tool.name for tool in tools} == {
+        "calculate",
+        "read_attachment",
+        "save_to_knowledge_base",
+        "delete_knowledge_document",
+        "ask_user",
+        "fetch_web_page",
+    }

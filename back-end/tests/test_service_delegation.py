@@ -95,9 +95,19 @@ def test_subagent_round_cap_truncates_to_report(db, monkeypatch):
 
 
 def test_subagent_shares_tool_result_budget_with_main(db, monkeypatch):
-    """子代理吃掉的预算主代理看得见：报告过长被截断，预算耗尽后主代理收敛。"""
+    """子代理吃掉的预算主代理看得见：报告过长被截断，预算耗尽后主代理收敛。
+
+    2026-09-05 调过数字。原来是 ``total=70 / per_call=40``，而它成立**靠的是一个
+    bug**：``_ToolResultBudget.take`` 在结果超出单次上限时把余额直接归零，
+    而不是扣掉实际注入的那 40 个字符。于是 70 - 7(calculate) - 归零 = 0，
+    预算"耗尽"，末轮不给 schema，断言通过。
+
+    修掉归零之后余额是 70 - 7 - 40 = 23，预算没耗尽，schema 照给——测试红了，
+    而红的原因和它要测的性质无关。所以把 total 调成 47：calculate 花 7、
+    报告截断花 40，恰好归零，这次是**真的**耗尽。
+    """
     _enable_delegation(monkeypatch)
-    monkeypatch.setattr(settings, "TOOL_RESULT_TOTAL_CHARS", 70)
+    monkeypatch.setattr(settings, "TOOL_RESULT_TOTAL_CHARS", 47)
     monkeypatch.setattr(settings, "TOOL_RESULT_MAX_CHARS", 40)
     service, adapter = make_service(
         [
