@@ -11,6 +11,8 @@ import { ModeCell } from "../components/ModeCell";
 import { ConfigRow } from "../components/ConfigRow";
 import { StatusCard } from "../components/StatusCard";
 import { MemoryPanel } from "../components/MemoryPanel";
+import { WorkspaceFolderPanel } from "../components/WorkspaceFolderPanel";
+import { SkillPanel } from "../components/SkillPanel";
 
 export const SettingsPage: React.FC = () => {
     const dispatch = useDispatch();
@@ -285,6 +287,12 @@ export const SettingsPage: React.FC = () => {
 
             {/* 长期记忆：跨会话注入的用户事实与偏好，可查看、可删除 */}
             <MemoryPanel className="anim-fade-up stagger-2" />
+
+            {/* 本机文件夹授权：文件工具的沙箱根，没授权就一个文件工具都不注册 */}
+            <WorkspaceFolderPanel className="anim-fade-up stagger-2" />
+
+            {/* 作业指导：AI 处理任务前先看清单，命中就按对应的指导执行 */}
+            <SkillPanel className="anim-fade-up stagger-3" />
 
             {/* 服务端配置（只读） */}
             {settings && (

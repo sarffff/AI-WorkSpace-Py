@@ -7,6 +7,7 @@ import { toastMessageFrom, useToast } from "@/shared/ui/Toast";
 import {
   Bot,
   BookOpen,
+  ListChecks,
   RefreshCw,
   ShieldAlert,
   Zap,
@@ -16,6 +17,7 @@ import {
 /** SSE 流式事件摘要,由 ChatPage 收集后传入 */
 export interface InsightEvent {
   type:
+    | "plan"
     | "tool_start"
     | "tool_result"
     | "citations"
@@ -92,6 +94,9 @@ export const ChatInsightPanel: React.FC<Props> = ({
                   className="relative flex items-center gap-2 text-[11px] px-2.5 py-1.5 rounded-lg bg-[#faf9f5] dark:bg-[#191817] anim-fade-up"
                   style={{ animationDelay: `${i * 0.04}s` }}
                 >
+                  {evt.type === "plan" && (
+                    <ListChecks className="w-3 h-3 text-[#6e6b63] dark:text-[#a19f96] shrink-0" />
+                  )}
                   {evt.type === "tool_start" && (
                     <span className="w-1.5 h-1.5 rounded-full bg-[#da7756] animate-pulse shrink-0" />
                   )}
