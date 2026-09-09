@@ -1388,7 +1388,37 @@ class ChatService:
         prefetch_context = ""
         # 条件是 use_rag 而不是"有没有工具":workspace 工具打开之后,关掉知识库的
         # 请求也会有非空的 tools,拿它当代理会让预检索在 RAG 关闭时照样触发。
-        if use_rag and settings.RAG_PREFETCH:
+        # 命中 skill 时给它让路:本轮不做预检索。
+        #
+        # 实测过的因果链(见 config.SKILL_PREEMPTS_PREFETCH 那段):预检索把一份
+        # 看起来够用的资料塞进用户消息 → 模型判断"我已经有资料了" → 索引没人读、
+        # load_skill 一次不调。改措辞试过,失败。这里撤掉的是那个"既成事实"。
+        #
+        # 只决定**让不让路**,不决定用哪一份——挑哪份仍然是模型看着索引自己调。
+        skill_preempted = False
+        if (
+            use_rag
+            and settings.RAG_PREFETCH
+            and settings.SKILL_PREEMPTS_PREFETCH
+            and skill_library.enabled()
+        ):
+            try:
+                match = await skill_service.most_relevant(
+                    db,
+                    scope.workspace_id,
+                    prompt,
+                    embedding=self._get_knowledge_service().embedding,
+                )
+            except Exception:
+                # 相关性判断失败就退回今天的行为(照常预检索)。这条路径上任何异常
+                # 都不该让整个回合挂掉——它是个优化,不是功能。
+                logger.warning("skill 相关性判断失败,本轮照常预检索", exc_info=True)
+                match = None
+            if match and match[1] >= settings.SKILL_PREEMPT_SIMILARITY:
+                skill_preempted = True
+                turn.set(skill_preempted=match[0], skill_similarity=round(match[1], 4))
+
+        if use_rag and settings.RAG_PREFETCH and not skill_preempted:
             search_query = await self._condense_query(history, prompt)
             yield {
                 "type": "tool_start",

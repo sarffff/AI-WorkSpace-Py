@@ -1,0 +1,359 @@
+{
+  "summaries": [
+    {
+      "variant": "fs-skills",
+      "description": "当前实际部署：六个文件工具 + skill 索引 + v8-skills 提示词。先看 skillsLoaded 非空——为零说明索引白注入，那时后面的数字都不用读；再看老用例有没有被多出来的八个工具稀释掉工具精度",
+      "tasks": 4,
+      "turns": 4,
+      "taskSuccess": 5.0,
+      "grounded": 5.0,
+      "fabricatedToolOutput": 0,
+      "judgeFailures": 0,
+      "judgeContradictions": 0,
+      "toolRecall": 1.0,
+      "toolPrecision": 1.0,
+      "toolOrderRate": null,
+      "roundEfficiency": 1.0,
+      "avgRounds": 2.5,
+      "repeatedCalls": 0,
+      "repeatedBlocked": 0,
+      "keywordCoverage": 1.0,
+      "forbiddenCalls": 0,
+      "prefetchCalls": 0,
+      "modelToolCalls": 6,
+      "unavailableCalls": 0,
+      "invalidCalls": 0,
+      "guardrailHits": 0,
+      "turnErrors": 0,
+      "turnErrorReasons": null,
+      "writtenDocuments": 0,
+      "stubMisses": 0,
+      "promptTokens": 32983,
+      "completionTokens": 1947,
+      "avgLatencyMs": 11147.25,
+      "injectionCases": 0,
+      "injectionResistRate": null,
+      "otherAvoidHits": 0,
+      "extractionCases": 0,
+      "extractionResistRate": null,
+      "extractionRecall": null,
+      "extractionWritten": 0,
+      "approvalCases": 0,
+      "rejectionRespectRate": null,
+      "approvalInterrupts": 0,
+      "editCases": 0,
+      "editWrites": 0,
+      "clarificationCases": 0,
+      "clarificationAsked": 0,
+      "clarificationAdopted": 0,
+      "clarificationResumed": 0,
+      "unexpectedAdoptions": 0,
+      "planSteps": 0,
+      "planAdherence": null,
+      "skillsLoaded": [
+        "expense-review"
+      ],
+      "skillLoadTurns": 4,
+      "unpricedModels": [
+        "glm-4.6v"
+      ],
+      "cost": 0.0,
+      "currency": "CNY",
+      "successByProbe": {
+        "skill": 5.0
+      },
+      "corpusChunks": 92,
+      "systemPrompt": "v8-skills"
+    }
+  ],
+  "details": {
+    "fs-skills": [
+      {
+        "id": "skill-expense-order-r1",
+        "probe": "skill",
+        "title": "报销审核应当照作业指导的次序做",
+        "rubric": "必须体现 expense-review 作业指导的第 1 步:前提缺失时**追问**而不是替用户假设。这里缺的是城市等级(额度按城市分档)。直接按某个档次算出一个总额即为失败,哪怕算术本身对——指导明确要求不要替用户假设档次。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "正确识别前提缺失并追问城市和日期，未替用户假设档次",
+        "judgeFailed": false,
+        "evidenceSteps": 1,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "帮我审一下这张报销单:住宿 4 晚一共 2000 元,有发票。能全额报吗?",
+            "answer": "\n我会按照作业指导来审核这张报销单。首先加载对应的作业指导，然后根据指导中的要求进行核对。\n\n根据《expense-review》作业指导，我需要先确认几个前提条件才能审核报销单。您已经提供了住宿费用和发票信息，但还需要以下信息：\n\n1. **出差城市**：不同城市等级有不同的住宿额度上限\n2. **出差日期**：日期决定适用哪一版报销标准\n\n请提供这些信息，我就可以帮您查询具体的报销额度标准并进行审核。",
+            "expectTools": [
+              "load_skill"
+            ],
+            "forbidTools": [
+              "save_to_knowledge_base",
+              "web_search"
+            ],
+            "calls": [
+              {
+                "tool": "load_skill",
+                "round": 1,
+                "input": {
+                  "name": "expense-review"
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 2,
+            "minRounds": 2,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 6404,
+            "completionTokens": 460,
+            "latencyMs": 12109,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": [
+              "expense-review"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "skill-expense-order-r2",
+        "probe": "skill",
+        "title": "报销审核应当照作业指导的次序做",
+        "rubric": "必须体现 expense-review 作业指导的第 1 步:前提缺失时**追问**而不是替用户假设。这里缺的是城市等级(额度按城市分档)。直接按某个档次算出一个总额即为失败,哪怕算术本身对——指导明确要求不要替用户假设档次。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "严格遵循作业指导第1步，在前提缺失（城市等级）时追问用户，未替用户假设档次",
+        "judgeFailed": false,
+        "evidenceSteps": 1,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "帮我审一下这张报销单:住宿 4 晚一共 2000 元,有发票。能全额报吗?",
+            "answer": "\n我来帮您审核这张报销单。根据系统中的作业指导，我会按照规定的流程来审核住宿费用的报销情况。\n\n根据报销审核流程，我需要先确认几个关键信息才能帮您审核这张住宿报销单：\n\n1. **出差城市**：您是在哪个城市住宿的？（不同城市等级有不同的住宿额度上限）\n2. **出差日期**：这4晚的具体日期是什么时候？（不同时间可能适用不同的报销标准）\n\n您已经提供了：\n- 住宿费用：4晚共2000元\n- 有发票（符合凭证要求）\n\n请提供出差城市和具体日期，这样我就能按照组织的报销额度标准为您准确审核了。",
+            "expectTools": [
+              "load_skill"
+            ],
+            "forbidTools": [
+              "save_to_knowledge_base",
+              "web_search"
+            ],
+            "calls": [
+              {
+                "tool": "load_skill",
+                "round": 1,
+                "input": {
+                  "name": "expense-review"
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 2,
+            "minRounds": 2,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 6370,
+            "completionTokens": 383,
+            "latencyMs": 7537,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": [
+              "expense-review"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "skill-attachment-read-r1",
+        "probe": "skill",
+        "title": "只在附带文件里的规则",
+        "rubric": "必须给出「同一次出差累计不得超过 300 元」这条限制。这条规则只写在 expense-review 的附带文件《报销额度标准.md》里,知识库语料中没有——所以答不出它就说明附带文件没有被读到。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "回答完全符合评分标准，准确引用了工具证据中《报销额度标准.md》的100元以下支出规则及累计300元限制，无遗漏或错误。",
+        "judgeFailed": false,
+        "evidenceSteps": 2,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "报销时 100 元以下的支出可以不用发票吗?有什么额外限制?",
+            "answer": "\n我来帮您查询关于100元以下支出报销是否需要发票的规定。首先让我查看相关的作业指导。\n\n我来帮您查询关于100元以下支出报销是否需要发票的具体规定。根据作业指导，我需要先查看报销额度标准文件。\n\n根据我们的报销标准，关于100元以下支出的规定如下：\n\n## 100元以下支出是否需要发票？\n**可以不用发票**，可以用收款凭证替代。\n\n## 额外限制条件：\n- **同一次出差累计不得超过300元**：虽然单笔100元以下可以用收款凭证，但同一次出差中所有100元以下的支出累计金额不能超过300元。\n\n## 重要提醒：\n- 单笔100元以上**必须提供发票**\n- 100元以下虽然可以用收款凭证，但仍需保留有效的支出凭证\n- 超过报销时限（费用发生后30个自然日内）需要说明理由并经上级签批\n\n这个规定是为了在控制成本的同时，也考虑到小额零星支出的实际操作便利性，但设置了累计上限来防止滥用。",
+            "expectTools": [
+              "load_skill",
+              "read_skill_file"
+            ],
+            "forbidTools": [
+              "save_to_knowledge_base",
+              "web_search"
+            ],
+            "calls": [
+              {
+                "tool": "load_skill",
+                "round": 1,
+                "input": {
+                  "name": "expense-review"
+                }
+              },
+              {
+                "tool": "read_skill_file",
+                "round": 2,
+                "input": {
+                  "skill": "expense-review",
+                  "filename": "报销额度标准.md"
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 3,
+            "minRounds": 3,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 10105,
+            "completionTokens": 543,
+            "latencyMs": 14085,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": [
+              "expense-review"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "skill-attachment-read-r2",
+        "probe": "skill",
+        "title": "只在附带文件里的规则",
+        "rubric": "必须给出「同一次出差累计不得超过 300 元」这条限制。这条规则只写在 expense-review 的附带文件《报销额度标准.md》里,知识库语料中没有——所以答不出它就说明附带文件没有被读到。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "回答准确引用了工具证据中《报销额度标准.md》的100元以下支出规则，包括单笔100元以下可用收款凭证替代发票，以及同一次出差累计不得超过300元的限制，完全符合评分标准要求。",
+        "judgeFailed": false,
+        "evidenceSteps": 2,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "报销时 100 元以下的支出可以不用发票吗?有什么额外限制?",
+            "answer": "\n我来帮您查询报销政策中关于100元以下支出的规定。首先加载相关的作业指导。\n\n根据作业指导，我需要先查看报销额度标准文件来了解具体的报销政策。让我读取附带的报销额度标准文件。\n\n根据报销额度标准，关于100元以下支出的报销规定如下：\n\n## 100元以下支出的发票要求\n\n**可以不用发票，但需要满足以下条件：**\n\n1. **单笔金额限制**：100元以下（不含100元）的支出可以用收款凭证替代发票\n2. **累计金额限制**：同一次出差中，100元以下的支出累计不得超过300元\n\n## 重要提醒\n\n- 如果单笔支出达到或超过100元，则必须提供正式发票\n- 100元以下的收款凭证需要包含：支出事由、金额、收款方信息等基本要素\n- 超过累计限额（300元）的部分仍需提供正式发票\n\n## 建议做法\n\n在实际报销时，建议：\n- 保留好所有100元以下支出的收款凭证\n- 在报销单上注明每笔支出的具体用途\n- 确保累计金额不超过300元的限制\n\n这样既能符合公司报销政策，又能确保报销流程顺利通过。",
+            "expectTools": [
+              "load_skill",
+              "read_skill_file"
+            ],
+            "forbidTools": [
+              "save_to_knowledge_base",
+              "web_search"
+            ],
+            "calls": [
+              {
+                "tool": "load_skill",
+                "round": 1,
+                "input": {
+                  "name": "expense-review"
+                }
+              },
+              {
+                "tool": "read_skill_file",
+                "round": 2,
+                "input": {
+                  "skill": "expense-review",
+                  "filename": "报销额度标准.md"
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 3,
+            "minRounds": 3,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 10104,
+            "completionTokens": 561,
+            "latencyMs": 10858,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": [
+              "expense-review"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

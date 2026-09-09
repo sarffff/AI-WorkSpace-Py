@@ -424,3 +424,234 @@ def test_索引紧贴用户问题且措辞不打架(db_real, monkeypatch):
     if "预先检索" in last_user:
         assert "load_skill" in last_user, "预检索指引没放行 load_skill，两条指令还在打架"
         assert "不算检索" in last_user
+
+
+# ========== 命中 skill 时给它让路 ==========
+#
+# 这一组钉住 SKILL_PREEMPTS_PREFETCH。它是**机制**层的改动:实测证明改措辞没用
+# （六次里零次成功），而把 use_rag 关掉之后 load_skill 立刻就调了。所以这里撤掉的
+# 是"资料已经在眼前"这个既成事实，不是再劝一遍模型。
+
+
+class _StubEmbedding:
+    """按预设分数回答相似度，不触网。
+
+    ``scores`` 按 skill 名给分。``calls`` 记下 embed_texts 被调了几次，
+    用来钉住描述向量的缓存真的生效了——不缓存的话每一轮都要为同一句话付一次钱。
+    """
+
+    def __init__(self, scores: dict[str, float]) -> None:
+        self.scores = scores
+        self.texts_calls = 0
+        self.query_calls = 0
+
+    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        self.texts_calls += 1
+        # 分数编码成**夹角**，不是长度。
+        #
+        # 余弦相似度把长度归一化掉了：[0.2, 0] 和 [1, 0] 指向同一个方向，相似度是
+        # 1.0 而不是 0.2。第一版这条替身就是这么写的，于是"不相关"的用例拿到了满分
+        # 相似度、预检索被误判成该跳过——测试报的错却是"用户消息里没有参考内容"，
+        # 离真正的原因隔着两层。
+        #
+        # 对 query=[1, 0] 来说，[s, sqrt(1-s²)] 的余弦正好是 s。
+        out = []
+        for text in texts:
+            name = text.split("：", 1)[0]
+            score = self.scores.get(name, 0.0)
+            out.append([score, (max(0.0, 1.0 - score * score)) ** 0.5])
+        return out
+
+    async def embed_query(self, query: str) -> list[float]:
+        self.query_calls += 1
+        return [1.0, 0.0]
+
+    @staticmethod
+    def cosine_similarity(a: list[float], b: list[float]) -> float:
+        from services.embedding_service import EmbeddingService
+
+        return EmbeddingService.cosine_similarity(a, b)
+
+
+def _write_skill(tmp_path, folder: str, **meta):
+    import os
+
+    d = tmp_path / folder
+    d.mkdir(parents=True, exist_ok=True)
+    front = "\n".join(f"{k}: {v}" for k, v in meta.items())
+    (d / "SKILL.md").write_text(
+        f"---\n{front}\n---\n照这个流程做。\n", encoding="utf-8"
+    )
+    return os.fspath(d)
+
+
+def test_相关时返回那份skill与分数(skills_dir, db_real):
+    from services import skill_service
+
+    skill_service.reset_vector_cache()
+    emb = _StubEmbedding({"expense": 0.9, "onboarding": 0.1})
+    got = run(
+        skill_service.most_relevant(
+            db_real, "w1", "帮我审一下这张报销单", embedding=emb
+        )
+    )
+    assert got is not None
+    name, score = got
+    assert name == "expense"
+    assert score > 0.8
+
+
+def test_没有skill时返回None不产生任何embedding调用(db_real, monkeypatch):
+    """没有 skill 就一次网络调用都不该发——否则每一轮白付一次 embedding。"""
+    from services import skill_library, skill_service
+
+    skill_service.reset_vector_cache()
+    monkeypatch.setattr(skill_library, "builtin", lambda: {})
+    emb = _StubEmbedding({})
+    assert run(skill_service.most_relevant(db_real, "w1", "随便问问", embedding=emb)) is None
+    assert emb.texts_calls == 0
+    assert emb.query_calls == 0
+
+
+def test_描述向量按内容缓存(skills_dir, db_real):
+    """同一份描述不该被反复向量化。问题向量每轮都要算，描述不用。"""
+    from services import skill_service
+
+    skill_service.reset_vector_cache()
+    emb = _StubEmbedding({"expense": 0.9})
+    for _ in range(3):
+        run(skill_service.most_relevant(db_real, "w1", "报销", embedding=emb))
+    assert emb.texts_calls == 1, "描述向量没有被缓存"
+    assert emb.query_calls == 3, "问题向量应当每轮都算"
+
+
+def test_命中时本轮不做预检索(skills_dir, db_real, monkeypatch):
+    """相关度过阈值时预检索不该发生——那份"资料已经在眼前"正是挡住 load_skill 的东西。
+
+    断言看的是**模型收到了什么**，不是内部标志:用户消息里不该出现预检索那段
+    参考内容，而知识库替身也不该被查过。
+    """
+    from conftest import FakeKnowledgeService, ScriptedAdapter, _seed_chat, collect
+    from services import skill_service
+    from services.chat_service import ChatService
+
+    skill_service.reset_vector_cache()
+    monkeypatch.setattr(settings, "RAG_PREFETCH", True)
+    monkeypatch.setattr(settings, "SKILL_PREEMPTS_PREFETCH", True)
+    monkeypatch.setattr(settings, "SKILL_PREEMPT_SIMILARITY", 0.45)
+    monkeypatch.setattr(settings, "AGENT_PLAN_MODE", "off")
+    monkeypatch.setattr(settings, "MEMORY_ENABLED", False)
+
+    adapter = ScriptedAdapter([{"text": "好"}])
+    service = ChatService(model_adapter=adapter)
+    knowledge = FakeKnowledgeService(context="【参考 1】来源: policy.md")
+    knowledge.embedding = _StubEmbedding({"expense": 0.9})
+    service._knowledge_service = knowledge
+    _seed_chat(db_real)
+
+    run(collect(service.stream_ai_response(db_real, "u1", "c1", "审报销单", use_rag=True)))
+
+    loop_calls = [c for c in adapter.calls if c["tools"]]
+    last_user = loop_calls[0]["messages"][-1]["content"]
+    assert "已预先从本地知识库检索" not in last_user
+    assert knowledge.search_queries == [], "预检索仍然发生了"
+    # 索引还在——让路的目的是让模型去读它
+    assert any(
+        "作业指导" in (m.get("content") or "") for m in loop_calls[0]["messages"]
+    )
+
+
+def test_不相关时照常预检索(skills_dir, db_real, monkeypatch):
+    """低于阈值就退回今天的行为。宁可漏判也不误判——废掉一次有价值的预检索更贵。"""
+    from conftest import FakeKnowledgeService, ScriptedAdapter, _seed_chat, collect
+    from services import skill_service
+    from services.chat_service import ChatService
+
+    skill_service.reset_vector_cache()
+    monkeypatch.setattr(settings, "RAG_PREFETCH", True)
+    monkeypatch.setattr(settings, "SKILL_PREEMPTS_PREFETCH", True)
+    monkeypatch.setattr(settings, "SKILL_PREEMPT_SIMILARITY", 0.45)
+    monkeypatch.setattr(settings, "AGENT_PLAN_MODE", "off")
+    monkeypatch.setattr(settings, "MEMORY_ENABLED", False)
+
+    # 多给几轮脚本：预检索会先发一次"改写检索问题"的辅助调用，
+    # 它也从同一个脚本里取，只给一轮的话循环那次就没得取了。
+    adapter = ScriptedAdapter([{"text": "好"}, {"text": "好"}, {"text": "好"}])
+    service = ChatService(model_adapter=adapter)
+    knowledge = FakeKnowledgeService(context="【参考 1】来源: policy.md")
+    # 0.2 远低于阈值：问的是完全不相干的事
+    knowledge.embedding = _StubEmbedding({"expense": 0.2})
+    service._knowledge_service = knowledge
+    _seed_chat(db_real)
+
+    run(collect(service.stream_ai_response(db_real, "u1", "c1", "年假几天", use_rag=True)))
+
+    loop_calls = [c for c in adapter.calls if c["tools"]]
+    assert "已预先从本地知识库检索" in loop_calls[0]["messages"][-1]["content"]
+    assert knowledge.search_queries, "预检索被误伤了"
+
+
+def test_开关关着时永不让路(skills_dir, db_real, monkeypatch):
+    """默认关闭。这条钉住"漏配开关不会静默改变行为"。"""
+    from conftest import FakeKnowledgeService, ScriptedAdapter, _seed_chat, collect
+    from services import skill_service
+    from services.chat_service import ChatService
+
+    skill_service.reset_vector_cache()
+    monkeypatch.setattr(settings, "RAG_PREFETCH", True)
+    monkeypatch.setattr(settings, "SKILL_PREEMPTS_PREFETCH", False)
+    monkeypatch.setattr(settings, "AGENT_PLAN_MODE", "off")
+    monkeypatch.setattr(settings, "MEMORY_ENABLED", False)
+
+    # 多给几轮脚本：预检索会先发一次"改写检索问题"的辅助调用，
+    # 它也从同一个脚本里取，只给一轮的话循环那次就没得取了。
+    adapter = ScriptedAdapter([{"text": "好"}, {"text": "好"}, {"text": "好"}])
+    service = ChatService(model_adapter=adapter)
+    knowledge = FakeKnowledgeService(context="【参考 1】来源: policy.md")
+    knowledge.embedding = _StubEmbedding({"expense": 0.99})
+    service._knowledge_service = knowledge
+    _seed_chat(db_real)
+
+    run(collect(service.stream_ai_response(db_real, "u1", "c1", "审报销单", use_rag=True)))
+
+    assert knowledge.search_queries, "开关关着却跳过了预检索"
+
+
+def test_相关性判断出错时退回预检索(skills_dir, db_real, monkeypatch):
+    """这是个优化，不是功能。它挂掉不该让整个回合挂掉。"""
+    from conftest import FakeKnowledgeService, ScriptedAdapter, _seed_chat, collect
+    from services import skill_service
+    from services.chat_service import ChatService
+
+    skill_service.reset_vector_cache()
+    monkeypatch.setattr(settings, "RAG_PREFETCH", True)
+    monkeypatch.setattr(settings, "SKILL_PREEMPTS_PREFETCH", True)
+    monkeypatch.setattr(settings, "AGENT_PLAN_MODE", "off")
+    monkeypatch.setattr(settings, "MEMORY_ENABLED", False)
+
+    class _Boom:
+        async def embed_texts(self, texts):
+            raise RuntimeError("embedding down")
+
+        async def embed_query(self, query):
+            raise RuntimeError("embedding down")
+
+        @staticmethod
+        def cosine_similarity(a, b):
+            return 0.0
+
+    # 多给几轮脚本：预检索会先发一次"改写检索问题"的辅助调用，
+    # 它也从同一个脚本里取，只给一轮的话循环那次就没得取了。
+    adapter = ScriptedAdapter([{"text": "好"}, {"text": "好"}, {"text": "好"}])
+    service = ChatService(model_adapter=adapter)
+    knowledge = FakeKnowledgeService(context="【参考 1】来源: policy.md")
+    knowledge.embedding = _Boom()
+    service._knowledge_service = knowledge
+    _seed_chat(db_real)
+
+    events = run(
+        collect(service.stream_ai_response(db_real, "u1", "c1", "审报销单", use_rag=True))
+    )
+
+    assert any(e["type"] == "message_delta" for e in events), "回合挂掉了"
+    assert knowledge.search_queries, "没有退回预检索"

@@ -41,7 +41,17 @@ const SIGNALS: Record<string, SignalSpec> = {
     // 空数组要显眼：索引每轮都注入进去了，模型一个都没调。
     render: (v) => (Array.isArray(v) && v.length === 0 ? "无" : list(v)),
     warn: (v) => Array.isArray(v) && v.length === 0,
-    hint: "索引注入了但一个都没调——按仓库历史，这种失效改措辞不管用",
+    hint: "索引注入了但一个都没调——先看下面有没有「让路给 skill」，没有的话就是预检索挡住了",
+  },
+  skill_preempted: {
+    label: "让路给 skill",
+    // 这一轮为了让模型自己去读索引而没做预检索。和 skills_loaded 一起看：
+    // 让了路却还是没加载，才是真的失效；没让路而没加载，是预检索挡住了。
+    render: (v) => String(v),
+  },
+  skill_similarity: {
+    label: "相关度",
+    render: (v) => String(v),
   },
   budget_reclaimed: {
     label: "预算回收",

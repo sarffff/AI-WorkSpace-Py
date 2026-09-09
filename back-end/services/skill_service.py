@@ -104,6 +104,81 @@ def build_index_block(db: Session, workspace_id: str) -> str:
     return "\n".join(lines)
 
 
+# ========== 相关性：这一轮该不该给 skill 让路 ==========
+
+# skill 描述的向量缓存。key 是 (skill 名, 描述的哈希)——描述变了就自然换 key，
+# 不需要显式失效。skill 的数量是几十条量级，且描述很短，常驻内存没有压力。
+#
+# 不按 workspace_id 分桶:同一份内置 skill 在每个工作区的描述是同一句话,
+# 按工作区分会把同一个向量算 N 遍。
+_DESCRIPTION_VECTORS: dict[tuple[str, int], list[float]] = {}
+
+
+async def most_relevant(
+    db: Session,
+    workspace_id: str,
+    question: str,
+    *,
+    embedding: Any,
+) -> tuple[str, float] | None:
+    """和这个问题最相关的那份 skill，以及相似度。没有 skill 时返回 None。
+
+    ## 这个函数只回答"要不要让路"，不回答"该用哪份"
+
+    它的返回值只被用来决定**本轮跳不跳过预检索**。挑哪一份、要不要真的加载，
+    仍然是模型看着索引自己调 ``load_skill`` 决定的——那是刻意保留的分工:
+    框架来判断"该用哪份 SOP"的话，判错比不加载更糟（照着错误的流程办事，
+    而输出看起来一样合理）。
+
+    ## 为什么用向量而不是关键词
+
+    中文分词在这件事上不可靠:「审报销单」和「报销单审核」共享的字很多，
+    而「发票能不能不开」和「报销额度标准」几乎不共享字，但后者才是同一件事。
+    描述本来就是一句话，向量化很便宜，而 embedding 走的是免费模型（见
+    model_prices.json 里 bge-m3 那条）。
+
+    描述向量按内容缓存;问题向量每轮算一次——这是唯一的新增成本。
+    """
+    skills = available(db, workspace_id)
+    if not skills:
+        return None
+
+    ordered = sorted(skills)
+    missing = [
+        name
+        for name in ordered
+        if (name, hash(skills[name].description)) not in _DESCRIPTION_VECTORS
+    ]
+    if missing:
+        # 描述连着名字一起向量化。只用描述的话，名字里带的信息（"expense-review"）
+        # 就丢了，而 admin 起的名字往往比描述更贴题。
+        texts = [f"{skills[name].name}：{skills[name].description}" for name in missing]
+        vectors = await embedding.embed_texts(texts)
+        for name, vector in zip(missing, vectors):
+            _DESCRIPTION_VECTORS[(name, hash(skills[name].description))] = vector
+
+    question_vector = await embedding.embed_query(question)
+    if not question_vector:
+        return None
+
+    best: tuple[str, float] | None = None
+    for name in ordered:
+        vector = _DESCRIPTION_VECTORS.get((name, hash(skills[name].description)))
+        if not vector:
+            continue
+        score = embedding.cosine_similarity(question_vector, vector)
+        if best is None or score > best[1]:
+            best = (name, score)
+    return best
+
+
+def reset_vector_cache() -> None:
+    """清掉描述向量缓存。给测试用——描述哈希已经保证了正确性，
+    但用例之间共享缓存会让"第几次调用 embed_texts"这类断言互相干扰。
+    """
+    _DESCRIPTION_VECTORS.clear()
+
+
 # ========== CRUD ==========
 
 
@@ -223,5 +298,7 @@ __all__ = [
     "build_index_block",
     "delete",
     "list_for_admin",
+    "most_relevant",
+    "reset_vector_cache",
     "upsert",
 ]

@@ -73,6 +73,10 @@ _BASE: dict[str, Any] = {
     "TOOL_FS_WRITE_ENABLED": False,
     "TOOL_FS_DELETE_ENABLED": False,
     "SKILL_ENABLED": False,
+    # 让路开关也要写死。它只在 SKILL_ENABLED 打开时才有效，但漏掉的话
+    # baseline 会跟着本地 .env 走——而它改变的是"模型看到了什么材料"，
+    # 那是这套评估里最不该串的东西。
+    "SKILL_PREEMPTS_PREFETCH": False,
     # ---- 跨回合记忆 ----
     "TOOL_HISTORY_ENABLED": True,
     "TOOL_HISTORY_TOKEN_BUDGET": 600,
@@ -352,6 +356,14 @@ AGENT_VARIANTS: dict[str, AgentVariant] = {
             # 而数据集里的提问是我们写的，开着它量到的是夹具的措辞，不是模型的判断。
             "TOOL_FS_DELETE_ENABLED": False,
             "SKILL_ENABLED": True,
+            # 命中 skill 的那一轮跳过预检索。必须显式写死:它直接改变模型看到的
+            # 材料（预检索那段在不在），也就直接改变工具选择与轮次。
+            #
+            # 2026-09-06 开。改措辞那条路已经试过并失败(load_skill 仍然一次不调),
+            # 这是唯一被对照实验证明有效的杠杆——同一条用例把 use_rag 关掉之后
+            # load_skill 与 read_skill_file 立刻都调了。
+            "SKILL_PREEMPTS_PREFETCH": True,
+            "SKILL_PREEMPT_SIMILARITY": 0.45,
             "PROMPT_CHAT_SYSTEM_VERSION": "v8-skills",
             # 文件任务比知识库任务更耗轮次（列目录 → 读 → 再读），6 轮会把
             # 多步任务卡在中途，而那看起来像"模型没做完"。线上就是 10。

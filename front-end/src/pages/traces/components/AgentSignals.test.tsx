@@ -90,6 +90,29 @@ describe("partitionAttributes", () => {
     expect(signals[0].warn).toBe(true);
   });
 
+  it("让路给 skill 与相关度都抬成命名行", () => {
+    const { signals, rest } = partitionAttributes({
+      skill_preempted: "expense-review",
+      skill_similarity: 0.72,
+    });
+    const keys = signals.map((x) => x.key);
+    expect(keys).toContain("skill_preempted");
+    expect(keys).toContain("skill_similarity");
+    // 这两个键是 2026-09-06 才加的；漏掉映射时它们会掉进 rest 被原样打印
+    expect(rest).toEqual({});
+  });
+
+  it("让了路却还是没加载才是真失效", () => {
+    // 两个键一起出现时，读的人要能分清是"预检索挡住了"还是"让了路也没用"
+    const { signals } = partitionAttributes({
+      skills_loaded: [],
+      skill_preempted: "expense-review",
+    });
+    const loaded = signals.find((x) => x.key === "skills_loaded");
+    expect(loaded?.warn).toBe(true);
+    expect(signals.find((x) => x.key === "skill_preempted")).toBeTruthy();
+  });
+
   it("展示顺序固定，不跟着后端 JSON 的键序变", () => {
     const a = partitionAttributes({ rounds: 1, skills_loaded: ["x"] });
     const b = partitionAttributes({ skills_loaded: ["x"], rounds: 1 });
