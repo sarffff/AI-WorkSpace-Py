@@ -92,7 +92,15 @@ class _ToolResultBudget:
     def take(self, text: str) -> str:
         limit = min(self._per_call, self._remaining)
         if limit <= 0:
-            return "[上下文预算已用尽，工具结果未注入。请基于已获得的信息直接回答。]"
+            # 后半句和工具失败那条同一个理由（见 tool_runtime._NO_FABRICATION）:
+            # 这个分支下模型拿到的结果正文是**空的**，只说"基于已获得的信息回答"
+            # 等于请它把缺口自己填上。这里比那边更该说——那边至少还有一句失败原因，
+            # 这边模型连工具跑出了什么都不知道。
+            return (
+                "[上下文预算已用尽，工具结果未注入。请基于已获得的信息直接回答；"
+                "如果关键事实恰好在这次没能注入的结果里，直接说明拿不到，"
+                "不要用记忆里的数字或名称替代。]"
+            )
         if len(text) <= limit:
             self._remaining -= len(text)
             return text

@@ -14,6 +14,28 @@ logger = logging.getLogger("tool_runtime")
 ToolHandler = Callable[[dict[str, Any]], Awaitable[str]]
 
 
+# 工具失败时补在结果后面的一句。
+#
+# 2026-09-06 加。起因是评估里 recovery-search-down 那条:web_search 故障之后模型
+# **编了一个汇率**（"通常在 6.3-6.8 之间，假设 6.5"）再拿它算出 6500。同配置
+# 重复跑时它有时正确拒绝、有时编，所以那条用例在 1.0~5.0 之间摆。
+#
+# 原来的失败消息只说"直接基于已有信息回答"。当那次检索**就是唯一的信息来源**时，
+# 这句话读起来就是"那你直接答吧"——于是模型从参数记忆里补上了缺的那个数。
+# 也就是说旧措辞在主动邀请这件事。
+#
+# 这和这个仓库里六次失败的措辞改动不是一类：那些试图让模型**多做**一件事
+# （调工具、提问），而这里是**撤掉一句邀请**。但它仍然是措辞，仍然要被度量——
+# fabricatedToolOutput 就是那个判据。
+#
+# 放在工具结果里而不是系统提示词里：位置紧贴失败本身。本轮的实测正好支持这一点
+# ——预检索那句话之所以压倒 skill 索引，就是因为它离用户问题更近。
+_NO_FABRICATION = (
+    "注意：如果缺的正是这次没查到的事实，就直接说明查不到，"
+    "不要用记忆里的数字、日期或名称替代——给一个听起来合理的值比说查不到更糟。"
+)
+
+
 class ToolStatus(str, Enum):
     """工具执行结果的分级,决定 Agent 循环该如何继续。"""
 
@@ -251,7 +273,8 @@ class ToolRuntime:
             # 发出的调用。拦下并说明，而不是让它真的跑一遍。
             return ToolResult(
                 f"工具调用失败：{call.name} 在本轮已因连续失败被熔断，不再执行。"
-                "请换用其他工具，或基于已有信息直接回答。",
+                "请换用其他工具，或基于已有信息直接回答。"
+                + _NO_FABRICATION,
                 ToolStatus.UNAVAILABLE,
             )
 
@@ -270,7 +293,7 @@ class ToolRuntime:
             self._breaker.note(call.name, ToolStatus.UNAVAILABLE)
             return ToolResult(
                 f"工具调用失败：{call.name} 暂时不可用。请不要重试该工具，"
-                f"直接基于已有信息回答。",
+                f"直接基于已有信息回答。" + _NO_FABRICATION,
                 ToolStatus.UNAVAILABLE,
             )
 

@@ -329,3 +329,19 @@ def test_所有bool开关都被钉成代码默认值():
         "这些 bool 开关在测试里没有被钉成 config.py 的默认值，"
         f"结果会取决于谁的 .env：{mismatched}"
     )
+
+
+def test_预算用尽时也禁止用记忆顶替():
+    """预算用尽这个分支下模型拿到的正文是**空的**，比工具失败更该说这句话。
+
+    工具失败至少还带一句失败原因；这里模型连工具跑出了什么都不知道，
+    只说"基于已获得的信息回答"就是请它自己把缺口填上。
+    见 tool_runtime._NO_FABRICATION 那段注释。
+    """
+    from services.chat_service import _ToolResultBudget
+
+    budget = _ToolResultBudget(total=0, per_call=100)
+    message = budget.take("这段内容一个字都进不去")
+
+    assert "预算已用尽" in message
+    assert "不要用记忆里的数字" in message
