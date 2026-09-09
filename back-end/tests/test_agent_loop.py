@@ -212,9 +212,16 @@ def test_prefetch_injects_context_and_tells_model_not_to_search_again(db, monkey
     messages = adapter.calls[0]["messages"]
     assert "已预先从本地知识库检索" in messages[-1]["content"]
     assert "预算多少" in messages[-1]["content"]
-    # 约束随参考内容一起送达，而不是待在系统提示词里
-    assert "不要重复检索" in messages[-1]["content"]
-    assert "不要重复检索" not in messages[0]["content"]
+    # 约束随参考内容一起送达，而不是待在系统提示词里。
+    #
+    # 断言的是**意思**而不是原句。2026-09-06 那次改动把"不要重复检索"换成了
+    # "不必再检索知识库"并补了一句"加载作业指导不算检索"——原来那句把 skill 一起
+    # 挡掉了（评估实测 load_skill 一次没被调，见 test_skill_tools 里那条相邻性
+    # 用例）。钉死原句会让这条测试在"约束还在、只是换了说法"时也变红。
+    assert "不必再检索" in messages[-1]["content"]
+    assert "不必再检索" not in messages[0]["content"]
+    # 收窄的范围只针对检索：加载作业指导必须被明确放行，否则两条指令互相打架
+    assert "load_skill" in messages[-1]["content"]
     assert knowledge.search_queries == ["预算多少"]
 
 

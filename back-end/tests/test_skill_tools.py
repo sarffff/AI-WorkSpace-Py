@@ -357,3 +357,70 @@ def test_skill工具出现在工具面里(db, monkeypatch):
 
     # conftest 的 ScriptedAdapter 记的已经是工具名
     assert "load_skill" in adapter.calls[0]["tools"]
+
+
+def test_索引紧贴用户问题且措辞不打架(db_real, monkeypatch):
+    """索引必须是**最后一条 system**、就在用户消息上面,而且预检索那句话要放行它。
+
+    2026-09-06 实测逼出来的:索引原来隔着整段对话,而预检索的"不必再检索"贴在
+    问题正上方,模型照了更近的那条,45 条用例跑完 load_skill 一次没调。
+
+    两条断言分别钉住这次改动的两半:
+      - 位置:用户消息里写着"上面的清单",不相邻的话那句话在说谎;
+      - 措辞:预检索的指引必须明确"加载作业指导不算检索",否则两条指令还在打架。
+    """
+    from conftest import (
+        FakeKnowledgeService,
+        ScriptedAdapter,
+        _seed_chat,
+        collect,
+        run,
+    )
+    from services import skill_service
+    from services.chat_service import ChatService
+
+    monkeypatch.setattr(settings, "SKILL_ENABLED", True)
+    monkeypatch.setattr(settings, "RAG_PREFETCH", True)
+    monkeypatch.setattr(settings, "PROMPT_CACHE_STABLE_PREFIX", True)
+    # 规划和记忆各自会多发几次**辅助**调用（改写检索问题、拆步骤），那些调用的
+    # messages 里没有工具面也没有索引。关掉它们，剩下的就只有循环本身那一次。
+    monkeypatch.setattr(settings, "AGENT_PLAN_MODE", "off")
+    monkeypatch.setattr(settings, "MEMORY_ENABLED", False)
+    monkeypatch.setattr(
+        skill_service,
+        "build_index_block",
+        lambda db_, workspace_id: "[可用的作业指导（skill）]\n- probe-skill：夹具",
+    )
+
+    adapter = ScriptedAdapter([{"text": "好"}])
+    service = ChatService(model_adapter=adapter)
+    # 让预检索真的命中，否则那段指引根本不会出现
+    service._knowledge_service = FakeKnowledgeService(context="报销上限是 600 元")
+
+    # 必须先攒出历史，所以用 db_real 而不是 FakeDB（后者的历史查询恒空）。
+    # 空历史下"索引在 memory 之后"和"索引在用户消息之前"会拼出**完全相同**的
+    # 一串 messages，这条用例就分不出位置有没有改——反向验证时第一版正是这么假绿的。
+    _seed_chat(db_real)
+
+    run(
+        collect(
+            service.stream_ai_response(db_real, "u1", "c1", "住宿能报多少", use_rag=True)
+        )
+    )
+
+    # 认循环那一次调用：辅助调用（改写检索问题等）拿不到工具面。
+    # 不能用 calls[0]——预检索会先发一次改写调用，那一次的 messages 里
+    # 既没有索引也没有用户问题，断言会在一个不相干的消息串上跑。
+    loop_calls = [c for c in adapter.calls if c["tools"]]
+    assert loop_calls, "没有带工具面的调用，循环压根没跑起来"
+    messages = loop_calls[0]["messages"]
+    assert messages[-1]["role"] == "user"
+    # 索引是紧挨着用户消息的那一条
+    assert messages[-2]["role"] == "system"
+    assert "作业指导" in messages[-2]["content"]
+
+    # 预检索的指引必须给 load_skill 开口子
+    last_user = messages[-1]["content"]
+    if "预先检索" in last_user:
+        assert "load_skill" in last_user, "预检索指引没放行 load_skill，两条指令还在打架"
+        assert "不算检索" in last_user
