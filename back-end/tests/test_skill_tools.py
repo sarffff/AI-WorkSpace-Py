@@ -655,3 +655,44 @@ def test_相关性判断出错时退回预检索(skills_dir, db_real, monkeypatc
 
     assert any(e["type"] == "message_delta" for e in events), "回合挂掉了"
     assert knowledge.search_queries, "没有退回预检索"
+
+
+def test_默认阈值把实测过的误判挡在外面(monkeypatch):
+    """阈值的默认值必须挡住实测过的那几条误判。
+
+    2026-09-09 在 33 条真实问题上量过一次真实 embedding。0.45（第一版拍的值）
+    误判 5 条，其中两条最说明问题:
+
+      - 「生产环境怎么申请权限」  0.4522
+      - 「把『报销』翻译成英文」  0.5095
+
+    两者都跟报销流程无关，却把那一轮的预检索毁掉了。0.58 是误判归零的最低点。
+
+    **这把尺子是钝的**：同一批数据里「接口报错帮我解释」拿到 0.5489，而
+    「住宿一共能报多少」只有 0.5211——排序本身就是错的。所以这条用例钉的不是
+    "阈值正确"，而是"别再退回那个已经被证伪的值"。
+
+    真实分数写在这里当文档：它们来自一次真实 embedding 调用，重跑要花钱，
+    而这几个数是当初做决定的全部依据。
+    """
+    from config import settings as live
+
+    # 实测样本：(相似度, 是不是真的报销话题)
+    measured = [
+        (0.4522, False),  # 生产环境怎么申请权限
+        (0.5095, False),  # 把「报销」「差旅」翻译成英文
+        (0.5489, False),  # 接口报错帮我解释
+        (0.5605, False),  # 供应商对账争议
+        (0.5734, False),  # 客户名单存知识库
+        (0.6093, True),   # skill-attachment-read
+        (0.6637, True),   # skill-expense-order
+        (0.6879, True),   # write-requested（整理报销时限）
+    ]
+    threshold = live.model_fields["SKILL_PREEMPT_SIMILARITY"].default
+
+    false_positives = [s for s, ok in measured if not ok and s >= threshold]
+    assert not false_positives, (
+        f"默认阈值 {threshold} 会误判这些无关问题：{false_positives}"
+    )
+    # 两条真正的 skill 用例必须仍然过线，否则上一轮量到的收益就没了
+    assert 0.6093 >= threshold and 0.6637 >= threshold

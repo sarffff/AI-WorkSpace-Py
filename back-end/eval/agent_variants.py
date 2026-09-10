@@ -363,7 +363,7 @@ AGENT_VARIANTS: dict[str, AgentVariant] = {
             # 这是唯一被对照实验证明有效的杠杆——同一条用例把 use_rag 关掉之后
             # load_skill 与 read_skill_file 立刻都调了。
             "SKILL_PREEMPTS_PREFETCH": True,
-            "SKILL_PREEMPT_SIMILARITY": 0.45,
+            "SKILL_PREEMPT_SIMILARITY": 0.58,
             "PROMPT_CHAT_SYSTEM_VERSION": "v8-skills",
             # 文件任务比知识库任务更耗轮次（列目录 → 读 → 再读），6 轮会把
             # 多步任务卡在中途，而那看起来像"模型没做完"。线上就是 10。

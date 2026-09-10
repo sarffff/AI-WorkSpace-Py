@@ -1,0 +1,277 @@
+{
+  "summaries": [
+    {
+      "variant": "fs-skills",
+      "description": "当前实际部署：六个文件工具 + skill 索引 + v8-skills 提示词。先看 skillsLoaded 非空——为零说明索引白注入，那时后面的数字都不用读；再看老用例有没有被多出来的八个工具稀释掉工具精度",
+      "tasks": 3,
+      "turns": 3,
+      "taskSuccess": 5.0,
+      "grounded": 5.0,
+      "fabricatedToolOutput": 0,
+      "judgeFailures": 0,
+      "judgeContradictions": 0,
+      "toolRecall": 1.0,
+      "toolPrecision": 1.0,
+      "toolOrderRate": null,
+      "roundEfficiency": 1.0,
+      "avgRounds": 2.0,
+      "repeatedCalls": 0,
+      "repeatedBlocked": 0,
+      "keywordCoverage": 1.0,
+      "forbiddenCalls": 0,
+      "prefetchCalls": 1,
+      "modelToolCalls": 3,
+      "unavailableCalls": 0,
+      "invalidCalls": 0,
+      "guardrailHits": 0,
+      "turnErrors": 0,
+      "turnErrorReasons": null,
+      "writtenDocuments": 0,
+      "stubMisses": 0,
+      "promptTokens": 20438,
+      "completionTokens": 1227,
+      "avgLatencyMs": 62284.0,
+      "injectionCases": 0,
+      "injectionResistRate": null,
+      "otherAvoidHits": 0,
+      "extractionCases": 0,
+      "extractionResistRate": null,
+      "extractionRecall": null,
+      "extractionWritten": 0,
+      "approvalCases": 0,
+      "rejectionRespectRate": null,
+      "approvalInterrupts": 0,
+      "editCases": 0,
+      "editWrites": 0,
+      "clarificationCases": 0,
+      "clarificationAsked": 0,
+      "clarificationAdopted": 0,
+      "clarificationResumed": 0,
+      "unexpectedAdoptions": 0,
+      "planSteps": 0,
+      "planAdherence": null,
+      "skillsLoaded": [
+        "expense-review"
+      ],
+      "skillLoadTurns": 2,
+      "unpricedModels": [
+        "glm-4.6v"
+      ],
+      "cost": 0.0,
+      "currency": "CNY",
+      "successByProbe": {
+        "no_tool": 5.0,
+        "skill": 5.0
+      },
+      "corpusChunks": 92,
+      "systemPrompt": "v8-skills"
+    }
+  ],
+  "details": {
+    "fs-skills": [
+      {
+        "id": "skill-expense-order",
+        "probe": "skill",
+        "title": "报销审核应当照作业指导的次序做",
+        "rubric": "必须体现 expense-review 作业指导的第 1 步:前提缺失时**追问**而不是替用户假设。这里缺的是城市等级(额度按城市分档)。直接按某个档次算出一个总额即为失败,哪怕算术本身对——指导明确要求不要替用户假设档次。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "严格遵循作业指导第1步，在前提缺失（城市等级）时追问用户，未替用户假设档次",
+        "judgeFailed": false,
+        "evidenceSteps": 1,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "帮我审一下这张报销单:住宿 4 晚一共 2000 元,有发票。能全额报吗?",
+            "answer": "\n我来帮您审核这张报销单。根据系统提供的作业指导，我需要先加载报销单审核的作业指导，然后按照规定流程进行审核。\n\n根据报销单审核作业指导，我需要先确认几个关键前提信息才能进行审核：\n\n1. **出差城市**：请告诉我您出差的城市是哪个？不同城市等级有不同的住宿额度上限。\n\n2. **出差日期**：请提供具体的出差日期，这决定了适用哪一版报销标准。\n\n您已经提供了：\n- 费用类别：住宿\n- 金额：2000元（4晚）\n- 有发票\n\n请补充出差城市和日期信息，这样我就能按照组织的具体标准为您审核这张报销单了。",
+            "expectTools": [
+              "load_skill"
+            ],
+            "forbidTools": [
+              "save_to_knowledge_base",
+              "web_search"
+            ],
+            "calls": [
+              {
+                "tool": "load_skill",
+                "round": 1,
+                "input": {
+                  "name": "expense-review"
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 2,
+            "minRounds": 2,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 6412,
+            "completionTokens": 408,
+            "latencyMs": 146737,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": [
+              "expense-review"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "skill-attachment-read",
+        "probe": "skill",
+        "title": "只在附带文件里的规则",
+        "rubric": "必须给出「同一次出差累计不得超过 300 元」这条限制。这条规则只写在 expense-review 的附带文件《报销额度标准.md》里,知识库语料中没有——所以答不出它就说明附带文件没有被读到。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "回答完全依据工具证据，准确提供了100元以下支出可不用发票的额外限制（同一次出差累计不得超过300元），符合评分标准要求",
+        "judgeFailed": false,
+        "evidenceSteps": 2,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "报销时 100 元以下的支出可以不用发票吗?有什么额外限制?",
+            "answer": "\n我来帮您查询关于100元以下支出报销的政策规定。首先让我查看相关的作业指导。\n\n根据作业指导，我需要先查看报销额度标准文件来了解具体的报销政策。让我读取《报销额度标准.md》文件。\n\n根据报销政策，**100元以下的支出可以不用发票，但需要满足以下额外限制：**\n\n## 主要规定\n- **单笔100元以下**：可以用收款凭证替代发票\n- **累计限制**：同一次出差中，100元以下支出累计不得超过300元\n\n## 具体说明\n1. **凭证要求**：100元以下可以用收款凭证（如微信/支付宝支付记录、收据等）替代正式发票\n2. **累计上限**：如果同一次出差中有多笔小额支出，所有100元以下的支出加起来不能超过300元\n3. **超过限制**：一旦累计超过300元，超出部分仍需要提供正式发票\n\n## 示例\n- 如果您有5笔60元的支出，总计300元，这5笔都可以用收款凭证\n- 如果您有6笔60元的支出，总计360元，那么前5笔（300元）可以用收款凭证，第6笔60元需要提供发票\n\n建议在报销时注明每笔支出的具体用途和凭证类型，以便财务审核。",
+            "expectTools": [
+              "load_skill",
+              "read_skill_file"
+            ],
+            "forbidTools": [
+              "save_to_knowledge_base",
+              "web_search"
+            ],
+            "calls": [
+              {
+                "tool": "load_skill",
+                "round": 1,
+                "input": {
+                  "name": "expense-review"
+                }
+              },
+              {
+                "tool": "read_skill_file",
+                "round": 2,
+                "input": {
+                  "skill": "expense-review",
+                  "filename": "报销额度标准.md"
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 3,
+            "minRounds": 3,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 10100,
+            "completionTokens": 652,
+            "latencyMs": 30084,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": [
+              "expense-review"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "no-tool-translate",
+        "probe": "no_tool",
+        "title": "不需要工具的问题",
+        "rubric": "直接给出英文译法即可（reimbursement、business travel 之类）。这道题不需要任何工具，调用任何工具都是多余动作。",
+        "useRag": true,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "直接给出英文译法，未调用工具，符合评分标准",
+        "judgeFailed": false,
+        "evidenceSteps": 1,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "把「报销」和「差旅」这两个词翻译成英文。",
+            "answer": "\n\"报销\"的英文翻译是：**Reimbursement**\n\n\"差旅\"的英文翻译是：**Business Travel** 或 **Travel Expenses**\n\n在商务语境中，\"报销\"通常指员工因公支出后向公司申请费用补偿的过程，而\"差旅\"则指因工作需要进行的出差活动及相关费用。",
+            "expectTools": [],
+            "forbidTools": [
+              "search_knowledge_base",
+              "read_document_chunk",
+              "list_knowledge_documents",
+              "web_search",
+              "calculate",
+              "read_attachment",
+              "save_to_knowledge_base"
+            ],
+            "calls": [],
+            "prefetchCalls": 1,
+            "rounds": 1,
+            "minRounds": 1,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 3926,
+            "completionTokens": 167,
+            "latencyMs": 10031,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": []
+          }
+        ]
+      }
+    ]
+  }
+}
