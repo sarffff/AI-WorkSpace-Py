@@ -227,6 +227,22 @@ class AgentTask:
     # 路径用 `{workspace}` 占位符写进 question，和附件那边 `{attachment}`
     # 同一个理由：绝对路径写死在数据集里，换台机器就不存在了。
     workspace_files: dict[str, str] = field(default_factory=dict)
+    # 跑完之后**磁盘上应该是什么样**，`{"相对路径": "期望内容"}`。
+    # 值为 ``None`` 表示这个文件不该存在（删除类用例用它）。
+    #
+    # 为什么需要它：其余所有判据看的都是**模型说了什么**——答案文本、工具调用序列、
+    # 裁判的印象。写操作是唯一会改变工作区状态的动作，而"它说写好了"和"文件真的
+    # 变成了那样"是两件事。差一点的情形不是模型撒谎，是路径拼错、写到了别的地方、
+    # 或者 content 被截断——三种都会让答案看起来完全正常。
+    #
+    # 比对时两边都 strip：模型给的内容结尾多不多一个换行不是判据。
+    workspace_after: dict[str, str | None] = field(default_factory=dict)
+    # 断言磁盘之前，先把最近一份备份恢复回去。
+    #
+    # 这是**用户**的动作（界面上那个"恢复"按钮），不是模型能调的工具，所以只能由
+    # 框架代做。它测的是那条真实链路：模型覆盖写 → 留下旧版本 → 用户后悔 → 放回去。
+    # 配合 workspace_after 写"恢复之后应该等于原始内容"。
+    restore_latest: bool = False
 
 
 def load_tasks(limit: int | None = None, path: str | None = None) -> list[AgentTask]:
@@ -293,6 +309,13 @@ def load_tasks(limit: int | None = None, path: str | None = None) -> list[AgentT
                             raw.get("workspace_files") or {}
                         ).items()
                     },
+                    workspace_after={
+                        str(name): (None if content is None else str(content))
+                        for name, content in (
+                            raw.get("workspace_after") or {}
+                        ).items()
+                    },
+                    restore_latest=bool(raw.get("restore_latest", False)),
                 )
             )
     return tasks[:limit] if limit else tasks
@@ -367,6 +390,9 @@ class TaskResult:
     stub_queries: list[str]
     stub_misses: list[str]
     evidence_steps: int
+    # 磁盘状态和 workspace_after 不符的地方。空列表 = 一致（或没声明）。
+    # 非空时它必须进裁判的证据，否则裁判会按答案文本给一个满分。
+    file_state_errors: list[str] = field(default_factory=list)
     # 只有 extraction 类任务非空
     extraction: ExtractionOutcome | None = None
 
@@ -726,6 +752,57 @@ def _error_reasons(
     if len(ordered) > limit:
         out_lines.append(f"…另有 {len(ordered) - limit} 种")
     return out_lines
+
+
+def _check_workspace_after(
+    db: Any, task: AgentTask, workspace: str
+) -> list[str]:
+    """比对磁盘的真实状态与 ``workspace_after``，返回不符之处。
+
+    ``restore_latest`` 为真时先替用户点一次"恢复"——那是界面上的动作，模型调不到，
+    只能由框架代做。顺序不能反：恢复之后的状态才是这类用例要断言的东西。
+    """
+    errors: list[str] = []
+
+    if task.restore_latest:
+        from services import fs_backup
+
+        rows = fs_backup.list_for_user(db, EVAL_USER_ID)
+        if not rows:
+            # 这本身就是失败:声明了要恢复,却根本没留下旧版本
+            errors.append("restore_latest: 没有任何可恢复的备份")
+        else:
+            try:
+                fs_backup.restore(db, EVAL_USER_ID, rows[0]["id"])
+            except Exception as exc:
+                errors.append(f"restore_latest: 恢复失败 {type(exc).__name__}: {exc}")
+
+    for rel, expected in task.workspace_after.items():
+        target = os.path.normpath(os.path.join(workspace, rel))
+        if not (target == workspace or target.startswith(workspace + os.sep)):
+            errors.append(f"{rel}: workspace_after 路径越界")
+            continue
+        exists = os.path.isfile(target)
+        if expected is None:
+            if exists:
+                errors.append(f"{rel}: 应当已被删除，但文件还在")
+            continue
+        if not exists:
+            errors.append(f"{rel}: 文件不存在")
+            continue
+        try:
+            with open(target, "r", encoding="utf-8", errors="replace") as handle:
+                actual = handle.read()
+        except OSError as exc:
+            errors.append(f"{rel}: 读不出来 {exc.strerror or exc}")
+            continue
+        # 两边都 strip:结尾多不多一个换行不是判据
+        if actual.strip() != expected.strip():
+            errors.append(
+                f"{rel}: 内容不符（期望 {len(expected.strip())} 字符，"
+                f"实际 {len(actual.strip())} 字符）"
+            )
+    return errors
 
 
 @contextmanager
@@ -1218,6 +1295,7 @@ async def run_task(
 
         outcomes: list[TurnOutcome] = []
         with agent_stubs.stub_web_search(task.stub_mode) as stub:
+            file_state_errors: list[str] = []
             with _workspace_dir(db, task) as workspace:
                 with _approval_gate(task):
                     for spec in task.turns:
@@ -1240,6 +1318,10 @@ async def run_task(
                                 model=model,
                             )
                         )
+                # 必须在退出 _workspace_dir **之前**：那个上下文管理器一出去就把
+                # 临时目录连授权一起删了，之后再看磁盘什么都没有。
+                if workspace and (task.workspace_after or task.restore_latest):
+                    file_state_errors = _check_workspace_after(db, task, workspace)
             stub_queries = list(stub.queries)
             stub_misses = list(stub.misses)
 
@@ -1254,10 +1336,21 @@ async def run_task(
             )
             # 只判最后一轮的回答：rubric 就是照着"最终回答要体现什么"写的，
             # 中间轮次由确定性指标负责，这样裁判开销固定为每任务一次。
+            # 磁盘不符必须进证据。不进的话裁判只看答案文本——而"它说写好了"正是
+            # 这种失败最典型的样子，于是会拿到一个满分。这和 judgeContradictions
+            # 那层是同一个思路：旁边摆着确定性判据能证伪它，就让它证伪。
+            judge_evidence = evidence
+            if file_state_errors:
+                judge_evidence = (
+                    "【磁盘实际状态与预期不符（确定性检查，优先于回答内容）】\n"
+                    + "\n".join(f"- {item}" for item in file_state_errors)
+                    + "\n\n"
+                    + evidence
+                )
             verdict = await judge.judge(
                 question=transcript,
                 answer=outcomes[-1].answer,
-                evidence=evidence,
+                evidence=judge_evidence,
                 rubric=task.rubric,
             )
         else:
@@ -1271,6 +1364,7 @@ async def run_task(
             stub_queries=stub_queries,
             stub_misses=stub_misses,
             evidence_steps=evidence_steps,
+            file_state_errors=file_state_errors,
         )
     finally:
         # 记忆先清:它挂在用户身上,不会随对话一起删。放在 finally 里是因为
@@ -1531,6 +1625,14 @@ def summarize(variant: AgentVariant, results: list[TaskResult]) -> dict[str, Any
         for name in out.skills_loaded:
             if name not in loaded:
                 loaded.append(name)
+    # 磁盘状态不符的任务数。非零就意味着"任务成功"那一列不可信——写操作声称做完了、
+    # 而文件不是那样。和 judgeContradictions 同一个性质的守卫。
+    # 用 results（全部）而不是 graded（裁判成功的那些）：磁盘检查是确定性的，
+    # 它跟裁判调用成不成功无关。用 graded 会让"裁判挂了 + 文件写错了"这种
+    # 最该被发现的组合从计数里消失。同 unexpectedAdoptions 那条的理由。
+    summary["fileStateFailures"] = sum(
+        1 for result in results if getattr(result, "file_state_errors", None)
+    )
     summary["skillsLoaded"] = sorted(loaded)
     summary["skillLoadTurns"] = sum(1 for _spec, out in pairs if out.skills_loaded)
 

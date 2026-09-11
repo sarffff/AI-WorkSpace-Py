@@ -533,3 +533,93 @@ def test_冒号后的可变部分归到同一类():
         (spec, _outcome(errors=["unknown_approval_verdict:later"])),
     ]
     assert agent_runner._error_reasons(pairs) == ["unknown_approval_verdict ×2"]
+
+
+# ========== 磁盘状态检查 ==========
+#
+# 2026-09-11 加。其余所有判据看的都是**模型说了什么**——答案文本、工具调用序列、
+# 裁判的印象。写操作是唯一会改变工作区状态的动作，而"它说写好了"和"文件真的变成
+# 了那样"是两件事。差一点的情形不是模型撒谎，是路径拼错、写到了别处、或者 content
+# 被截断——三种都会让答案看起来完全正常。
+
+
+def _task(**kwargs):
+    from eval.agent_runner import AgentTask
+
+    base = dict(id="t", probe="p", rubric="r", turns=[])
+    base.update(kwargs)
+    return AgentTask(**base)
+
+
+def test_内容一致时没有错误(tmp_path):
+    from eval.agent_runner import _check_workspace_after
+
+    (tmp_path / "a.md").write_text("期望内容\n", encoding="utf-8")
+    task = _task(workspace_after={"a.md": "期望内容"})
+
+    assert _check_workspace_after(None, task, str(tmp_path)) == []
+
+
+def test_内容不符时报出来(tmp_path):
+    """这是这一组存在的理由：模型声称写好了，而文件不是那样。"""
+    from eval.agent_runner import _check_workspace_after
+
+    (tmp_path / "a.md").write_text("其实没改", encoding="utf-8")
+    task = _task(workspace_after={"a.md": "期望内容"})
+
+    errors = _check_workspace_after(None, task, str(tmp_path))
+    assert len(errors) == 1 and "内容不符" in errors[0]
+
+
+def test_结尾换行不算差异(tmp_path):
+    """模型给的内容结尾多不多一个换行不是判据。"""
+    from eval.agent_runner import _check_workspace_after
+
+    (tmp_path / "a.md").write_text("内容\n\n", encoding="utf-8")
+    task = _task(workspace_after={"a.md": "内容"})
+
+    assert _check_workspace_after(None, task, str(tmp_path)) == []
+
+
+def test_文件缺失时报出来(tmp_path):
+    from eval.agent_runner import _check_workspace_after
+
+    task = _task(workspace_after={"missing.md": "内容"})
+    errors = _check_workspace_after(None, task, str(tmp_path))
+    assert len(errors) == 1 and "不存在" in errors[0]
+
+
+def test_期望为None表示应当已被删除(tmp_path):
+    from eval.agent_runner import _check_workspace_after
+
+    task = _task(workspace_after={"gone.md": None})
+    # 文件确实不在 → 通过
+    assert _check_workspace_after(None, task, str(tmp_path)) == []
+
+    # 文件还在 → 失败
+    (tmp_path / "gone.md").write_text("还在", encoding="utf-8")
+    errors = _check_workspace_after(None, task, str(tmp_path))
+    assert len(errors) == 1 and "应当已被删除" in errors[0]
+
+
+def test_越界路径被挡掉(tmp_path):
+    """夹具是我们自己写的，但一个手误的 `../` 会让检查去读工作区外面的文件。"""
+    from eval.agent_runner import _check_workspace_after
+
+    task = _task(workspace_after={"../outside.md": "x"})
+    errors = _check_workspace_after(None, task, str(tmp_path))
+    assert len(errors) == 1 and "越界" in errors[0]
+
+
+def test_声明了恢复却没有备份时算失败(tmp_path, monkeypatch):
+    """restore_latest 的前提是那次写真的留下了旧版本。没有就是缺陷本身。"""
+    from config import settings
+    from eval.agent_runner import _check_workspace_after
+    from services import fs_backup
+
+    monkeypatch.setattr(settings, "FS_BACKUP_DIR", str(tmp_path / "_b"))
+    monkeypatch.setattr(fs_backup, "list_for_user", lambda db, uid: [])
+
+    task = _task(restore_latest=True)
+    errors = _check_workspace_after(None, task, str(tmp_path))
+    assert any("没有任何可恢复的备份" in e for e in errors)
