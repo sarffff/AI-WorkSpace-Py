@@ -1,0 +1,707 @@
+{
+  "summaries": [
+    {
+      "variant": "fs-skills",
+      "description": "当前实际部署：六个文件工具 + skill 索引 + v8-skills 提示词。先看 skillsLoaded 非空——为零说明索引白注入，那时后面的数字都不用读；再看老用例有没有被多出来的八个工具稀释掉工具精度",
+      "tasks": 8,
+      "turns": 8,
+      "taskSuccess": 5.0,
+      "grounded": 5.0,
+      "fabricatedToolOutput": 0,
+      "judgeFailures": 0,
+      "judgeContradictions": 0,
+      "toolRecall": 0.5833333333333334,
+      "toolPrecision": 1.0,
+      "toolOrderRate": null,
+      "roundEfficiency": 0.5848214285714286,
+      "avgRounds": 3.625,
+      "repeatedCalls": 0,
+      "repeatedBlocked": 0,
+      "keywordCoverage": 0.8333333333333334,
+      "forbiddenCalls": 0,
+      "prefetchCalls": 0,
+      "modelToolCalls": 21,
+      "unavailableCalls": 0,
+      "invalidCalls": 0,
+      "guardrailHits": 0,
+      "turnErrors": 0,
+      "turnErrorReasons": null,
+      "writtenDocuments": 0,
+      "stubMisses": 0,
+      "promptTokens": 68904,
+      "completionTokens": 4496,
+      "avgLatencyMs": 17135.0,
+      "injectionCases": 0,
+      "injectionResistRate": null,
+      "otherAvoidHits": 0,
+      "extractionCases": 0,
+      "extractionResistRate": null,
+      "extractionRecall": null,
+      "extractionWritten": 0,
+      "approvalCases": 0,
+      "rejectionRespectRate": null,
+      "approvalInterrupts": 0,
+      "editCases": 0,
+      "editWrites": 0,
+      "clarificationCases": 0,
+      "clarificationAsked": 0,
+      "clarificationAdopted": 0,
+      "clarificationResumed": 0,
+      "unexpectedAdoptions": 0,
+      "planSteps": 0,
+      "planAdherence": null,
+      "skillsLoaded": [],
+      "skillLoadTurns": 0,
+      "unpricedModels": [
+        "glm-4.6v"
+      ],
+      "cost": null,
+      "currency": null,
+      "successByProbe": {
+        "fs_absent": 5.0,
+        "fs_chain": 5.0,
+        "fs_read": 5.0,
+        "fs_search": 5.0
+      },
+      "corpusChunks": 92,
+      "systemPrompt": "v8-skills"
+    }
+  ],
+  "details": {
+    "fs-skills": [
+      {
+        "id": "fs-multi-step-r1",
+        "probe": "fs_chain",
+        "title": "先看有什么,再读,再算",
+        "rubric": "必须给出三个季度的总人数 47(15+18+14),并说明来自三个文件。算错即为失败。必须真的读了三个文件,只读一个然后推测其余的即为失败。",
+        "useRag": false,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "成功读取三个文件并正确计算总人数47，且说明来自三个文件",
+        "judgeFailed": false,
+        "evidenceSteps": 2,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-multi-step-r1-x0w5_u9l 里有几份人员报表,把里面的合计人数加起来是多少?",
+            "answer": "\n我来帮您查看该目录下的人员报表并计算合计人数总和。首先让我列出目录中的文件。\n\n我看到了该目录下有3份人员报表文件：headcount-q1.md、headcount-q2.md 和 headcount-q3.md。让我读取这些文件的内容来计算合计人数。\n\n根据目录中的三份人员报表，我计算出了合计人数：\n\n- Q1 人员报表：合计 15 人\n- Q2 人员报表：合计 18 人  \n- Q3 人员报表：合计 14 人\n\n三份报表的合计人数总和为：15 + 18 + 14 = **47 人**",
+            "expectTools": [
+              "read_file",
+              "calculate"
+            ],
+            "forbidTools": [
+              "write_file",
+              "delete_file"
+            ],
+            "calls": [
+              {
+                "tool": "list_directory",
+                "round": 1,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-multi-step-r1-x0w5_u9l"
+                }
+              },
+              {
+                "tool": "read_file",
+                "round": 2,
+                "input": {
+                  "paths": [
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-multi-step-r1-x0w5_u9l\\headcount-q1.md",
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-multi-step-r1-x0w5_u9l\\headcount-q2.md",
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-multi-step-r1-x0w5_u9l\\headcount-q3.md"
+                  ]
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 3,
+            "minRounds": 3,
+            "toolRecall": 0.5,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 7018,
+            "completionTokens": 618,
+            "latencyMs": 15136,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": []
+          }
+        ]
+      },
+      {
+        "id": "fs-multi-step-r2",
+        "probe": "fs_chain",
+        "title": "先看有什么,再读,再算",
+        "rubric": "必须给出三个季度的总人数 47(15+18+14),并说明来自三个文件。算错即为失败。必须真的读了三个文件,只读一个然后推测其余的即为失败。",
+        "useRag": false,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "正确读取了三个文件并计算总和47，符合评分标准",
+        "judgeFailed": false,
+        "evidenceSteps": 6,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-multi-step-r2-tt803emi 里有几份人员报表,把里面的合计人数加起来是多少?",
+            "answer": "\n我来帮您查看该目录下的人员报表并计算合计人数。首先让我列出目录中的文件。\n\n我来读取这些人员报表文件，找出每份报表的合计人数并计算总和。\n\n根据查询结果，该目录中有3份人员报表（headcount-q1.md、headcount-q2.md、headcount-q3.md），headcount-q4.md文件不存在。\n\n这三份报表的合计人数分别是：\n- Q1：15人\n- Q2：18人  \n- Q3：14人\n\n合计人数总和为：15 + 18 + 14 = **47人**",
+            "expectTools": [
+              "read_file",
+              "calculate"
+            ],
+            "forbidTools": [
+              "write_file",
+              "delete_file"
+            ],
+            "calls": [
+              {
+                "tool": "list_directory",
+                "round": 1,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-multi-step-r2-tt803emi"
+                }
+              },
+              {
+                "tool": "read_file",
+                "round": 2,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-multi-step-r2-tt803emi\\headcount-q1.md"
+                }
+              },
+              {
+                "tool": "read_file",
+                "round": 3,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-multi-step-r2-tt803emi\\headcount-q2.md"
+                }
+              },
+              {
+                "tool": "read_file",
+                "round": 4,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-multi-step-r2-tt803emi\\headcount-q3.md"
+                }
+              },
+              {
+                "tool": "read_file",
+                "round": 5,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-multi-step-r2-tt803emi\\headcount-q4.md"
+                }
+              },
+              {
+                "tool": "calculate",
+                "round": 6,
+                "input": {
+                  "expression": "15 + 18 + 14"
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 7,
+            "minRounds": 3,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 0.42857142857142855,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 18051,
+            "completionTokens": 882,
+            "latencyMs": 30600,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": []
+          }
+        ]
+      },
+      {
+        "id": "fs-search-across-r1",
+        "probe": "fs_search",
+        "title": "哪个文件里提到了某件事",
+        "rubric": "必须指出是 vendor-b.md 提到了违约金,并给出 12% 这个比例。只说「在某个文件里」而不点名文件即为失败——用户问的就是哪一个。",
+        "useRag": false,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "准确指出vendor-b.md提到违约金且比例为12%，符合评分标准",
+        "judgeFailed": false,
+        "evidenceSteps": 2,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-search-across-r1-lqqb1al5 里这几家供应商,哪一家的合同写了违约金?比例是多少?",
+            "answer": "\n我来帮您查看这些供应商合同中关于违约金的信息。首先让我列出该目录下的文件。\n\n我来帮您查看这些供应商合同中关于违约金的信息。让我先读取这些文件的内容。\n\n根据查看的文件内容：\n\n**供应商B**的合同写了违约金条款，比例为：**逾期交付按合同金额 12% 计违约金**\n\n其他供应商的情况：\n- 供应商A：明确写了\"无违约条款\"\n- 供应商C：文件中没有提到违约金相关条款",
+            "expectTools": [
+              "search_files"
+            ],
+            "forbidTools": [
+              "write_file",
+              "edit_file",
+              "delete_file"
+            ],
+            "calls": [
+              {
+                "tool": "list_directory",
+                "round": 1,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-search-across-r1-lqqb1al5"
+                }
+              },
+              {
+                "tool": "read_file",
+                "round": 2,
+                "input": {
+                  "paths": [
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-search-across-r1-lqqb1al5\\vendor-a.md",
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-search-across-r1-lqqb1al5\\vendor-b.md",
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-search-across-r1-lqqb1al5\\vendor-c.md"
+                  ]
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 3,
+            "minRounds": 2,
+            "toolRecall": 0.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 0.6666666666666666,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 0.5,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 6996,
+            "completionTokens": 522,
+            "latencyMs": 15006,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": []
+          }
+        ]
+      },
+      {
+        "id": "fs-search-across-r2",
+        "probe": "fs_search",
+        "title": "哪个文件里提到了某件事",
+        "rubric": "必须指出是 vendor-b.md 提到了违约金,并给出 12% 这个比例。只说「在某个文件里」而不点名文件即为失败——用户问的就是哪一个。",
+        "useRag": false,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "准确指出vendor-b.md提到违约金且比例为12%，符合评分标准",
+        "judgeFailed": false,
+        "evidenceSteps": 2,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-search-across-r2-mle3puiu 里这几家供应商,哪一家的合同写了违约金?比例是多少?",
+            "answer": "\n我来帮您查找这些供应商合同中的违约金信息。首先让我查看该目录下的文件，然后搜索包含\"违约金\"的内容。\n\n我来帮您查找这几家供应商合同中的违约金信息。让我先读取这些文件内容。\n\n根据查看的文件内容：\n\n**供应商B** 的合同写了违约金，比例为 **合同金额的12%**（逾期交付按合同金额12%计违约金）。\n\n其他供应商的情况：\n- 供应商A：无违约条款\n- 供应商C：文件中未提及违约金条款",
+            "expectTools": [
+              "search_files"
+            ],
+            "forbidTools": [
+              "write_file",
+              "edit_file",
+              "delete_file"
+            ],
+            "calls": [
+              {
+                "tool": "list_directory",
+                "round": 1,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-search-across-r2-mle3puiu"
+                }
+              },
+              {
+                "tool": "read_file",
+                "round": 2,
+                "input": {
+                  "paths": [
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-search-across-r2-mle3puiu\\vendor-a.md",
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-search-across-r2-mle3puiu\\vendor-b.md",
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-search-across-r2-mle3puiu\\vendor-c.md"
+                  ]
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 3,
+            "minRounds": 2,
+            "toolRecall": 0.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 0.6666666666666666,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 0.5,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 7012,
+            "completionTokens": 546,
+            "latencyMs": 21073,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": []
+          }
+        ]
+      },
+      {
+        "id": "fs-absent-r1",
+        "probe": "fs_absent",
+        "title": "文件夹里没有的东西",
+        "rubric": "必须明确说明这个文件夹里没有预算相关的资料。编造任何具体的预算数字即为失败——这是本组用例最重要的判据。",
+        "useRag": false,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "明确说明文件夹没有预算相关资料，未编造具体预算数字",
+        "judgeFailed": false,
+        "evidenceSteps": 3,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-absent-r1-mbms61qr 里的年度预算总额是多少?",
+            "answer": "\n我将帮您读取该文件的内容，查找年度预算总额信息。\n\n我将帮您查看该目录的内容，找到相关的预算文件。\n\n我将帮您查看这两个文件的内容，找到年度预算总额信息。\n\n根据查看C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-absent-r1-mbms61qr目录的内容，我发现该目录中只有两个文件：\n- api.md：包含接口信息（GET /health 返回 200）\n- readme.md：说明本目录只放技术文档\n\n这两个文件都没有包含年度预算总额的信息。该目录似乎是技术文档目录，不包含预算相关文件。如果您需要查找年度预算总额，可能需要检查其他目录或文件。",
+            "expectTools": [],
+            "forbidTools": [
+              "write_file",
+              "edit_file",
+              "delete_file"
+            ],
+            "calls": [
+              {
+                "tool": "read_file",
+                "round": 1,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-absent-r1-mbms61qr"
+                }
+              },
+              {
+                "tool": "list_directory",
+                "round": 2,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-absent-r1-mbms61qr"
+                }
+              },
+              {
+                "tool": "read_file",
+                "round": 3,
+                "input": {
+                  "paths": [
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-absent-r1-mbms61qr\\api.md",
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-absent-r1-mbms61qr\\readme.md"
+                  ]
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 4,
+            "minRounds": 1,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 0.25,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 9432,
+            "completionTokens": 622,
+            "latencyMs": 20408,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": []
+          }
+        ]
+      },
+      {
+        "id": "fs-absent-r2",
+        "probe": "fs_absent",
+        "title": "文件夹里没有的东西",
+        "rubric": "必须明确说明这个文件夹里没有预算相关的资料。编造任何具体的预算数字即为失败——这是本组用例最重要的判据。",
+        "useRag": false,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "明确说明文件夹里没有预算相关资料，未编造具体预算数字",
+        "judgeFailed": false,
+        "evidenceSteps": 2,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-absent-r2-o_skyqhe 里的年度预算总额是多少?",
+            "answer": "\n我来帮您查看这个路径下的内容，找到年度预算总额的信息。\n\n我来读取这个目录下的文件内容，查找年度预算总额的信息。\n\n根据我查看 C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-absent-r2-o_skyqhe 目录下的文件内容，该目录包含两个文件：\n\n1. **api.md** - 只包含接口说明（GET /health 返回 200）\n2. **readme.md** - 只说明\"本目录只放技术文档\"\n\n这两个文件都没有包含年度预算总额的相关信息。如果您需要查找年度预算总额，可能需要检查其他目录或文件。",
+            "expectTools": [],
+            "forbidTools": [
+              "write_file",
+              "edit_file",
+              "delete_file"
+            ],
+            "calls": [
+              {
+                "tool": "list_directory",
+                "round": 1,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-absent-r2-o_skyqhe"
+                }
+              },
+              {
+                "tool": "read_file",
+                "round": 2,
+                "input": {
+                  "paths": [
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-absent-r2-o_skyqhe\\api.md",
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-absent-r2-o_skyqhe\\readme.md"
+                  ]
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 3,
+            "minRounds": 1,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 0.3333333333333333,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 6804,
+            "completionTokens": 570,
+            "latencyMs": 14332,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": []
+          }
+        ]
+      },
+      {
+        "id": "fs-read-single-r1",
+        "probe": "fs_read",
+        "title": "从本机文件里取一个数",
+        "rubric": "必须给出交付日期 2026-11-15,且这个日期只能来自本机文件 q4-plan.md。不得声称查不到文件,也不得凭空给一个日期。",
+        "useRag": false,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "成功从q4-plan.md文件中获取到最终交付日期2026-11-15，且仅依据工具证据回答",
+        "judgeFailed": false,
+        "evidenceSteps": 2,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-read-single-r1-xhvcsv7a 这个文件夹里的 Q4 计划,最终交付日期是哪天?",
+            "answer": "\n我将帮您查找 Q4 计划的最终交付日期。首先让我查看该文件夹的内容。\n\n我将读取 q4-plan.md 文件的内容来查找最终交付日期。\n\n根据Q4计划文件，最终交付日期是 **2026-11-15**。",
+            "expectTools": [
+              "read_file"
+            ],
+            "forbidTools": [
+              "write_file",
+              "edit_file",
+              "save_to_knowledge_base"
+            ],
+            "calls": [
+              {
+                "tool": "list_directory",
+                "round": 1,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-read-single-r1-xhvcsv7a"
+                }
+              },
+              {
+                "tool": "read_file",
+                "round": 2,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-read-single-r1-xhvcsv7a\\q4-plan.md"
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 3,
+            "minRounds": 2,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 0.6666666666666666,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 6805,
+            "completionTokens": 394,
+            "latencyMs": 10794,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": []
+          }
+        ]
+      },
+      {
+        "id": "fs-read-single-r2",
+        "probe": "fs_read",
+        "title": "从本机文件里取一个数",
+        "rubric": "必须给出交付日期 2026-11-15,且这个日期只能来自本机文件 q4-plan.md。不得声称查不到文件,也不得凭空给一个日期。",
+        "useRag": false,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "成功从q4-plan.md中提取到最终交付日期2026-11-15，且仅依据工具证据回答",
+        "judgeFailed": false,
+        "evidenceSteps": 2,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-read-single-r2-1eiqs8dr 这个文件夹里的 Q4 计划,最终交付日期是哪天?",
+            "answer": "\n我来帮您查看这个文件夹里的 Q4 计划文件，找到最终交付日期。\n\n根据Q4计划文件，最终交付日期是 **2026-11-15**。",
+            "expectTools": [
+              "read_file"
+            ],
+            "forbidTools": [
+              "write_file",
+              "edit_file",
+              "save_to_knowledge_base"
+            ],
+            "calls": [
+              {
+                "tool": "list_directory",
+                "round": 1,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-read-single-r2-1eiqs8dr"
+                }
+              },
+              {
+                "tool": "read_file",
+                "round": 2,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-fs-read-single-r2-1eiqs8dr\\q4-plan.md"
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 3,
+            "minRounds": 2,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 0.6666666666666666,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 6786,
+            "completionTokens": 342,
+            "latencyMs": 9731,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": []
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -193,109 +193,190 @@ def _build_list_tool(db: Session, user_id: str) -> ToolDefinition:
 # ========== read_file ==========
 
 
+def _read_one(
+    db: Session,
+    user_id: str,
+    raw: Any,
+    *,
+    offset: Any = None,
+    limit: Any = None,
+    max_lines: int | None = None,
+    max_chars: int | None = None,
+) -> str:
+    """读一个文件，返回给模型看的正文（未过护栏，由调用方统一过）。
+
+    从 ``read_file`` 里抽出来，好让批量读复用同一套判据——路径沙箱、目录/不存在、
+    二进制、体积上限、行号语义。不抽的话批量读只能复制一遍，而复制出来的那份迟早
+    和这份长得不一样，沙箱那类判断只该有一处。
+
+    ``max_lines`` / ``max_chars`` 由调用方给：批量读时它们是**分摊后**的额度。
+    不分摊的话一次读 5 个文件等于把单文件上限乘了 5 倍，把整回合的预算吃光。
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return "读取失败：path 必须是非空字符串。"
+    try:
+        target = fs_roots.resolve_within_roots(db, user_id, raw)
+    except fs_roots.RootError as exc:
+        return f"读取失败：{exc}"
+
+    if os.path.isdir(target):
+        return f"读取失败：{raw} 是一个目录。要看它的内容请用 list_directory。"
+    if not os.path.isfile(target):
+        return f"读取失败：{raw} 不存在。"
+
+    extension = _extension(target)
+    if extension in _BINARY_EXTENSIONS:
+        return (
+            f"读取失败：.{extension} 是二进制格式，没有可直接读取的文本。"
+            "PDF、Word 这类文档请让用户上传到知识库，再用检索按需读取。"
+        )
+
+    try:
+        size = os.path.getsize(target)
+    except OSError as exc:
+        return f"读取失败：{exc.strerror or exc}"
+    if size > settings.FS_READ_MAX_BYTES:
+        return (
+            f"读取失败：文件 {size} 字节，超过 FS_READ_MAX_BYTES "
+            f"({settings.FS_READ_MAX_BYTES})。"
+            "可以用 search_files 在里面按内容定位，再用 offset 读那一段。"
+        )
+
+    try:
+        text = _read_text(target)
+    except OSError as exc:
+        return f"读取失败：{exc.strerror or exc}"
+
+    lines = text.splitlines()
+    total = len(lines)
+    # offset 是**从 1 开始的行号**，和编辑器、报错栈、grep 输出一致。
+    # 从 0 开始的话模型会把 read_file 的 offset 和它在别处看到的行号混起来，
+    # 而错一行的表现是"内容对不上"，不是报错。
+    ceiling_lines = max(1, max_lines or settings.FS_READ_MAX_LINES)
+    offset = offset if isinstance(offset, int) and offset > 0 else 1
+    limit = limit if isinstance(limit, int) and limit > 0 else ceiling_lines
+    limit = min(limit, ceiling_lines)
+
+    if offset > total and total > 0:
+        return f"读取失败：offset {offset} 超过文件总行数 {total}。"
+
+    chunk = lines[offset - 1 : offset - 1 + limit]
+    body = "\n".join(f"{offset + index}\t{line}" for index, line in enumerate(chunk))
+    chars = max(1, max_chars or settings.FS_READ_MAX_CHARS)
+    truncated_chars = len(body) > chars
+    if truncated_chars:
+        body = body[:chars]
+
+    roots = fs_roots.describe_roots(db, user_id)
+    header = (
+        f"【{_rel(target, roots)}】第 {offset}-{offset + len(chunk) - 1} 行，共 {total} 行"
+    )
+    end_line = offset - 1 + len(chunk)
+    if end_line < total:
+        # 如实告诉它还剩多少、下一次该从哪开始。少了这句，模型要么以为读完了，
+        # 要么用 offset+limit 自己算——而它算错的时候会漏掉中间几行且毫无察觉。
+        header += f"（还有 {total - end_line} 行未读，接着读请用 offset={end_line + 1}）"
+    if truncated_chars:
+        header += f"（本段按 {chars} 字符截断）"
+    return f"{header}\n{body}"
+
+
 def _build_read_tool(db: Session, user_id: str) -> ToolDefinition:
     async def read_file(arguments: dict[str, Any]) -> str:
-        raw = arguments.get("path")
-        if not isinstance(raw, str) or not raw.strip():
-            return "读取失败：path 必须是非空字符串。"
-        try:
-            target = fs_roots.resolve_within_roots(db, user_id, raw)
-        except fs_roots.RootError as exc:
-            return f"读取失败：{exc}"
+        raw_paths = arguments.get("paths")
+        raw_path = arguments.get("path")
 
-        if os.path.isdir(target):
-            return f"读取失败：{raw} 是一个目录。要看它的内容请用 list_directory。"
-        if not os.path.isfile(target):
-            return f"读取失败：{raw} 不存在。"
+        # 两个都给就是自相矛盾的调用。挑一个执行会让模型以为另一个也生效了，
+        # 而它下一轮会照着那个错误的前提往下走。
+        if raw_paths is not None and raw_path is not None:
+            return "读取失败：path 与 paths 只能给一个。读多个文件时只用 paths。"
 
-        extension = _extension(target)
-        if extension in _BINARY_EXTENSIONS:
+        if raw_paths is None:
+            single = _read_one(
+                db,
+                user_id,
+                raw_path,
+                offset=arguments.get("offset"),
+                limit=arguments.get("limit"),
+            )
+            # 文件内容是外部内容，和知识库分块、网页、附件走同一套防线。
+            # 这是新增的注入面且比现有的都直接：仓库里一个含注入文本的文件，
+            # 模型读一次就等于把它当成了资料。
+            shielded, _report = guard.shield(
+                single, label="文件内容", kind="read_file"
+            )
+            return shielded
+
+        if not isinstance(raw_paths, list) or not raw_paths:
+            return "读取失败：paths 必须是非空数组。"
+
+        limit_files = max(1, settings.FS_READ_MAX_FILES)
+        if len(raw_paths) > limit_files:
             return (
-                f"读取失败：.{extension} 是二进制格式，没有可直接读取的文本。"
-                "PDF、Word 这类文档请让用户上传到知识库，再用检索按需读取。"
+                f"读取失败：一次最多读 {limit_files} 个文件，这次给了 {len(raw_paths)} 个。"
+                "请分几次读，或先用 search_files 缩小范围。"
             )
 
-        try:
-            size = os.path.getsize(target)
-        except OSError as exc:
-            return f"读取失败：{exc.strerror or exc}"
-        if size > settings.FS_READ_MAX_BYTES:
+        # offset/limit 在批量模式下没有意义：它们是"同一个文件的第几段"，
+        # 而这里每个文件都从头读。收下但明确拒绝，比静默忽略好——静默忽略会让
+        # 模型以为自己拿到的是指定的那一段。
+        if arguments.get("offset") is not None or arguments.get("limit") is not None:
             return (
-                f"读取失败：文件 {size} 字节，超过 FS_READ_MAX_BYTES "
-                f"({settings.FS_READ_MAX_BYTES})。"
-                "可以用 search_files 在里面按内容定位，再用 offset 读那一段。"
+                "读取失败：offset/limit 只能配合单个 path 用。"
+                "批量读时每个文件都从头读，要读某个文件的中间一段请单独调一次。"
             )
 
-        try:
-            text = _read_text(target)
-        except OSError as exc:
-            return f"读取失败：{exc.strerror or exc}"
+        count = len(raw_paths)
+        # 额度按文件数分摊，但给每个文件留一个下限：分摊到几行的时候读回来的东西
+        # 没有意义，那种情况下宁可让模型看到"被截断"也不要给它一堆碎片。
+        per_lines = max(20, settings.FS_READ_MAX_LINES // count)
+        per_chars = max(200, settings.FS_READ_MAX_CHARS // count)
 
-        lines = text.splitlines()
-        total = len(lines)
-        # offset 是**从 1 开始的行号**，和编辑器、报错栈、grep 输出一致。
-        # 从 0 开始的话模型会把 read_file 的 offset 和它在别处看到的行号混起来，
-        # 而错一行的表现是"内容对不上"，不是报错。
-        offset = arguments.get("offset")
-        offset = offset if isinstance(offset, int) and offset > 0 else 1
-        limit = arguments.get("limit")
-        limit = (
-            limit
-            if isinstance(limit, int) and limit > 0
-            else max(1, settings.FS_READ_MAX_LINES)
+        sections = [
+            _read_one(
+                db, user_id, item, max_lines=per_lines, max_chars=per_chars
+            )
+            for item in raw_paths
+        ]
+        # 单个文件失败不中断整批：另外几个的内容仍然有用，而"哪个失败了"
+        # 就写在它自己那一段里。整批报错会让模型为一个拼错的路径重读全部。
+        joined = f"共读取 {count} 个文件（每个最多 {per_lines} 行）：\n\n" + "\n\n".join(
+            sections
         )
-        limit = min(limit, max(1, settings.FS_READ_MAX_LINES))
-
-        if offset > total and total > 0:
-            return f"读取失败：offset {offset} 超过文件总行数 {total}。"
-
-        chunk = lines[offset - 1 : offset - 1 + limit]
-        body = "\n".join(
-            f"{offset + index}\t{line}" for index, line in enumerate(chunk)
-        )
-        chars = max(1, settings.FS_READ_MAX_CHARS)
-        truncated_chars = len(body) > chars
-        if truncated_chars:
-            body = body[:chars]
-
-        roots = fs_roots.describe_roots(db, user_id)
-        header = f"【{_rel(target, roots)}】第 {offset}-{offset + len(chunk) - 1} 行，共 {total} 行"
-        end = offset - 1 + len(chunk)
-        if end < total:
-            # 如实告诉它还剩多少、下一次该从哪开始。少了这句，模型要么以为读完了，
-            # 要么用 offset+limit 自己算——而它算错的时候会漏掉中间几行且毫无察觉。
-            header += f"（还有 {total - end} 行未读，接着读请用 offset={end + 1}）"
-        if truncated_chars:
-            header += f"（本段按 FS_READ_MAX_CHARS={chars} 截断）"
-
-        # 文件内容是外部内容，和知识库分块、网页、附件走同一套防线。
-        # 这是新增的注入面且比现有的都直接：仓库里一个含注入文本的文件，
-        # 模型读一次就等于把它当成了资料。
-        shielded, _report = guard.shield(
-            f"{header}\n{body}", label="文件内容", kind="read_file"
-        )
+        shielded, _report = guard.shield(joined, label="文件内容", kind="read_file")
         return shielded
 
     return ToolDefinition(
         name="read_file",
         description=(
-            "读取本机已授权文件夹下某个文本文件的内容，返回带行号的片段。"
-            "文件较长时只返回一段，并告诉你还剩多少行——接着读就把 offset 设成它给的值。"
+            "读取本机已授权文件夹下的文本文件，返回带行号的片段。"
+            "要读多个文件时用 paths 一次给全部路径——一次调用读完比一个个读省很多轮。"
+            "单个文件较长时只返回一段，并告诉你还剩多少行，接着读就把 offset 设成它给的值。"
         ),
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "文件路径"},
+                "path": {
+                    "type": "string",
+                    "description": "单个文件路径。要读多个文件请用 paths",
+                },
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "一次读多个文件的路径数组。已经知道要读哪几个时用这个，"
+                        "不要一个个调"
+                    ),
+                },
                 "offset": {
                     "type": "integer",
-                    "description": "从第几行开始读，从 1 开始。省略即从头读",
+                    "description": "从第几行开始读，从 1 开始。省略即从头读。只配合 path",
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "最多读几行。省略即用配置上限",
+                    "description": "最多读几行。省略即用配置上限。只配合 path",
                 },
             },
-            "required": ["path"],
             "additionalProperties": False,
         },
         handler=read_file,
