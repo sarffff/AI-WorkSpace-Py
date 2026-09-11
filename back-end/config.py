@@ -291,6 +291,21 @@ class Settings(BaseSettings):
     # 所以让**一次调用带多个路径**——顺着模型的限制走,而不是逆着劝它。
     # 上限取 8:再多的话即使分摊后每个文件也只剩几十行,读回来的是一堆碎片。
     FS_READ_MAX_FILES: int = 8
+    # ---- 写操作的旧版本留存 ----
+    #
+    # write_file 是 open(path, "w")，旧内容当场消失。审批闸门挡的是"模型偷偷写"，
+    # 挡不住"用户点了同意然后后悔"——而审批卡片上只看得到 diff 的前 60 行。
+    #
+    # 备份落在**授权目录外面**：放在用户工作目录里的话 list_directory/search_files
+    # 会列出来、模型会把自己写坏的旧版本当资料读、而且 delete_file 能把回收站本身删掉。
+    FS_BACKUP_DIR: str = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "fs_backups"
+    )
+    # 每个文件留几份旧版本。给 5 而不是 1:连续改三次之后想回到最早那版是常见需求
+    FS_BACKUP_MAX_PER_FILE: int = 5
+    # 单份备份的上限。超过就不备份,而且要**如实告诉用户**——静默跳过会让人
+    # 以为有后路。和 FS_READ_MAX_BYTES 同量级
+    FS_BACKUP_MAX_BYTES: int = 2 * 1024 * 1024
     # 按内容搜索:最多返回几处命中、最多扫几个文件、每处摘要多少字符
     FS_SEARCH_MAX_MATCHES: int = 40
     FS_SEARCH_MAX_FILES: int = 400

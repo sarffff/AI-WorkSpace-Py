@@ -110,3 +110,7 @@ back-end/model_prices.json
 back-end/uploads/
 !back-end/uploads/eval/
 !back-end/uploads/eval/**
+
+# 本机文件写操作的旧版本留存。用户真实文件的内容，绝不进仓库。
+# 目录本身由 fs_backup 按需创建（FS_BACKUP_DIR）。
+back-end/fs_backups/

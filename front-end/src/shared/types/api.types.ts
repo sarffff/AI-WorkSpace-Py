@@ -920,6 +920,30 @@ export interface FsRootsResponse {
   tools: string[];
 }
 
+/**
+ * 一份写操作留下的旧版本。
+ *
+ * 这是**给用户的撤销**，不是给模型的工具：要撤销的是用户自己批准过的那次写——
+ * 审批卡片上只看得到 diff 的前 60 行，同意之后才发现覆盖掉的是别的东西。
+ */
+export interface FsBackup {
+  id: string;
+  /** 被写/删的那个文件的绝对路径 */
+  path: string;
+  /** write / edit / delete / restore */
+  action: string;
+  size: number;
+  createdAt: string;
+  /** 文件此刻还在不在。删除留下的备份这里是 false */
+  exists: boolean;
+}
+
+export interface FsBackupsResponse {
+  backups: FsBackup[];
+  /** 后端没开写工具时为 false：这时列表必然是空的，界面要能区分"没开"和"没写过" */
+  enabled: boolean;
+}
+
 /** /fs/browse 里的一个条目。 */
 export interface FsEntry {
   name: string;

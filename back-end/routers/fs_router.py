@@ -29,7 +29,7 @@ from auth import get_current_user
 from config import settings
 from database import get_db
 from models import User
-from services import fs_roots, fs_tools
+from services import fs_backup, fs_roots, fs_tools
 
 router = APIRouter(prefix="/fs", tags=["本机文件夹"])
 
@@ -161,6 +161,48 @@ async def browse(
         "entries": entries[:limit],
         "truncated": len(entries) > limit,
     }
+
+
+@router.get("/backups")
+async def list_backups(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """写操作留下的旧版本，最新的在前。
+
+    ## 为什么这是一个界面接口，而不是给模型的工具
+
+    要撤销的是**用户自己批准过的那次写**——审批卡片上只看得到 diff 的前 60 行，
+    同意之后才发现覆盖掉的是别的东西。这件事只有人能判断。做成工具的话模型可以
+    撤销自己的写，那是另一回事，而且会凭空多一个工具稀释工具面。
+
+    每一条都重新过一次沙箱（见 ``fs_backup.list_for_user``）：授权撤销之后旧备份
+    不该还能恢复，那等于绕过"用户已经收回了这个目录的权限"。
+    """
+    return {
+        "backups": fs_backup.list_for_user(db, current_user.id),
+        "enabled": fs_tools.enabled() and settings.TOOL_FS_WRITE_ENABLED,
+    }
+
+
+@router.post("/backups/{backup_id}/restore")
+async def restore_backup(
+    backup_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """把某份旧版本放回原位。
+
+    恢复本身也是一次覆盖，所以 ``fs_backup.restore`` 会先把当前内容再备份一份——
+    "点错了恢复"不该是又一次不可逆操作。
+    """
+    try:
+        path = fs_backup.restore(db, current_user.id, backup_id)
+    except fs_backup.BackupError as exc:
+        # 400 而不是 404：不存在、不属于你、内容文件丢了，对调用方是同一类结果，
+        # 而区分开会把"别人有哪些备份"漏出去
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "path": path}
 
 
 @router.post("/roots")

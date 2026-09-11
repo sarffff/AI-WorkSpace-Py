@@ -37,6 +37,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from config import settings
 from models import WorkspaceRoot
 
 
@@ -91,6 +92,23 @@ def add_root(
         raise RootError("路径为空。")
     if not os.path.isdir(cleaned):
         raise RootError(f"{cleaned} 不是一个存在的目录。")
+
+    # 授权的目录**不能包含备份目录**。
+    #
+    # 写操作的旧版本存在 FS_BACKUP_DIR（默认在后端目录下）。要是有人把仓库根、
+    # 或者任何它的上级目录授权成工作区，回收站就落进了沙箱里面——模型能用
+    # read_file 读到自己写坏的旧版本、把它当成资料，更糟的是能用 delete_file
+    # 把回收站本身删掉，于是"写操作可撤销"这个保证静默失效。
+    #
+    # 判据是"包含"而不是"相等"：真正危险的是祖先目录，而不是恰好选中它。
+    # 两边都 realpath 再比，理由和 resolve_within_roots 那边一样。
+    real_root = _real(cleaned)
+    real_backup = _real(settings.FS_BACKUP_DIR)
+    if real_backup == real_root or real_backup.startswith(real_root + os.sep):
+        raise RootError(
+            f"{cleaned} 包含了写操作的备份目录，授权它会让备份可被文件工具读写。"
+            "请选一个更具体的工作目录。"
+        )
 
     existing = (
         db.query(WorkspaceRoot)

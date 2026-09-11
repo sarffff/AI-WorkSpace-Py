@@ -387,3 +387,92 @@ def test_label显示成相对授权根的形式(client, tmp_path):
 
     body = client.get("/fs/browse", params={"path": str(sub)}, headers=headers).json()
     assert body["label"] == "资料/sub"
+
+
+# ========== 旧版本与恢复 ==========
+
+
+def test_未登录拿不到备份列表(client):
+    assert client.get("/fs/backups").status_code in (401, 403)
+
+
+def test_未登录不能恢复(client):
+    assert client.post("/fs/backups/whatever/restore").status_code in (401, 403)
+
+
+def test_没有写操作时备份列表为空(client, tmp_path):
+    headers = _auth_headers(client)
+    client.post("/fs/roots", json={"path": str(tmp_path)}, headers=headers)
+    assert client.get("/fs/backups", headers=headers).json()["backups"] == []
+
+
+def test_覆盖写之后能从接口把旧内容恢复回来(client, tmp_path, monkeypatch, db_session):
+    """走完整链路：授权 → 工具覆盖写 → 接口列备份 → 接口恢复。"""
+    from config import settings as live
+    from conftest import run
+    from services import fs_tools
+
+    monkeypatch.setattr(live, "TOOL_FS_ENABLED", True)
+    monkeypatch.setattr(live, "TOOL_FS_WRITE_ENABLED", True)
+    monkeypatch.setattr(live, "FS_BACKUP_DIR", str(tmp_path / "_backups"))
+
+    target = tmp_path / "work"
+    target.mkdir()
+    (target / "notes.md").write_text("原始内容", encoding="utf-8")
+
+    headers = _auth_headers(client)
+    client.post("/fs/roots", json={"path": str(target)}, headers=headers)
+
+    # 找到这个用户的 id，工具是按 user_id 建的
+    me = client.get("/auth/me", headers=headers).json()
+    tools = {t.name: t for t in fs_tools.build(db_session, me["id"])}
+    run(tools["write_file"].handler({"path": "notes.md", "content": "新内容"}))
+    assert (target / "notes.md").read_text(encoding="utf-8") == "新内容"
+
+    listed = client.get("/fs/backups", headers=headers).json()["backups"]
+    assert len(listed) == 1
+    assert listed[0]["action"] == "write"
+
+    got = client.post(
+        f"/fs/backups/{listed[0]['id']}/restore", headers=headers
+    )
+    assert got.status_code == 200, got.text
+    assert (target / "notes.md").read_text(encoding="utf-8") == "原始内容"
+
+
+def test_恢复不存在的备份返回400(client, tmp_path):
+    headers = _auth_headers(client)
+    client.post("/fs/roots", json={"path": str(tmp_path)}, headers=headers)
+    got = client.post("/fs/backups/nope/restore", headers=headers)
+    assert got.status_code == 400
+    assert "不存在" in got.json()["detail"]
+
+
+def test_别人恢复不了我的备份(client, tmp_path, monkeypatch, db_session):
+    """备份的判据是 user_id，和 workspace_roots 一致。"""
+    from config import settings as live
+    from conftest import run
+    from services import fs_tools
+
+    monkeypatch.setattr(live, "TOOL_FS_ENABLED", True)
+    monkeypatch.setattr(live, "TOOL_FS_WRITE_ENABLED", True)
+    monkeypatch.setattr(live, "FS_BACKUP_DIR", str(tmp_path / "_backups"))
+
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "notes.md").write_text("原始内容", encoding="utf-8")
+
+    alice = _auth_headers(client)
+    client.post("/fs/roots", json={"path": str(work)}, headers=alice)
+    me = client.get("/auth/me", headers=alice).json()
+    tools = {t.name: t for t in fs_tools.build(db_session, me["id"])}
+    run(tools["write_file"].handler({"path": "notes.md", "content": "新内容"}))
+    backup_id = client.get("/fs/backups", headers=alice).json()["backups"][0]["id"]
+
+    bob = _auth_headers(client, email="bob@example.com", username="bob")
+    assert client.get("/fs/backups", headers=bob).json()["backups"] == []
+    assert (
+        client.post(f"/fs/backups/{backup_id}/restore", headers=bob).status_code == 400
+    )
+    # alice 那边的文件没被动过
+    assert (work / "notes.md").read_text(encoding="utf-8") == "新内容"

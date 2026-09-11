@@ -106,6 +106,25 @@ def _code_default_flags() -> dict[str, object]:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_fs_backups(tmp_path_factory, monkeypatch):
+    """把 ``FS_BACKUP_DIR`` 指到临时目录。
+
+    autouse 且必须在这里，不能靠各个测试自己记得：默认值是
+    ``back-end/fs_backups``，也就是**仓库里的一个真实目录**。不隔离的话跑一次
+    测试就会往那儿写十几份备份，而且 ``index.json`` 跨运行累积——
+    下一次跑 ``list_for_user`` 会看到上一次留下的行。
+
+    这是"结果取决于上一次跑过什么"那一类，和 ``_pin_feature_flags`` 防的是
+    同一件事，只不过脏的是磁盘而不是配置。
+
+    它是字符串型设置，按 bool 类型钉开关的那条规则覆盖不到。
+    """
+    monkeypatch.setattr(
+        settings, "FS_BACKUP_DIR", str(tmp_path_factory.mktemp("fs_backups"))
+    )
+
+
+@pytest.fixture(autouse=True)
 def _pin_feature_flags(monkeypatch):
     """把功能开关钉到测试假定的值，隔离本地 .env。
 

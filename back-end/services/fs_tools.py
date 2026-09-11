@@ -31,7 +31,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from config import settings
-from services import file_types, fs_roots
+from services import file_types, fs_backup, fs_roots
 from services.guardrails import guard, mask_markup
 from services.tool_runtime import ToolDefinition
 
@@ -527,6 +527,11 @@ def _build_write_tool(db: Session, user_id: str) -> ToolDefinition:
                 "请先用 list_directory 确认目标目录，不要依赖自动创建。"
             )
 
+        # 覆盖之前留一份旧内容。审批闸门挡的是"模型偷偷写"，挡不住"用户点了同意
+        # 之后后悔"——而卡片上只看得到 diff 的前 60 行。备份失败不让写失败
+        # （见 fs_backup.save 的文档串），但超上限没备份要如实说出来。
+        note = fs_backup.save(user_id, target, action="write") if existed else None
+
         try:
             with open(target, "w", encoding="utf-8", newline="") as handle:
                 handle.write(content)
@@ -535,7 +540,7 @@ def _build_write_tool(db: Session, user_id: str) -> ToolDefinition:
 
         roots = fs_roots.describe_roots(db, user_id)
         verb = "已覆盖" if existed else "已新建"
-        return f"{verb} {_rel(target, roots)}（{len(content)} 字符）。"
+        return f"{verb} {_rel(target, roots)}（{len(content)} 字符）。{note or ''}"
 
     return ToolDefinition(
         name="write_file",
@@ -601,6 +606,8 @@ def _build_edit_tool(db: Session, user_id: str) -> ToolDefinition:
                 "请多带几行上下文，让它只匹配你要改的那一处。"
             )
 
+        note = fs_backup.save(user_id, target, action="edit")
+
         try:
             with open(target, "w", encoding="utf-8", newline="") as handle:
                 handle.write(text.replace(old_text, new_text, 1))
@@ -608,7 +615,10 @@ def _build_edit_tool(db: Session, user_id: str) -> ToolDefinition:
             return f"修改失败：{exc.strerror or exc}"
 
         roots = fs_roots.describe_roots(db, user_id)
-        return f"已修改 {_rel(target, roots)}（替换 1 处，{len(old_text)} → {len(new_text)} 字符）。"
+        return (
+            f"已修改 {_rel(target, roots)}"
+            f"（替换 1 处，{len(old_text)} → {len(new_text)} 字符）。{note or ''}"
+        )
 
     return ToolDefinition(
         name="edit_file",
@@ -671,11 +681,15 @@ def _build_delete_tool(
 
         roots = fs_roots.describe_roots(db, user_id)
         shown = _rel(target, roots)
+        # 删除之前留一份。这是三个写操作里最需要它的：覆盖写至少还有 diff 可看，
+        # 删掉的文件在界面上什么都不剩。
+        note = fs_backup.save(user_id, target, action="delete")
+
         try:
             os.remove(target)
         except OSError as exc:
             return f"删除失败：{exc.strerror or exc}"
-        return f"已删除 {shown}。"
+        return f"已删除 {shown}。{note or ''}"
 
     return ToolDefinition(
         name="delete_file",

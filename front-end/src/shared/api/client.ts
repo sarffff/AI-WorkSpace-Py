@@ -31,6 +31,8 @@ import type {
   AgentMetrics,
   FsBrowseResponse,
   FsRoot,
+  FsBackup,
+  FsBackupsResponse,
   FsRootsResponse,
   SkillsResponse,
   WorkspaceSkill,
@@ -1281,6 +1283,41 @@ export class ApiClient {
     if (!response.ok) {
       throw new Error(`Failed to remove folder: ${response.statusText}`);
     }
+  }
+
+  /**
+   * 写操作留下的旧版本，最新的在前
+   * GET /fs/backups
+   */
+  async getFsBackups(): Promise<FsBackupsResponse> {
+    const response = await this.authedFetch(`${this.baseUrl}/fs/backups`);
+    if (!response.ok) {
+      throw new Error(`Failed to load backups: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 把某份旧版本放回原位
+   * POST /fs/backups/{id}/restore
+   *
+   * 恢复本身也会先备份当前内容，所以点错了还能再撤回来。
+   */
+  async restoreFsBackup(backupId: string): Promise<{ path: string }> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/fs/backups/${backupId}/restore`,
+      { method: "POST" },
+    );
+    if (!response.ok) {
+      // 400 的 detail 是面向用户的文案（"该备份不存在"、"原来的目录已经不存在"），
+      // 照抄 addFsRoot 那边的形状
+      const detail = await response
+        .json()
+        .then((body) => body?.detail)
+        .catch(() => null);
+      throw new Error(detail || `恢复失败：${response.statusText}`);
+    }
+    return response.json();
   }
 
   /**
