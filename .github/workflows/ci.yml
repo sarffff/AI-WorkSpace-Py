@@ -49,9 +49,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - uses: pnpm/action-setup@v2
+      # 版本只来自 front-end/package.json 的 packageManager（当前 pnpm@11.20.0）。
+      # 原来钉的是 v2 + version: 9，而锁文件是 pnpm 11 写的——pnpm 10 起会写
+      # pnpmfileChecksum，pnpm 9 读那份锁文件算出的校验和对不上，
+      # --frozen-lockfile 就失败。报错建议的 --no-frozen-lockfile 不能照做：
+      # 那等于让 CI 自己改锁文件，正是 --frozen-lockfile 要防的事。
+      #
+      # 这个 job 的 working-directory 是 front-end，但 uses: 步骤不继承它，
+      # 所以要显式指出 package.json 在哪——仓库根没有那份文件。
+      - uses: pnpm/action-setup@v4
         with:
-          version: 9
+          package_json_file: front-end/package.json
       - name: 安装依赖
         run: pnpm install --frozen-lockfile --ignore-scripts
       - name: 类型检查
