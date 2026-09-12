@@ -46,9 +46,16 @@ jobs:
         working-directory: front-end
     steps:
       - uses: actions/checkout@v4
+      # 22 而不是 20：pnpm 11 require 了 node:sqlite，那是 Node 22.5 起才有的
+      # 内置模块，在 20 上直接 ERR_UNKNOWN_BUILTIN_MODULE。pnpm 自己也会先 warn
+      # "requires at least Node.js v22.13"。
+      #
+      # 方向是把 CI 抬到锁文件那一侧，而不是把 pnpm 降回 9：锁文件已经是 pnpm 11
+      # 写的，降 pnpm 就回到上一个 commit 修掉的那个 pnpmfileChecksum 不匹配。
+      # 打包出去的 Electron 自带 Node 运行时，所以这个版本只影响构建工具链。
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
       # 版本只来自 front-end/package.json 的 packageManager（当前 pnpm@11.20.0）。
       # 原来钉的是 v2 + version: 9，而锁文件是 pnpm 11 写的——pnpm 10 起会写
       # pnpmfileChecksum，pnpm 9 读那份锁文件算出的校验和对不上，
