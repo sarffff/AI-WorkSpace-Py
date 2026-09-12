@@ -20,6 +20,13 @@ class RenameRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
 
 
+class RoleRequest(BaseModel):
+    # 不用 Literal["admin","user"]:那样非法值会被 FastAPI 挡成 422,而 422 的
+    # detail 是一段 pydantic 结构体,前端那张面板只会显示"请求参数错误"。
+    # 让它走到 service 里换一句中文错误("角色只能是 admin 或 user")。
+    role: str = Field(..., min_length=1, max_length=20)
+
+
 class JoinRequest(BaseModel):
     # 长度上界给 16 而不是 8:邀请码长度是实现细节,而这里只需要挡住超长输入。
     # 真正的校验在 join_by_invite_code 里(它做 strip + upper 再查库)。
@@ -91,6 +98,64 @@ async def regenerate_invite_code(
     except WorkspaceError as e:
         raise HTTPException(status_code=403, detail=str(e))
     return {"inviteCode": code}
+
+
+@router.patch("/members/{member_id}")
+async def set_member_role(
+    member_id: str,
+    body: RoleRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """改一个成员的角色(仅管理员)。
+
+    两类失败都回 400,不分 403/404:
+
+    * "仅管理员可以执行"确实是权限问题,但把它和别的分开会让前端要写两条分支,
+      而它们的处置一样(把 detail 显示出来)。
+    * "该成员不在这个工作区"故意不回 404——404 会确认"这个 id 存在但不在这里",
+      也就是把别人的归属漏给调用方。
+
+    这一条与 rename / invite-code 那两个 403 不一致,是刻意的:那两个只有权限
+    一种失败,这里有四种(非管理员、人不在、角色非法、最后一个管理员),
+    而前端对四种做的是同一件事。
+    """
+    try:
+        result = workspace_service.set_member_role(
+            db, current_user, member_id, body.role
+        )
+    except WorkspaceError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "success": True,
+        "member": result,
+        "workspace": workspace_service.workspace_info(db, current_user),
+    }
+
+
+@router.delete("/members/{member_id}")
+async def remove_member(
+    member_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """把一个成员移出工作区(仅管理员)。
+
+    响应里带上整份 workspace_info:前端那张面板要同时更新成员列表与
+    ``adminCount``(它决定按钮禁不禁),再发一次 GET 是多一趟往返而且会闪。
+
+    被移除的人不会丢数据:共享文档留在原地(组织资产),他自己的私有文档跟他走
+    ——不需要迁移,判据是"所有者当前在不在这个空间",见 workspace_service。
+    """
+    try:
+        removed = workspace_service.remove_member(db, current_user, member_id)
+    except WorkspaceError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "success": True,
+        "removed": removed,
+        "workspace": workspace_service.workspace_info(db, current_user),
+    }
 
 
 async def _document_count(db: Session, workspace_id: str, viewer_id: str) -> int:
