@@ -2574,10 +2574,11 @@ class ChatService:
                 scope.history = history
                 # 确认令牌：用户在界面上点的那一下，比词表扫出来的"用户说过删除"
                 # 是更强的证据。所以这里不再扫原话，直接按裁决给——但**只在**
-                # 被批准的那次调用确实是删除操作时给，而不是整回合放开。
+                # 被批准的那次调用确实是删除操作时给，而不是整回合放开：同一轮里
+                # 常有"写知识库 + 删文件"两个调用，为前者点的同意不该放行后者。
                 approvals = workspace_tools._ToolApprovals(
                     delete_granted=(
-                        approved and request.tool == "delete_knowledge_document"
+                        approved and request.tool in workspace_tools.DELETE_TOOLS
                     )
                 )
                 citations: list[dict] = []

@@ -22,7 +22,7 @@ from typing import Any
 from conftest import collect, run
 from config import settings
 from models import AgentCheckpoint, AgentRun, MessageToolStep
-from services import checkpoint_store
+from services import checkpoint_store, fs_roots
 
 from tests.test_sse_contract import make_service, enable_delegation
 from tests.test_service_security import RecordingKnowledge, _seed_workspace
@@ -303,6 +303,114 @@ def test_resume_rejected_feeds_reason_back_to_model(db_real, monkeypatch):
     )
     assert step.status == "rejected"
     assert step.run_id == run_id
+
+
+def test_批准一次删除本机文件之后那次删除真的执行(db_real, tmp_path, monkeypatch):
+    """审批放行 ``delete_file`` 之后，文件要真的消失。
+
+    这条路上有两道门，而它们的判据不一样：审批闸门问"用户点没点同意"，确认令牌问
+    "用户原话里要求过没有"。恢复轮里没有新的用户输入，所以令牌只能由裁决重建——
+    ``resume_turn`` 那处判定原来只认 ``delete_knowledge_document`` 一个名字，
+    于是用户点了同意、工具却回"需要用户明确要求过删除"。
+
+    这个失败没有任何报错：run 落 ``done``，工具状态是 ``ok``，模型照着那段拒绝
+    文本向用户解释一遍。用户看到的是"我明明点了同意"，日志里什么都没有。
+    """
+    enable_checkpoints(monkeypatch)
+    monkeypatch.setattr(settings, "TOOL_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "TOOL_FS_WRITE_ENABLED", True)
+    monkeypatch.setattr(settings, "TOOL_FS_DELETE_ENABLED", True)
+    admin_id = seed_admin(db_real)
+
+    work = tmp_path / "work"
+    work.mkdir()
+    target = work / "draft.txt"
+    target.write_text("草稿\n", encoding="utf-8")
+    fs_roots.add_root(db_real, admin_id, str(work))
+
+    service, _adapter = make_service(
+        [
+            {"tool_calls": [("delete_file", {"path": str(target)})]},
+            {"text": "已经删掉了。"},
+        ]
+    )
+    first = run(
+        collect(
+            service.stream_ai_response(
+                db_real,
+                admin_id,
+                "c1",
+                "把 draft.txt 删掉",
+                use_rag=False,
+                message_id="m-user",
+            )
+        )
+    )
+    request = next(e for e in first if e["type"] == "approval_required")
+    assert request["tool"] == "delete_file"
+    # 审批停在执行之前：这时文件还在
+    assert target.exists()
+
+    resumed = run(
+        collect(service.resume_turn(db_real, admin_id, request["runId"], approved=True))
+    )
+
+    result = next(e for e in resumed if e["type"] == "tool_result")
+    assert result["status"] == "ok"
+    assert not target.exists(), "点了同意，文件却还在"
+
+
+def test_批准一次知识库写入不顺带打开删除本机文件的令牌(db_real, tmp_path, monkeypatch):
+    """反向：裁决重建的令牌只覆盖**被批准的那一次**，不是整回合放开删除。
+
+    同一轮里两个调用——第一个是知识库写入（停下来等审批），第二个是删文件。
+    用户为写入点的那次同意不该把后面那次删除一起放行。
+    """
+    enable_checkpoints(monkeypatch)
+    monkeypatch.setattr(settings, "TOOL_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "TOOL_FS_WRITE_ENABLED", True)
+    monkeypatch.setattr(settings, "TOOL_FS_DELETE_ENABLED", True)
+    admin_id = seed_admin(db_real)
+
+    work = tmp_path / "work"
+    work.mkdir()
+    target = work / "keep.txt"
+    target.write_text("别删我\n", encoding="utf-8")
+    fs_roots.add_root(db_real, admin_id, str(work))
+
+    knowledge = RecordingKnowledge()
+    service, _adapter = make_service(
+        [
+            {
+                "tool_calls": [
+                    ("save_to_knowledge_base", {"name": "要点", "content": "正文"}),
+                    ("delete_file", {"path": str(target)}),
+                ]
+            },
+            {"text": "写好了。"},
+        ],
+        knowledge,
+    )
+    first = run(
+        collect(
+            service.stream_ai_response(
+                db_real,
+                admin_id,
+                "c1",
+                "把这些要点存进知识库",
+                use_rag=False,
+                message_id="m-user",
+            )
+        )
+    )
+    request = next(e for e in first if e["type"] == "approval_required")
+    assert request["tool"] == "save_to_knowledge_base"
+
+    run(collect(service.resume_turn(db_real, admin_id, request["runId"], approved=True)))
+
+    # 知识库那次写入照常执行；删除没有被顺带放行
+    assert len(knowledge.uploaded) == 1
+    assert target.exists(), "为知识库写入点的同意把一次删除也放行了"
 
 
 # ========== 幂等：已执行的工具不重跑 ==========

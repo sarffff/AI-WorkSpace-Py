@@ -16,7 +16,7 @@ import pytest
 
 from config import settings
 from conftest import run
-from services import approval, fs_roots, fs_tools
+from services import approval, fs_roots, fs_tools, workspace_tools
 
 
 @pytest.fixture(autouse=True)
@@ -95,6 +95,21 @@ def test_写操作全部在审批名单里(root, db_real):
     # 反向也钉：注册出来的写工具就是 WRITE_TOOLS 那三个，没有漏网的
     registered = set(_tools(root and db_real))
     assert registered & set(fs_tools.WRITE_TOOLS) == set(fs_tools.WRITE_TOOLS)
+
+
+def test_删文件在确认令牌的消费名单里(root, db_real):
+    """``workspace_tools.DELETE_TOOLS`` 决定"审批放行之后要不要重建删除令牌"。
+
+    和上面那条一样是防漂移，但漏掉的后果方向相反：审批名单漏一个是**绕过审批**，
+    这份名单漏一个是**批准了也不执行**——用户点了同意，工具回"需要你明确要求过
+    删除"。后者不报错、run 落 done、工具状态 ok，只有用户在界面上看得出不对。
+    """
+    assert "delete_file" in workspace_tools.DELETE_TOOLS
+    # 反向：这份名单只收删除操作。写和改归审批闸门管，不该在这里出现——
+    # 令牌是给不可恢复的删除留的门，放宽到覆盖写就等于这道门对写操作永久敞开。
+    assert set(workspace_tools.DELETE_TOOLS) & {"write_file", "edit_file"} == set()
+    # 名单里的 fs 工具必须真的注册得出来，否则钉的是一个不存在的名字
+    assert "delete_file" in _tools(root and db_real)
 
 
 def test_每个受审工具都有说明文案(root, db_real):
