@@ -306,6 +306,19 @@ class Settings(BaseSettings):
     # 单份备份的上限。超过就不备份,而且要**如实告诉用户**——静默跳过会让人
     # 以为有后路。和 FS_READ_MAX_BYTES 同量级
     FS_BACKUP_MAX_BYTES: int = 2 * 1024 * 1024
+    # ---- 凭据文件保护 ----
+    #
+    # 沙箱回答的是"路径在授权目录里吗",不回答"这个文件该不该给模型看"。而实测
+    # 一个普通项目目录里的 .env 会被 read_file 原样读出来(DB_PASSWORD=hunter2),
+    # search_files 还能按关键词把它找出来——那些内容随下一次调用发给模型提供商。
+    #
+    # 默认**开**。这是三个文件开关里唯一默认开的:另两个(写、删)默认关是因为
+    # 它们扩大能力,而这个是收窄能力,默认关等于默认不设防。
+    FS_PROTECT_SECRETS: bool = True
+    # 组织自有的凭据文件名,逗号分隔,fnmatch 语法(如 ``*.corp-key,vault-*.json``)。
+    # 只能加不能减:没有例外名单——例外名单里写一个 *.pem 就能静默打开整条防线。
+    # 要放开就把 FS_PROTECT_SECRETS 整个关掉,那是个看得见的决定。
+    FS_SECRET_EXTRA_PATTERNS: str = ""
     # 按内容搜索:最多返回几处命中、最多扫几个文件、每处摘要多少字符
     FS_SEARCH_MAX_MATCHES: int = 40
     FS_SEARCH_MAX_FILES: int = 400

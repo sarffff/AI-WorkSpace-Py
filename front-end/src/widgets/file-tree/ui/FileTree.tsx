@@ -8,6 +8,7 @@ import {
   File as FileIcon,
   Folder,
   FolderOpen,
+  Lock,
   RefreshCw,
 } from "lucide-react";
 
@@ -147,22 +148,42 @@ export const FileTree: React.FC<Props> = ({ onPick, onClose }) => {
           <button
             key={entry.path}
             onClick={() => (entry.isDir ? load(entry.path) : onPick?.(entry))}
-            title={entry.path}
+            title={
+              entry.protected
+                ? `${entry.path}（受凭据保护，agent 读不到也改不了）`
+                : entry.path
+            }
             className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-[#f3f0e6] dark:hover:bg-[#262522] text-[11px] text-left transition-colors group"
           >
             {entry.isRoot ? (
               <FolderOpen className="w-3.5 h-3.5 text-[#da7756] shrink-0" />
+            ) : entry.protected ? (
+              // 受保护的条目换成锁，不是换成灰色的文件图标：颜色差别在小尺寸下
+              // 看不出来，而用户要一眼分辨的是「这个文件助手碰不到」
+              <Lock className="w-3.5 h-3.5 text-amber-600 dark:text-amber-500 shrink-0" />
             ) : entry.isDir ? (
               <Folder className="w-3.5 h-3.5 text-[#918d83] shrink-0" />
             ) : (
               <FileIcon className="w-3.5 h-3.5 text-[#918d83] shrink-0" />
             )}
-            <span className="flex-1 truncate text-[#1f1e1d] dark:text-[#edece8]">
+            <span
+              className={`flex-1 truncate ${
+                entry.protected
+                  ? "text-[#918d83]"
+                  : "text-[#1f1e1d] dark:text-[#edece8]"
+              }`}
+            >
               {entry.name}
             </span>
-            <span className="text-[10px] text-[#918d83] shrink-0">
-              {fmtBytes(entry.size)}
-            </span>
+            {entry.protected ? (
+              <span className="text-[10px] text-amber-600 dark:text-amber-500 shrink-0">
+                受保护
+              </span>
+            ) : (
+              <span className="text-[10px] text-[#918d83] shrink-0">
+                {fmtBytes(entry.size)}
+              </span>
+            )}
           </button>
         ))}
 

@@ -61,6 +61,57 @@ def test_expect_and_forbid_never_overlap():
             assert not overlap, f"{task.id} 第 {index} 轮自相矛盾：{overlap}"
 
 
+def test_声明了工具的用例必须真的能拿到那个工具():
+    """用例期望的工具,在它自己的配置下必须是**注册得出来**的。
+
+    这条拦的是一类特别安静的错:``fs-skills`` 刻意关着 ``TOOL_FS_DELETE_ENABLED``,
+    而一条用例写了 ``expect_tools: [delete_file]``。跑起来不会报错——那个工具压根
+    不在工具面里,模型当然不调,于是工具召回扣分、用例失败,而失败原因看起来像
+    "模型不肯删",实际是"它没有这个工具"。
+
+    判据只覆盖文件工具的三个开关:它们是唯一"按开关注册"且被用例点名的一组。
+    知识库那几个工具在 ``_BASE`` 里全程开着,不需要这条。
+    """
+    gated = {
+        "write_file": "TOOL_FS_WRITE_ENABLED",
+        "edit_file": "TOOL_FS_WRITE_ENABLED",
+        "delete_file": "TOOL_FS_DELETE_ENABLED",
+    }
+    variant = AGENT_VARIANTS["fs-skills"]
+    for task in TASKS:
+        for index, turn in enumerate(task.turns, start=1):
+            for tool in turn.expect_tools:
+                flag = gated.get(tool)
+                if flag is None:
+                    continue
+                # 任务级覆盖优先,其次是变体,最后是 Settings 的默认值
+                enabled = task.settings_overrides.get(
+                    flag, variant.overrides.get(flag, getattr(Settings(), flag))
+                )
+                assert enabled, (
+                    f"{task.id} 第 {index} 轮期望 {tool},但 {flag} 在这个用例下是关的——"
+                    f"要么给它加 settings_overrides,要么别期望这个工具"
+                )
+
+
+def test_任务级覆盖只收布尔与数值且必须是真配置项():
+    """拼错的开关名在运行时是静默不生效,而用例照常给分——量的却不是它声称的东西。"""
+    from eval.agent_runner import _parse_overrides
+
+    assert _parse_overrides(None, "t") == {}
+    assert _parse_overrides({"TOOL_FS_DELETE_ENABLED": True}, "t") == {
+        "TOOL_FS_DELETE_ENABLED": True
+    }
+    # 不存在的配置项
+    with pytest.raises(ValueError, match="不是一个已知配置项"):
+        _parse_overrides({"TOOL_FS_DELETE": True}, "t")
+    # 字符串开关不收:提示词版本会让同一份报告里两个任务跑在不同提示词上
+    with pytest.raises(ValueError, match="只能是布尔或数值"):
+        _parse_overrides({"PROMPT_CHAT_SYSTEM_VERSION": "v8-skills"}, "t")
+    with pytest.raises(ValueError, match="必须是一个对象"):
+        _parse_overrides(["TOOL_FS_DELETE_ENABLED"], "t")
+
+
 # ---- 记忆注入用例 ----
 
 

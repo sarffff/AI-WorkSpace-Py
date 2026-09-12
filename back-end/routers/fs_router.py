@@ -29,7 +29,7 @@ from auth import get_current_user
 from config import settings
 from database import get_db
 from models import User
-from services import fs_backup, fs_roots, fs_tools
+from services import fs_backup, fs_policy, fs_roots, fs_tools
 
 router = APIRouter(prefix="/fs", tags=["本机文件夹"])
 
@@ -133,11 +133,18 @@ async def browse(
                 size = os.path.getsize(full)
             except OSError:
                 size = None
+        # 受凭据保护的条目在界面上也要看得出来。这里**只标记不隐藏**：
+        # 这是用户浏览自己的文件夹，藏起来等于骗他；而他需要知道的是
+        # "助手看不到这个文件"——那正是他授权这个文件夹时会关心的事。
+        protected = fs_policy.is_protected(
+            os.path.join(full, "x") if is_dir else full
+        )
         (dirs if is_dir else files).append(
             {
                 "name": name,
                 "path": full,
                 "isDir": is_dir,
+                "protected": protected,
                 "size": size,
                 "isRoot": False,
             }

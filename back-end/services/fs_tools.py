@@ -31,7 +31,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from config import settings
-from services import file_types, fs_backup, fs_roots
+from services import file_types, fs_backup, fs_policy, fs_roots
 from services.guardrails import guard, mask_markup
 from services.tool_runtime import ToolDefinition
 
@@ -148,13 +148,24 @@ def _build_list_tool(db: Session, user_id: str) -> ToolDefinition:
                 continue
             full = os.path.join(target, name)
             if os.path.isdir(full):
-                dirs.append(f"{name}/")
+                # 受保护目录（.ssh 之类）照样列出来，但标出来并且不鼓励进去。
+                # 藏起来的话用户会遇到"我明明看到那个目录，助手说没有"。
+                if fs_policy.is_protected(os.path.join(full, "x")):
+                    dirs.append(f"{name}/（受保护，里面的内容不可读）")
+                else:
+                    dirs.append(f"{name}/")
             else:
                 try:
                     size = os.path.getsize(full)
                 except OSError:
                     size = 0
-                files.append(f"{name}（{size} 字节）")
+                # 名字照列、值不给。目录里有 .env 这件事本身不是秘密，
+                # 里面那行 DB_PASSWORD 才是——而模型需要知道它存在但读不了，
+                # 否则它会反复换路径重试。
+                if fs_policy.is_protected(full):
+                    files.append(f"{name}（{size} 字节，受保护，不可读/改/删）")
+                else:
+                    files.append(f"{name}（{size} 字节）")
 
         entries = dirs + files
         if not entries:
@@ -223,6 +234,12 @@ def _read_one(
         return f"读取失败：{raw} 是一个目录。要看它的内容请用 list_directory。"
     if not os.path.isfile(target):
         return f"读取失败：{raw} 不存在。"
+
+    # 凭据保护。位置在沙箱**之后**：先确认这个路径本来就归他管，再判断内容敏感性。
+    # 反过来的话，一个越界路径会先收到"被凭据策略挡下"——那句话确认了那个路径
+    # 存在且是敏感文件，等于用错误消息回答了一个不该回答的问题。
+    if fs_policy.is_protected(target):
+        return fs_policy.refusal(raw, action="读取")
 
     extension = _extension(target)
     if extension in _BINARY_EXTENSIONS:
@@ -417,6 +434,9 @@ def _build_search_tool(db: Session, user_id: str) -> ToolDefinition:
         hits: list[str] = []
         scanned = 0
         truncated = False
+        # 因为凭据保护跳过了几个文件。必须报出来:不报的话"没找到"会被模型
+        # 当成"库里没有这件事",而实际是有一个文件没敢看——两个结论的处置不同。
+        protected_skipped = 0
 
         for base in bases:
             for dirpath, dirnames, filenames in os.walk(base):
@@ -430,6 +450,12 @@ def _build_search_tool(db: Session, user_id: str) -> ToolDefinition:
                         truncated = True
                         break
                     full = os.path.join(dirpath, filename)
+                    # 凭据文件整个跳过。这条比 read_file 那道门更要紧:搜索是
+                    # **按关键词**命中的,搜 "PASSWORD" 会直接把 .env 里那一行
+                    # 连值一起摘出来——比整篇读出去更精准地泄露。
+                    if fs_policy.is_protected(full):
+                        protected_skipped += 1
+                        continue
                     try:
                         if os.path.getsize(full) > settings.FS_READ_MAX_BYTES:
                             continue
@@ -453,15 +479,26 @@ def _build_search_tool(db: Session, user_id: str) -> ToolDefinition:
             if truncated or len(hits) >= max_matches:
                 break
 
+        # 两处都要带上这句。"没找到"尤其需要它:少了这句,模型会把
+        # "有一个凭据文件没敢搜"讲成"你的项目里没有这个东西"。
+        protected_note = (
+            f"（另有 {protected_skipped} 个受凭据保护的文件没有搜索，"
+            "它们可能包含密码或密钥）"
+            if protected_skipped
+            else ""
+        )
+
         if not hits:
             return (
-                f"在 {scanned} 个文件里没有找到包含 {needle!r} 的行。"
+                f"在 {scanned} 个文件里没有找到包含 {needle!r} 的行。{protected_note}"
                 "可以换一个更短或更常见的说法，或先用 list_directory 确认搜的是不是这个目录。"
             )
 
         header = f"找到 {len(hits)} 处包含 {needle!r} 的行（扫了 {scanned} 个文件）"
         if truncated:
             header += "，结果已截断"
+        if protected_note:
+            header += protected_note
         # 命中的行是文件内容，同样是外部内容
         shielded, _report = guard.shield(
             f"{header}：\n" + "\n".join(hits), label="搜索结果", kind="search_files"
@@ -512,6 +549,10 @@ def _build_write_tool(db: Session, user_id: str) -> ToolDefinition:
 
         if os.path.isdir(target):
             return f"写入失败：{raw} 是一个目录。"
+        # 凭据文件不给写。覆盖 .env 的后果是本机服务连不上数据库,而模型看到的
+        # 是"写入成功"——它不知道自己刚把环境弄坏了。
+        if fs_policy.is_protected(target):
+            return fs_policy.refusal(raw, action="写入")
         limit = max(1, settings.AGENT_WRITE_MAX_CHARS)
         if len(content) > limit:
             return f"写入失败：content 超过 {limit} 字符，请自行精简或分次写入。"
@@ -585,6 +626,11 @@ def _build_edit_tool(db: Session, user_id: str) -> ToolDefinition:
 
         if not os.path.isfile(target):
             return f"修改失败：{raw} 不存在。"
+        # 改比写更需要这道门:edit_file 要先把整个文件读出来才能匹配 old_text,
+        # 也就是说少了这一句,一次"改 .env 里的某一行"会把整个 .env 读进内存,
+        # 而失败消息里可能带上文件内容的片段。
+        if fs_policy.is_protected(target):
+            return fs_policy.refusal(raw, action="修改")
         try:
             text = _read_text(target)
         except OSError as exc:
@@ -668,6 +714,14 @@ def _build_delete_tool(
             )
         if not os.path.isfile(target):
             return f"删除失败：{raw} 不存在（可能已经被删掉了）。"
+        # 删凭据文件是不可逆的本机损坏:删掉 ~/.ssh/id_rsa 之后所有 git remote
+        # 都连不上,而备份留的是我们自己的目录、用户不一定找得到。
+        #
+        # 这道门在确认令牌**之前**:令牌问的是"用户要求过删除吗",而这里的答案是
+        # "这个文件无论谁要求都不删"。顺序反了的话,用户说一句"删掉"就会让
+        # 拒绝理由变成"需要明确要求",而他明明已经要求了。
+        if fs_policy.is_protected(target):
+            return fs_policy.refusal(raw, action="删除")
 
         # 确认令牌：和 delete_knowledge_document 同一道门。单靠 description 里
         # 写"只在用户明确要求时使用"拦不住——模型可能把它刚读到的文件内容或网页里
@@ -820,6 +874,14 @@ def preview_extra(
         target = resolve_path_for_preview(db, user_id, raw)
     except fs_roots.RootError:
         return {}
+
+    # 凭据文件不出 diff。这是第七个调用点,而且是最容易漏的一个:它不在
+    # read_file 那条路上,但 diff **就是文件内容**——一份 .env 的 diff 会把
+    # 每一行密码原样送进 SSE 事件、渲染在审批卡片上。
+    #
+    # 而且这次调用注定会被工具拒绝(上面那三道门),给它算 diff 本来就没有意义。
+    if fs_policy.is_protected(target):
+        return {"__protected": True}
 
     try:
         before = _read_text(target) if os.path.isfile(target) else ""

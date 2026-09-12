@@ -100,6 +100,49 @@ describe("FileTree", () => {
     expect(vi.mocked(apiClient.browseFs).mock.calls.length).toBe(callsBefore);
   });
 
+  it("受凭据保护的条目标出来，但不隐藏也不显示大小", async () => {
+    // 藏起来会让用户遇到"我明明看到 .env，助手说没有"。他要知道的恰恰是
+    // 「授权了这个文件夹，但助手看不到这几个文件」。
+    vi.mocked(apiClient.browseFs).mockResolvedValueOnce({
+      ...inRoot,
+      entries: [
+        {
+          name: ".env",
+          path: "D:/work/.env",
+          isDir: false,
+          size: 52,
+          isRoot: false,
+          protected: true,
+        },
+        {
+          name: "a.txt",
+          path: "D:/work/a.txt",
+          isDir: false,
+          size: 2048,
+          isRoot: false,
+          protected: false,
+        },
+      ],
+    });
+    render(<FileTree />);
+    await waitFor(() => expect(screen.getByText(".env")).toBeTruthy());
+
+    // 名字还在，而且标了
+    expect(screen.getByText("受保护")).toBeTruthy();
+    // 大小让位给标记：那一列只有一个位置，而"52 字节"不是用户在这里要看的东西
+    expect(screen.queryByText("52 B")).toBeNull();
+    // 普通文件不受影响
+    expect(screen.getByText("2.0 KB")).toBeTruthy();
+  });
+
+  it("后端没给 protected 字段时按不受保护渲染", async () => {
+    // 旧后端 + 新前端。缺字段不该让整棵树渲染不出来，也不该把普通文件误标成受保护
+    vi.mocked(apiClient.browseFs).mockResolvedValueOnce(inRoot);
+    render(<FileTree />);
+    await waitFor(() => expect(screen.getByText("a.txt")).toBeTruthy());
+    expect(screen.queryByText("受保护")).toBeNull();
+  });
+
   it("parent 为 null 时不显示返回上级", async () => {
     vi.mocked(apiClient.browseFs).mockResolvedValueOnce(rootList);
     render(<FileTree />);

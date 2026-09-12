@@ -243,6 +243,54 @@ class AgentTask:
     # 框架代做。它测的是那条真实链路：模型覆盖写 → 留下旧版本 → 用户后悔 → 放回去。
     # 配合 workspace_after 写"恢复之后应该等于原始内容"。
     restore_latest: bool = False
+    # 只在这一个任务上生效的配置，跑完立刻还原。
+    #
+    # 存在的理由：有些用例要的工具面**故意和变体基线不同**。第一个这样的用例是
+    # 「凭据保护那道门在确认令牌之前」——它需要 ``TOOL_FS_DELETE_ENABLED`` 开着，
+    # 而 ``fs-skills`` 刻意把它关着（注释写了理由：删除的令牌要在用户原话里找确认词，
+    # 而数据集里的提问是我们写的，开着它量到的是夹具的措辞）。
+    #
+    # 那条理由对「模型会不会先问一句再删」成立，对这条用例不成立——这条用例
+    # **正需要**令牌是开的，好让私钥前面只剩策略这一道门。
+    #
+    # 为什么不干脆把变体里那个开关打开：那会给所有声明了 workspace_files 的用例
+    # 多一个 delete_file，也就改变了它们的工具面。为一条新用例去动其余用例的基线，
+    # 是把「不可比」引进历史报告的最快方式。
+    #
+    # 只允许覆盖**布尔与数值**开关，不允许改提示词版本之类：后者会让同一份报告里
+    # 两个任务跑在不同提示词上，而报告顶上只印一个版本号。
+    settings_overrides: dict[str, Any] = field(default_factory=dict)
+
+
+def _parse_overrides(raw: Any, task_id: str) -> dict[str, Any]:
+    """校验并规范化一个任务的 ``settings_overrides``。
+
+    在**加载时**校验而不是运行时：一个拼错的开关名（``TOOL_FS_DELETE`` 少了
+    ``_ENABLED``）在运行时的表现是"这个覆盖静默没生效"，而用例照常跑、照常给分——
+    只是量的东西不是它声称要量的那个。加载时抛异常的话，一次跑不起来比一份
+    读不出问题的报告便宜得多。
+
+    只收布尔与数值。字符串开关里最危险的是提示词版本：它会让同一份报告里两个任务
+    跑在不同提示词上，而报告顶上只印一个版本号。
+    """
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{task_id}: settings_overrides 必须是一个对象")
+    cleaned: dict[str, Any] = {}
+    for key, value in raw.items():
+        name = str(key)
+        if not hasattr(settings, name):
+            raise ValueError(
+                f"{task_id}: settings_overrides 里的 {name!r} 不是一个已知配置项"
+            )
+        if not isinstance(value, (bool, int, float)):
+            raise ValueError(
+                f"{task_id}: settings_overrides[{name!r}] 只能是布尔或数值，"
+                f"拿到 {type(value).__name__}"
+            )
+        cleaned[name] = value
+    return cleaned
 
 
 def load_tasks(limit: int | None = None, path: str | None = None) -> list[AgentTask]:
@@ -316,6 +364,9 @@ def load_tasks(limit: int | None = None, path: str | None = None) -> list[AgentT
                         ).items()
                     },
                     restore_latest=bool(raw.get("restore_latest", False)),
+                    settings_overrides=_parse_overrides(
+                        raw.get("settings_overrides"), raw["id"]
+                    ),
                 )
             )
     return tasks[:limit] if limit else tasks
@@ -1684,7 +1735,18 @@ async def run_variant(
 
         results: list[TaskResult] = []
         for index, task in enumerate(tasks, start=1):
-            result = await run_task(service, judge, task, settings.LLM_MODEL)
+            # 任务级覆盖。``finally`` 里逐个还原，而不是在循环外统一还原:
+            # 一个任务抛异常时后面的任务不该继承它的开关。
+            task_original = {
+                key: getattr(settings, key) for key in task.settings_overrides
+            }
+            for key, value in task.settings_overrides.items():
+                setattr(settings, key, value)
+            try:
+                result = await run_task(service, judge, task, settings.LLM_MODEL)
+            finally:
+                for key, value in task_original.items():
+                    setattr(settings, key, value)
             results.append(result)
             logger.info(
                 "[%s] %s/%s %s success=%s rounds=%s calls=%s",
