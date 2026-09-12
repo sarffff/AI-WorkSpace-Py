@@ -1,9 +1,11 @@
+import logging
 import os
 
 import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -13,6 +15,7 @@ from rate_limit import limiter
 from config import settings
 from database import init_db, SessionLocal
 from models import Prompt
+from redis_service import redis_service
 from routers import (
     chat_router,
     knowledge_router,
@@ -36,6 +39,8 @@ from services import subagent
 from services import vector_store
 from services import workspace_tools
 from services.rerank import rerank_client
+
+logger = logging.getLogger("main")
 
 app = FastAPI(
     title="AI Workspace API",
@@ -94,11 +99,79 @@ app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads"
 
 @app.get("/")
 async def root():
-    """API 根路径"""
+    """API 根路径。**不是**健康检查——它只证明进程在监听。
+
+    健康检查在 ``/health``。分开是刻意的:这个端点要保持零依赖、永远 200,
+    它回答的是"端口通不通";而"这个实例现在能不能干活"要真的去连数据库。
+    """
     return {
         "message": "AI Workspace API",
         "version": "1.0.0",
-        "status": "running"
+        "status": "running",
+        "health": "/health",
+    }
+
+
+@app.get("/health")
+async def health(response: Response):
+    """给编排系统看的健康检查:真的去连一次数据库。
+
+    ## 为什么不能沿用 ``/``
+
+    ``/`` 返回的是一个写死的字典。数据库挂了它照样回 ``running``——而 k8s 探针、
+    负载均衡、监控告警全都会据此认为这个实例是好的,于是流量继续打进来,
+    每一个请求都在 500。一个永远说"我很好"的健康检查比没有健康检查更糟:
+    它让"实例坏了"这件事在监控上不可见。
+
+    ## 判据只有数据库
+
+    数据库是**硬依赖**:它不通,认证、对话、检索没有一个能工作。所以它决定
+    HTTP 状态码。
+
+    Redis 是**软依赖**(会话缓存与摘要缓存,没有就退化成每次重算),模型 API
+    是外部服务(它挂了是一次请求失败,不是这个实例坏了)。把软依赖算进状态码会
+    造成一类更糟的故障:Redis 抖一下,编排系统把一批本来能正常服务的实例全部
+    重启。所以它们只报告状态,不影响 ready。
+
+    ## 503 而不是 200 带一个 status 字段
+
+    编排系统默认只看状态码。返回 200 + ``{"status":"unhealthy"}`` 需要在探针
+    上额外配一条解析规则,而漏配的后果是这个端点白做。
+    """
+    checks: dict[str, str] = {}
+
+    db = SessionLocal()
+    try:
+        db.execute(text("SELECT 1"))
+        checks["database"] = "ok"
+        ready = True
+    except Exception as exc:  # noqa: BLE001 - 任何异常都算不健康
+        # 只记类型不记消息:连接串里可能带着凭据,而这个端点通常是不需要认证的
+        checks["database"] = f"error: {type(exc).__name__}"
+        logger.error("health check: database unreachable (%s)", type(exc).__name__)
+        ready = False
+    finally:
+        db.close()
+
+    if not settings.REDIS_URL:
+        checks["redis"] = "disabled"
+    else:
+        try:
+            client = getattr(redis_service, "client", None)
+            if client is None:
+                checks["redis"] = "unavailable"
+            else:
+                client.ping()
+                checks["redis"] = "ok"
+        except Exception as exc:  # noqa: BLE001 - 软依赖,不影响 ready
+            checks["redis"] = f"error: {type(exc).__name__}"
+
+    if not ready:
+        response.status_code = 503
+    return {
+        "status": "ok" if ready else "unhealthy",
+        "version": "1.0.0",
+        "checks": checks,
     }
 
 
