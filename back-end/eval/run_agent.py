@@ -283,6 +283,45 @@ def render_markdown(report: dict[str, Any]) -> str:
             "所以只看那三列会得出「判据很准」的结论。"
         )
 
+    # 跨轮波动。只有 --repeat > 1 时才有内容，而它是那个开关存在的全部理由：
+    # 汇总行的均值回答不了"这条用例是不稳、还是真的退化了"。
+    rounds = report.get("runs") or 1
+    if rounds > 1:
+        lines += ["", f"## 跨轮波动（{rounds} 轮）", ""]
+        any_volatile = False
+        for summary in summaries:
+            details = report.get("details", {}).get(summary["variant"]) or []
+            volatile = agent_runner.volatile_tasks(details)
+            if not volatile:
+                continue
+            any_volatile = True
+            lines += [
+                f"**{summary['variant']}**：{len(volatile)} 条用例跨轮摆动 ≥ "
+                f"{agent_runner._VOLATILE_SPAN}",
+                "",
+                "| 用例 | 探针 | 幅度 | 每轮分数 |",
+                "| --- | --- | --- | --- |",
+            ]
+            for row in volatile:
+                shown = "、".join(
+                    "—" if value is None else f"{value:g}" for value in row["values"]
+                )
+                lines.append(
+                    f"| {row['id']} | {row['probe']} | {row['span']:g} | {shown} |"
+                )
+            lines.append("")
+        if not any_volatile:
+            lines += [
+                f"{rounds} 轮里没有用例摆动 ≥ {agent_runner._VOLATILE_SPAN}。"
+                "这一轮的分数可以按面值读。",
+                "",
+            ]
+        lines += [
+            "摆动的用例**不能按单轮分数下结论**——它这次红了不代表退化了。"
+            "要判它到底行不行，只能加轮数或者改用例让判据变确定（比如磁盘状态检查"
+            "那种，它不经过裁判，所以不摆）。",
+        ]
+
     unpriced = [s for s in summaries if s.get("unpricedModels")]
     if unpriced:
         lines += ["", "## ⚠ 计价缺口", ""]
@@ -376,6 +415,14 @@ async def main() -> None:
         "在 --limit 之前生效——新加的用例都在文件末尾，--limit 取的是前 N 条，"
         "单独调一组用例时用这个。",
     )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="每个变体重复跑几轮，报告给均值 + 每轮原值。同配置的分数会摆"
+        "（实测同一条用例能从 2.0 摆到 5.0），单次跑出来的红和绿都不可判定。"
+        "耗时与花费按轮数线性增长。默认 1",
+    )
     parser.add_argument("--dataset", default=None, help="改用别的任务集文件")
     parser.add_argument("--out", default=_REPORT_DIR, help="报告输出目录")
     parser.add_argument("--quiet", action="store_true", help="只输出报告，不打进度")
@@ -434,7 +481,16 @@ async def main() -> None:
             raise SystemExit("修好之后再跑，或者加 --force 明知故犯。")
         print("--force：继续运行，审批相关的列可能不可用。\n")
 
-    report = await agent_runner.run(variants, tasks)
+    rounds = max(1, args.repeat)
+    if rounds > 1:
+        # 开跑之前把代价说出来。48 个任务一轮约 30 分钟，--repeat 3 就是一个半
+        # 小时和三倍 API 花费——那是应该在按回车之前知道的事，不是跑到一半才发现。
+        print(
+            f"--repeat {rounds}：{len(variants)} 个变体 × {len(tasks)} 个任务 × "
+            f"{rounds} 轮，耗时与花费都是单轮的 {rounds} 倍。\n"
+        )
+
+    report = await agent_runner.run(variants, tasks, repeat=rounds)
     markdown = render_markdown(report)
 
     os.makedirs(args.out, exist_ok=True)

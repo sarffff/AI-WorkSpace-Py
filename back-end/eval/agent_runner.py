@@ -1810,65 +1810,249 @@ def _turn_detail(spec: TurnSpec, outcome: TurnOutcome) -> dict[str, Any]:
     }
 
 
+def _task_detail(result: TaskResult) -> dict[str, Any]:
+    """一条用例的逐项明细。
+
+    从 ``run`` 里抽出来是为了让 ``--repeat`` 的合并能复用同一份形状——
+    合并要按 id 把 N 轮的同一条用例对齐，而对齐的前提是每轮产出的字典结构一致。
+    """
+    return {
+        "id": result.task.id,
+        "probe": result.task.probe,
+        "title": result.task.title,
+        "rubric": result.task.rubric,
+        "useRag": result.task.use_rag,
+        "stubMode": result.task.stub_mode,
+        "success": result.verdict.success,
+        "grounded": result.verdict.grounded,
+        "fabricatedToolOutput": result.verdict.fabricated_tool_output,
+        "judgeReason": result.verdict.reason,
+        "judgeFailed": result.verdict.failed,
+        "evidenceSteps": result.evidence_steps,
+        "writtenDocuments": result.written_documents,
+        # 实际搜索词原样留下：罐头结果是按关键词命中的，
+        # 命中不了的查询会以 stubMisses 出现，靠这一列去调数据集
+        "stubQueries": result.stub_queries,
+        "stubMisses": result.stub_misses,
+        # 预置的记忆原样留下：这个任务失败时第一件要确认的事就是
+        # "模型当时到底看到了什么"，而它不在对话里、也不在工具轨迹里
+        "seedMemories": result.task.seed_memories,
+        # 抽取类任务：落库的记忆正文原样留下。这条失败时要看的不是分数，
+        # 而是"它到底把哪句话记成了记忆"
+        "extraction": (
+            {
+                "question": result.task.extraction.question,
+                "answer": result.task.extraction.answer,
+                "mustStore": result.task.extraction.must_store,
+                "mustNotStore": result.task.extraction.must_not_store,
+                "written": result.extraction.written,
+                "stored": result.extraction.stored,
+                "storeHits": result.extraction.store_hits,
+                "storeTotal": result.extraction.store_total,
+                "leaked": result.extraction.leaked,
+                "resisted": result.extraction.resisted,
+                "recall": result.extraction.recall,
+                "errors": result.extraction.errors,
+            }
+            if result.extraction is not None
+            and result.task.extraction is not None
+            else None
+        ),
+        "turns": [
+            _turn_detail(spec, outcome)
+            for spec, outcome in zip(result.task.turns, result.turns)
+        ],
+    }
+
+
+# ========== 重复跑与合并 ==========
+#
+# 同配置的分数会摆。实测:同一个变体连跑两次,某条用例能从 2.0 摆到 5.0。
+# 于是"单次跑出来的红"和"单次跑出来的绿"都不可判定——这个仓库为此手搭过三次
+# 一次性探针,每次都在重新发明同一件事。
+#
+# 合并的判据不需要硬编码字段名:
+#
+#   **跨轮完全相同的字段,恰好就是数据集描述量**(tasks、turns、injectionCases、
+#   systemPrompt)。所以规则是"全部相同就原样保留、不记波动;数值就取均值并记
+#   min/max"。相同的值取均值等于它自己,两类字段因此自动分开,不用维护一张名单。
+#
+# 要避开的坑:``modelToolCalls`` 这类是**跨任务求和**的计数。按求和合并的话
+# ``--repeat 3`` 会把 53 变成 159,每一处读数都错,而且看起来像回归。必须取均值。
+
+
+def _is_number(value: Any) -> bool:
+    """bool 是 int 的子类，但把 True 当 1 去平均没有意义。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _merge_summaries(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    """把同一变体的 N 轮汇总合成一行。
+
+    ``repeat=1`` 时原样返回那一轮——默认行为必须和改动前逐字节一致，否则历史
+    报告和新报告不可比，而"能不能比"正是这个功能要解决的问题。
+    """
+    if len(runs) == 1:
+        return runs[0]
+
+    merged: dict[str, Any] = {}
+    spread: dict[str, dict[str, Any]] = {}
+    for key in runs[0]:
+        values = [run.get(key) for run in runs]
+
+        # 1. 跨轮完全相同 → 原样保留，不记波动。
+        if all(value == values[0] for value in values[1:]):
+            merged[key] = values[0]
+            continue
+
+        present = [value for value in values if value is not None]
+        numbers = [value for value in present if _is_number(value)]
+        # 2. 数值 → 均值 + min/max + 每轮原值。
+        #    None 表示"这一轮没有可判定的样本"（裁判全失败之类），只对有值的那几轮
+        #    求均值；而 values 里把 None 留着——少了它就看不出这是几轮里的均值。
+        if numbers and len(numbers) == len(present):
+            merged[key] = metrics.mean(numbers)
+            spread[key] = {
+                "min": min(numbers),
+                "max": max(numbers),
+                "values": values,
+            }
+            continue
+
+        # 3. 逐键都是数值的字典（successByProbe）→ 按键平均。
+        #    某个 probe 可能在某一轮整体缺席，只平均在场的那几轮。
+        if all(value is None or isinstance(value, dict) for value in values):
+            per_key: dict[str, Any] = {}
+            for inner in sorted({k for value in values if value for k in value}):
+                got = [
+                    value[inner]
+                    for value in values
+                    if value and _is_number(value.get(inner))
+                ]
+                per_key[inner] = metrics.mean(got) if got else None
+            merged[key] = per_key
+            continue
+
+        # 4. 列表（unpricedModels / skillsLoaded / turnErrorReasons）→ 按出现顺序去重。
+        #    turnErrorReasons 是已经格式化过的 "原因 ×N"，这里**不重新求和**：
+        #    解析那个字符串再相加很脆，而合并后的列表已经能回答"哪几类错误出现过"。
+        if all(value is None or isinstance(value, list) for value in values):
+            seen: list[Any] = []
+            for value in values:
+                for item in value or []:
+                    if item not in seen:
+                        seen.append(item)
+            merged[key] = seen
+            continue
+
+        merged[key] = values[0]
+
+    merged["runs"] = len(runs)
+    merged["spread"] = spread
+    return merged
+
+
+def _merge_details(runs: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """逐用例的跨轮分数。这是 ``--repeat`` 真正要给的东西。
+
+    汇总行的均值回答不了"这条用例是不稳、还是真的退化了"：6 条用例各动 2 分而
+    总分几乎不变是完全可能的（2026-09-12 那轮就是 3 升 3 降，总分 4.600→4.619）。
+    """
+    if len(runs) == 1:
+        return runs[0]
+
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for run_details in runs:
+        for task in run_details:
+            task_id = task["id"]
+            if task_id not in by_id:
+                by_id[task_id] = []
+                order.append(task_id)
+            by_id[task_id].append(task)
+
+    merged: list[dict[str, Any]] = []
+    for task_id in order:
+        entries = by_id[task_id]
+        scored = [entry for entry in entries if _is_number(entry.get("success"))]
+        # 轨迹留**分最低那一轮**的，不是第一轮的。留全部会让报告体积 ×N
+        # （48 任务的 JSON 已经四千多行），而排查波动时想读的恰恰是失败那次的
+        # 工具序列——留第一轮有一半概率留错。
+        worst = min(scored, key=lambda e: e["success"]) if scored else entries[0]
+        base = dict(worst)
+        base["runs"] = len(entries)
+        base["traceFromRun"] = entries.index(worst) + 1
+
+        for field_name in ("success", "grounded"):
+            per_run = [entry.get(field_name) for entry in entries]
+            numbers = [value for value in per_run if _is_number(value)]
+            base[f"{field_name}Runs"] = per_run
+            base[field_name] = metrics.mean(numbers) if numbers else None
+        # 每轮的裁判理由都留：同一条用例两轮失败的原因可能完全不同，而
+        # "原因每轮都一样"和"原因每轮都变"对应的处置相反（改用例 vs 认噪声）。
+        base["judgeReasonRuns"] = [entry.get("judgeReason") for entry in entries]
+        merged.append(base)
+    return merged
+
+
+# 判定"这条用例在跨轮之间摆了"的阈值。取 2.0 是因为裁判兜底值是 3.0，
+# 而 5.0↔3.0 正好差 2.0——那就是这个仓库实测出现过的形状。
+_VOLATILE_SPAN = 2.0
+
+
+def volatile_tasks(details: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """跨轮波动超过阈值的用例，按波动幅度降序。
+
+    单次跑看不见这个。它回答的是报告里最常被误读的那个问题：
+    某条用例这次红了，是它真的退化了，还是它一直在摆。
+    """
+    rows = []
+    for task in details:
+        per_run = [value for value in task.get("successRuns") or [] if _is_number(value)]
+        if len(per_run) < 2:
+            continue
+        span = max(per_run) - min(per_run)
+        if span >= _VOLATILE_SPAN:
+            rows.append(
+                {
+                    "id": task["id"],
+                    "probe": task.get("probe"),
+                    "span": span,
+                    "values": task.get("successRuns"),
+                }
+            )
+    return sorted(rows, key=lambda row: row["span"], reverse=True)
+
+
 async def run(
-    variants: list[AgentVariant], tasks: list[AgentTask]
+    variants: list[AgentVariant],
+    tasks: list[AgentTask],
+    *,
+    repeat: int = 1,
 ) -> dict[str, Any]:
+    """跑一遍（或 N 遍）全部变体。
+
+    ``repeat`` 是同一变体重复跑的轮数。轮与轮之间**不共享任何状态**：
+    ``run_variant`` 每次自己起临时工作区、自己清库，所以第二轮不是"接着第一轮跑"，
+    而是一次独立复现。这正是它能用来判噪声的前提。
+    """
     # 评估依赖埋点来算成本与延迟，强制打开
     settings.TELEMETRY_ENABLED = True
+    rounds = max(1, repeat)
 
     summaries: list[dict[str, Any]] = []
     details: dict[str, list[dict[str, Any]]] = {}
     for variant in variants:
-        summary, results = await run_variant(variant, tasks)
-        summaries.append(summary)
-        details[variant.name] = [
-            {
-                "id": result.task.id,
-                "probe": result.task.probe,
-                "title": result.task.title,
-                "rubric": result.task.rubric,
-                "useRag": result.task.use_rag,
-                "stubMode": result.task.stub_mode,
-                "success": result.verdict.success,
-                "grounded": result.verdict.grounded,
-                "fabricatedToolOutput": result.verdict.fabricated_tool_output,
-                "judgeReason": result.verdict.reason,
-                "judgeFailed": result.verdict.failed,
-                "evidenceSteps": result.evidence_steps,
-                "writtenDocuments": result.written_documents,
-                # 实际搜索词原样留下：罐头结果是按关键词命中的，
-                # 命中不了的查询会以 stubMisses 出现，靠这一列去调数据集
-                "stubQueries": result.stub_queries,
-                "stubMisses": result.stub_misses,
-                # 预置的记忆原样留下：这个任务失败时第一件要确认的事就是
-                # "模型当时到底看到了什么"，而它不在对话里、也不在工具轨迹里
-                "seedMemories": result.task.seed_memories,
-                # 抽取类任务：落库的记忆正文原样留下。这条失败时要看的不是分数，
-                # 而是"它到底把哪句话记成了记忆"
-                "extraction": (
-                    {
-                        "question": result.task.extraction.question,
-                        "answer": result.task.extraction.answer,
-                        "mustStore": result.task.extraction.must_store,
-                        "mustNotStore": result.task.extraction.must_not_store,
-                        "written": result.extraction.written,
-                        "stored": result.extraction.stored,
-                        "storeHits": result.extraction.store_hits,
-                        "storeTotal": result.extraction.store_total,
-                        "leaked": result.extraction.leaked,
-                        "resisted": result.extraction.resisted,
-                        "recall": result.extraction.recall,
-                        "errors": result.extraction.errors,
-                    }
-                    if result.extraction is not None
-                    and result.task.extraction is not None
-                    else None
-                ),
-                "turns": [
-                    _turn_detail(spec, outcome)
-                    for spec, outcome in zip(result.task.turns, result.turns)
-                ],
-            }
-            for result in results
-        ]
-    return {"summaries": summaries, "details": details}
+        run_summaries: list[dict[str, Any]] = []
+        run_details: list[list[dict[str, Any]]] = []
+        for index in range(rounds):
+            if rounds > 1:
+                logger.info(
+                    "===== %s 第 %s/%s 轮 =====", variant.name, index + 1, rounds
+                )
+            summary, results = await run_variant(variant, tasks)
+            run_summaries.append(summary)
+            run_details.append([_task_detail(result) for result in results])
+        summaries.append(_merge_summaries(run_summaries))
+        details[variant.name] = _merge_details(run_details)
+    return {"summaries": summaries, "details": details, "runs": rounds}
