@@ -10,6 +10,7 @@ import type {
   JoinWorkspaceResponse,
   UploadDocumentResponse,
   WorkspaceInfo,
+  WorkspaceMemberMutationResponse,
   LoginRequest,
   RegisterRequest,
   AuthResponse,
@@ -842,6 +843,62 @@ export class ApiClient {
         .then((body) => body?.detail)
         .catch(() => null);
       throw new Error(detail || `加入工作区失败: ${response.statusText}`);
+    }
+
+    return response.json();
+  }
+
+  /**
+   * 改一个成员的角色(仅管理员)。
+   * PATCH /workspace/members/{id}
+   *
+   * 四种失败(非管理员、人不在本空间、角色非法、最后一个管理员)后端都回 400,
+   * detail 是面向用户的中文——直接透出去,调用方不需要分辨是哪一种。
+   */
+  async setMemberRole(
+    memberId: string,
+    role: "admin" | "user",
+  ): Promise<WorkspaceMemberMutationResponse> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/workspace/members/${encodeURIComponent(memberId)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role }),
+      },
+    );
+
+    if (!response.ok) {
+      const detail = await response
+        .json()
+        .then((body) => body?.detail)
+        .catch(() => null);
+      throw new Error(detail || `修改角色失败: ${response.statusText}`);
+    }
+
+    return response.json();
+  }
+
+  /**
+   * 把一个成员移出工作区(仅管理员)。
+   * DELETE /workspace/members/{id}
+   *
+   * 响应里带整份 workspace,调用方直接拿去替换本地状态——再发一次 GET 会闪。
+   */
+  async removeMember(
+    memberId: string,
+  ): Promise<WorkspaceMemberMutationResponse> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/workspace/members/${encodeURIComponent(memberId)}`,
+      { method: "DELETE" },
+    );
+
+    if (!response.ok) {
+      const detail = await response
+        .json()
+        .then((body) => body?.detail)
+        .catch(() => null);
+      throw new Error(detail || `移除成员失败: ${response.statusText}`);
     }
 
     return response.json();

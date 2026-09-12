@@ -124,6 +124,18 @@ export interface WorkspaceMember {
   name: string;
   /** `member` 是历史值，语义等同 `user`（见 WorkspaceInfo.role） */
   role: "admin" | "user" | "member";
+  /**
+   * 下面三个是**管理字段**，只有 admin 拿得到（后端按 is_admin 决定发不发）。
+   * 普通成员看到的成员项里它们完全不存在——名册本身全员可见（同一个空间里
+   * 知道彼此是谁不是特权），但 email 是 PII。
+   *
+   * 所以它们都是可选的，而界面上要按 `isAdmin` 判断该不该渲染管理列，
+   * 不要靠"email 有没有值"去推断权限。
+   */
+  email?: string;
+  isActive?: boolean;
+  /** 这一行是不是当前登录的人。自己那行的移除按钮要禁掉 */
+  isSelf?: boolean;
 }
 
 export interface WorkspaceInfo {
@@ -139,8 +151,26 @@ export interface WorkspaceInfo {
   isAdmin?: boolean;
   memberCount: number;
   members: WorkspaceMember[];
+  /**
+   * 还剩几个管理员。界面靠它决定"最后一个管理员"那两个动作要不要禁掉。
+   *
+   * 后端直接给，而不是让前端数 `members` 里的 admin：那是把一条不变量抄到
+   * 第二个地方，而它在后端是拒绝的依据。两处算法漂移的表现是按钮可点、
+   * 点了报错。
+   *
+   * 可选是为了兼容旧后端。
+   */
+  adminCount?: number;
   /** 邀请码只发给 admin；user 拿到的是 null，界面上就不该出现它 */
   inviteCode?: string | null;
+}
+
+/** PATCH/DELETE /workspace/members/... 的返回。带整份 info，省一次 GET */
+export interface WorkspaceMemberMutationResponse {
+  success: boolean;
+  workspace: WorkspaceInfo;
+  member?: { id: string; name: string; role: string };
+  removed?: { id: string; name: string };
 }
 
 export interface JoinWorkspaceResponse {
