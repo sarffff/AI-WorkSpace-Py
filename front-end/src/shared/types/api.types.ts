@@ -1019,6 +1019,13 @@ export interface BuiltinSkill {
   /** 附带文件名。模型用 read_skill_file 读它们 */
   attachments: string[];
   /**
+   * 下结论之前必须先拿到的材料，逗号分隔。内置的来自 SKILL.md 的 frontmatter。
+   *
+   * 它不是提示词，是给结论结构提供必填槽位：缺一项就只能是"需要人判断"，
+   * 由后端强制。空串表示这份指导不是审核型的（写作指导就没有）。
+   */
+  requiredInputs: string;
+  /**
    * 是否被同名的工作区 skill 盖掉了。
    *
    * 必须显示出来：不显示的话 admin 写了一份同名的却看不出内置那份已经不生效，
@@ -1034,6 +1041,15 @@ export interface WorkspaceSkill {
   description: string;
   instructions: string;
   enabled: boolean;
+  /** 同 BuiltinSkill.requiredInputs，逗号分隔 */
+  requiredInputs: string;
+  /**
+   * 规程版本号。正文、描述或前置材料声明变了才 +1（切启用开关不算）。
+   *
+   * 审核结论会引用它，所以它要显示出来：admin 才能对上"这条结论按的是哪一版"。
+   * 改一次 SOP 而版本号不动的话，历史结论的依据就指向一份已经不存在的文本。
+   */
+  version: number;
   updatedAt: string | null;
 }
 

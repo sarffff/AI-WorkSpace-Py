@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SkillPanel } from "./SkillPanel";
 
 /**
@@ -16,7 +16,7 @@ import { SkillPanel } from "./SkillPanel";
  */
 
 vi.mock("@/shared/api/client", () => ({
-  apiClient: { getSkills: vi.fn() },
+  apiClient: { getSkills: vi.fn(), saveSkill: vi.fn(), deleteSkill: vi.fn() },
 }));
 
 vi.mock("@/shared/ui/Toast", () => ({
@@ -33,6 +33,7 @@ const base = {
       name: "expense-review",
       description: "审核报销单",
       attachments: ["报销额度标准.md"],
+      requiredInputs: "出差城市, 发生日期, 费用类别, 发票或等效凭证",
       overridden: false,
     },
   ],
@@ -68,6 +69,8 @@ describe("SkillPanel", () => {
           description: "本公司流程",
           instructions: "只看三项。",
           enabled: true,
+          requiredInputs: "",
+          version: 1,
           updatedAt: null,
         },
       ],
@@ -113,6 +116,8 @@ describe("SkillPanel", () => {
           description: "写季度报告",
           instructions: "按模板写。",
           enabled: false,
+          requiredInputs: "",
+          version: 1,
           updatedAt: null,
         },
       ],
@@ -120,5 +125,74 @@ describe("SkillPanel", () => {
     render(<SkillPanel />);
 
     await waitFor(() => expect(screen.getByText("已停用")).toBeTruthy());
+  });
+
+  it("显示必备材料与规程版本", async () => {
+    vi.mocked(apiClient.getSkills).mockResolvedValue({
+      ...base,
+      workspace: [
+        {
+          id: "s1",
+          name: "expense",
+          description: "本公司报销流程",
+          instructions: "按三步走。",
+          enabled: true,
+          requiredInputs: "金额, 凭证",
+          version: 4,
+          updatedAt: null,
+        },
+      ],
+    });
+    render(<SkillPanel />);
+
+    // 必备材料决定 AI 什么时候会拒绝下结论，光看正文看不出来
+    await waitFor(() => expect(screen.getByText(/金额, 凭证/)).toBeTruthy());
+    // 版本号是审核结论引用的那个号，对不上就查不出"当时按的哪一版"
+    expect(screen.getByText(/第 4 版/)).toBeTruthy();
+  });
+
+  it("编辑已有指导时把必备材料带进草稿", async () => {
+    // 这条钉的是覆盖陷阱：PUT 是整体覆盖，编辑时不回填原值的话，
+    // 保存一次就把声明抹成空串——不报错，只是审核安静地松一档。
+    vi.mocked(apiClient.getSkills).mockResolvedValue({
+      ...base,
+      workspace: [
+        {
+          id: "s1",
+          name: "expense",
+          description: "本公司报销流程",
+          instructions: "按三步走。",
+          enabled: true,
+          requiredInputs: "金额, 凭证",
+          version: 2,
+          updatedAt: null,
+        },
+      ],
+    });
+    vi.mocked(apiClient.saveSkill).mockResolvedValue({
+      id: "s1",
+      name: "expense",
+      description: "本公司报销流程",
+      enabled: true,
+      requiredInputs: "金额, 凭证",
+      version: 2,
+    });
+    render(<SkillPanel />);
+
+    await waitFor(() => expect(screen.getByTitle("编辑")).toBeTruthy());
+    fireEvent.click(screen.getByTitle("编辑"));
+
+    // 草稿里回填了原值，而不是空
+    const field = await waitFor(() =>
+      screen.getByDisplayValue("金额, 凭证"),
+    );
+    expect(field).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() =>
+      expect(vi.mocked(apiClient.saveSkill)).toHaveBeenCalledWith(
+        expect.objectContaining({ requiredInputs: "金额, 凭证" }),
+      ),
+    );
   });
 });

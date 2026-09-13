@@ -34,6 +34,15 @@ class SkillUpsertRequest(BaseModel):
     description: str = Field(min_length=1, max_length=255)
     instructions: str = Field(min_length=1)
     enabled: bool = True
+    # 下结论之前必须先拿到的东西，逗号分隔（中英文逗号都收）。
+    #
+    # 它不是提示词，是给 structured.ReviewVerdict 提供必填槽位：审核型 SOP 填了它，
+    # 结论里就有对应数量的核对项，缺一项就只能是 needs_human——由代码强制。
+    # 写作指导类的 SOP 留空即可。
+    #
+    # 500 与 models.WorkspaceSkill.required_inputs 的列宽一致：在这里挡住比在
+    # 数据库层截断好，后者会把最后一项悄悄截掉半个字，而那一项就永远 found=false。
+    required_inputs: str = Field(default="", max_length=500)
 
 
 def _require_admin(user: User) -> None:
@@ -82,6 +91,7 @@ async def upsert_skill(
             instructions=body.instructions,
             enabled=body.enabled,
             created_by=current_user.id,
+            required_inputs=body.required_inputs,
         )
     except SkillError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -92,6 +102,10 @@ async def upsert_skill(
         "name": row.name,
         "description": row.description,
         "enabled": row.enabled,
+        "requiredInputs": row.required_inputs,
+        # 回传版本号，界面上才看得出这次保存到底算不算一次改动——
+        # 改了正文版本号会跳，只切 enabled 不会。
+        "version": row.version,
     }
 
 

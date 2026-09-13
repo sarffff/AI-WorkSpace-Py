@@ -29,7 +29,15 @@ import {
  * 停用（而不是删除）会退回内置那份：改坏一条之后想先关掉看看，比删了重录便宜。
  */
 
-const EMPTY_DRAFT = { name: "", description: "", instructions: "", enabled: true };
+const EMPTY_DRAFT = {
+  name: "",
+  description: "",
+  instructions: "",
+  enabled: true,
+  // 必须在草稿里：PUT 是整体覆盖，编辑一条已有 SOP 时不带上原值就会把声明
+  // 覆盖成空串。那不报错——只是审核少了几个必填项，安静地松一档。
+  requiredInputs: "",
+};
 
 export const SkillPanel: React.FC<{ className?: string }> = ({
   className = "",
@@ -177,6 +185,26 @@ export const SkillPanel: React.FC<{ className?: string }> = ({
             placeholder={"具体怎么做。例如：\n1. 先确认出差城市与日期\n2. 从知识库查额度上限，不要凭印象\n3. 逐项核对并列出超出部分"}
             className="w-full resize-y rounded-lg px-2.5 py-2 text-xs font-mono bg-white dark:bg-[#151412] border border-[#e3dfd5] dark:border-[#2e2d2a] text-[#3d3929] dark:text-[#e8e6dc] placeholder:text-[#a19f96] focus:outline-none focus:border-[#da7756]"
           />
+          <input
+            value={draft.requiredInputs}
+            onChange={(e) =>
+              setDraft({ ...draft, requiredInputs: e.target.value })
+            }
+            placeholder="下结论前必须拿到的材料，逗号分隔（可留空）"
+            className="w-full rounded-lg px-2.5 py-1.5 text-xs bg-white dark:bg-[#151412] border border-[#e3dfd5] dark:border-[#2e2d2a] text-[#3d3929] dark:text-[#e8e6dc] placeholder:text-[#a19f96] focus:outline-none focus:border-[#da7756]"
+          />
+          {/*
+            这句要说清它和上面正文的区别：正文里写"缺了就问用户"是**给 AI 的请求**，
+            而这一行是**结构约束**——填了的每一项都会变成结论里的必填核对项，
+            缺一项就只能给"需要人判断"，AI 绕不过去。
+
+            两者不冲突，但只写正文那句话是不够的：实测 4 条该提问的用例里
+            AI 主动提问 0 次。
+          */}
+          <div className="text-[11px] text-[#a19f96]">
+            填了的每一项都会成为结论里的必填核对项，缺一项 AI 只能给"需要人判断"，
+            不能自己假设。不是审核类指导可以留空。
+          </div>
           <div className="flex items-center justify-between">
             <label className="flex items-center gap-1.5 text-xs text-[#6e6b63] dark:text-[#a19f96]">
               <input
@@ -241,6 +269,19 @@ export const SkillPanel: React.FC<{ className?: string }> = ({
                     <div className="mt-0.5 text-[11px] text-[#6e6b63] dark:text-[#a19f96]">
                       {skill.description}
                     </div>
+                    {/*
+                      前置材料要显示出来：它决定 AI 在什么情况下会拒绝下结论，
+                      而这件事光看正文看不出来。版本号跟着它一起显示——审核结论
+                      引用的就是那个号，对不上就查不出"当时按的哪一版"。
+                    */}
+                    {skill.requiredInputs ? (
+                      <div className="mt-1 text-[10px] text-[#6e6b63] dark:text-[#a19f96]">
+                        必备材料：{skill.requiredInputs}
+                        <span className="ml-1.5 text-[#a19f96]">
+                          （第 {skill.version} 版）
+                        </span>
+                      </div>
+                    ) : null}
                   </div>
                   {canEdit ? (
                     <div className="flex gap-0.5 shrink-0">
@@ -252,6 +293,7 @@ export const SkillPanel: React.FC<{ className?: string }> = ({
                             description: skill.description,
                             instructions: skill.instructions,
                             enabled: skill.enabled,
+                            requiredInputs: skill.requiredInputs ?? "",
                           })
                         }
                         className="p-1.5 rounded-lg text-[#6e6b63] dark:text-[#a19f96] hover:bg-[#e3dfd5]/60 dark:hover:bg-[#2e2d2a]"
@@ -306,6 +348,12 @@ export const SkillPanel: React.FC<{ className?: string }> = ({
                 <div className="mt-0.5 text-[11px] text-[#6e6b63] dark:text-[#a19f96]">
                   {skill.description}
                 </div>
+                {/* 同工作区那侧一个含义，来源是 SKILL.md 的 frontmatter */}
+                {skill.requiredInputs ? (
+                  <div className="mt-1 text-[10px] text-[#6e6b63] dark:text-[#a19f96]">
+                    必备材料：{skill.requiredInputs}
+                  </div>
+                ) : null}
                 {skill.attachments.length ? (
                   <div className="mt-1 flex flex-wrap items-center gap-1">
                     {skill.attachments.map((filename) => (

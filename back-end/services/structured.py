@@ -34,7 +34,13 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, TypeVar
 
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from config import settings
 from services.telemetry import current_span
@@ -305,6 +311,82 @@ class TaskScores(BaseModel):
     grounded: float = Field(ge=1, le=5)
     fabricated_tool_output: bool | None = None
     reason: str = ""
+
+
+class InputCheck(BaseModel):
+    """SOP 声明的一项前置材料，在这次的材料里找到了没有。"""
+
+    name: str = Field(description="对应 SOP required_inputs 里的一项")
+    # 抄原值再判在不在。顺序和 AbstentionVerdict 里 reason 先于 abstained 同一个
+    # 理由：先写值，found 才是看着值下的判断；反过来 found 在找之前就落定了。
+    #
+    # 模型说"找到了金额"而 value 是空的，那和没找到是同一回事——但只看 found
+    # 分不出来，而这一列是给人复核的。
+    value: str | None = Field(default=None, description="找到的原值，没找到留空")
+    found: bool = Field(description="在材料里找到了没有。拿不准填 false")
+
+
+class ReviewVerdict(BaseModel):
+    """一次审核的结论。
+
+    ## 为什么结论必须是结构，不能是一段话
+
+    三件事全踩在这上面：
+
+    1. **「缺前提就别下结论」变成可强制的。** 自由文本里"依据不足"是一句话，
+       没法判定；这里它是 ``verdict`` 的一个取值，而下面那个 validator 让
+       "有 found=false 却填 pass" 直接构造失败。
+    2. **「跑两遍结论一致吗」变成可机械比较的。** 比 ``verdict`` 字段而不比文本：
+       措辞变了但结论相同、措辞相同但金额差一位，比文本这两种都会误判。
+       2026-09-12 实测过摆动就在结论层——同一条用例三轮工具序列逐次相同、
+       分数 5/5/3，所以这个比较是**必要**的，不是防御性设计。
+    3. **「按的是哪一版 SOP」进得了台账。** 规程改一次，历史结论不该失去依据。
+
+    ## 字段顺序：先核材料、再写依据、最后落结论
+
+    同 ``AbstentionVerdict`` 那条教训（``reason`` 刻意排在 ``abstained`` 之前）：
+    bool 排在推理之前时，它在理由写完之前就落定了，而模型写完理由不会回头改。
+    这里放大到整个结论——``inputs`` → ``basis`` → ``verdict``。
+
+    ## needs_human 不是失败
+
+    它是这个产品最有价值的那种输出。审核这份工作的全部意义在于"拿不准就往上抬
+    一级"，把它算成失败会让人去优化掉它——那正好优化掉了价值。
+    """
+
+    # 逐项对齐 SOP 的 required_inputs。**长度必须等于声明的项数**，由调用方校验
+    # （这个类拿不到 skill）。少一项是"没检查"，它和"检查了没找到"处置相反。
+    inputs: list[InputCheck] = Field(description="逐项核对 SOP 声明的前置材料")
+    # 每条依据要能回指两处：规程的哪一条、材料的哪个位置。只给结论不给依据的话，
+    # 人要复核就得把整件事重做一遍，那审核没省下任何东西。
+    basis: list[str] = Field(
+        default_factory=list, description="结论依据：引用的规程条目 + 材料出处"
+    )
+    verdict: Literal["pass", "reject", "needs_human"] = Field(
+        description="通过 / 不通过 / 需要人判断。任何一项 found=false 时只能填 needs_human"
+    )
+    sop_name: str = Field(description="按的哪份 SOP")
+    sop_version: int = Field(description="那份 SOP 的版本号")
+
+    @model_validator(mode="after")
+    def _missing_inputs_force_human(self) -> "ReviewVerdict":
+        """缺任何一项前置材料 → 只能是 needs_human。
+
+        这是整个设计的支点，所以它在**代码**里而不在提示词里。放提示词里它是一句
+        请求，而这个仓库有六次记录说明"请求模型多做一件事"不成立（记忆 ×3、
+        ask_user ×2、skill ×1），唯一成功的一次是"撤掉一句邀请"。
+
+        校验失败会被 ``request_structured`` 当成 ValidationError 并把原文回灌重试
+        （见 ``_retry_message``）。重试仍失败则整份结论作废，而那是正确的处置：
+        一份"缺着材料却说通过"的结论比没有结论危险得多。
+        """
+        missing = [item.name for item in self.inputs if not item.found]
+        if missing and self.verdict != "needs_human":
+            raise ValueError(
+                f"这些前置材料没找到：{'、'.join(missing)}；"
+                f"缺材料时 verdict 只能是 needs_human，不能是 {self.verdict}"
+            )
+        return self
 
 
 # ---- 请求 -------------------------------------------------------------------

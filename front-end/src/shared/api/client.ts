@@ -1423,11 +1423,31 @@ export class ApiClient {
     description: string;
     instructions: string;
     enabled?: boolean;
-  }): Promise<Pick<WorkspaceSkill, "id" | "name" | "description" | "enabled">> {
+    /**
+     * 逗号分隔的前置材料。**必须传**——PUT 是整体覆盖，不传就会把已有的声明
+     * 覆盖成空串，而那不报错：审核从此少了几个必填槽位，安静地松了一档。
+     */
+    requiredInputs?: string;
+  }): Promise<
+    Pick<
+      WorkspaceSkill,
+      "id" | "name" | "description" | "enabled" | "requiredInputs" | "version"
+    >
+  > {
     const response = await this.authedFetch(`${this.baseUrl}/skills`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      // 逐字段列出而不是原样 JSON.stringify(payload)：后端字段是 snake_case
+      // （同 joinWorkspace 的 invite_code）。整体透传的话 requiredInputs 会被
+      // Pydantic 当成未知键丢掉，而 required_inputs 取默认空串——保存成功、
+      // 声明消失，一声不响。
+      body: JSON.stringify({
+        name: payload.name,
+        description: payload.description,
+        instructions: payload.instructions,
+        enabled: payload.enabled,
+        required_inputs: payload.requiredInputs ?? "",
+      }),
     });
     if (!response.ok) {
       const detail = await response

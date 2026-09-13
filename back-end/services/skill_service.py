@@ -72,6 +72,10 @@ def available(db: Session, workspace_id: str) -> dict[str, Skill]:
             source="workspace",
             # 工作区 skill 没有附带文件（理由见迁移 0014 的文档）
             attachments=(),
+            # 和内置 skill 的 frontmatter 共用一套解析：两处各写一遍的话
+            # "逗号后的空格算不算"迟早分叉，而分叉的表现是同一份 SOP 在两种
+            # 来源下要求的项数不一样——不报错，只是审核松了一档。
+            required_inputs=skill_library.parse_required_inputs(row.required_inputs),
         )
     return merged
 
@@ -191,6 +195,9 @@ def list_for_admin(db: Session, workspace_id: str) -> dict[str, Any]:
                 "name": skill.name,
                 "description": skill.description,
                 "attachments": list(skill.attachments),
+                # 内置的声明来自 frontmatter，和工作区那侧同一个键名，
+                # 好让界面上两层用同一个渲染
+                "requiredInputs": ", ".join(skill.required_inputs),
                 # 内置 skill 被同名工作区 skill 盖掉时要显示出来，
                 # 否则 admin 会以为自己写的那份没生效
                 "overridden": name in workspace and workspace[name].enabled,
@@ -204,6 +211,9 @@ def list_for_admin(db: Session, workspace_id: str) -> dict[str, Any]:
                 "description": row.description,
                 "instructions": row.instructions,
                 "enabled": row.enabled,
+                "requiredInputs": row.required_inputs or "",
+                # 审核结论引用的就是这个号。列出来才能对上"这条结论按的哪一版"
+                "version": row.version or 1,
                 "updatedAt": row.updated_at.isoformat() if row.updated_at else None,
             }
             for row in sorted(workspace.values(), key=lambda item: item.name)
@@ -221,11 +231,25 @@ def upsert(
     instructions: str,
     enabled: bool = True,
     created_by: str | None = None,
+    required_inputs: str = "",
 ) -> WorkspaceSkill:
     """新增或更新一条工作区 skill。
 
     按 ``(workspace_id, name)`` upsert 而不是"重名报错"：admin 在界面上改一条 SOP
     的正文是最常见的操作，让它变成"先删再建"会丢掉 created_by 与创建时间。
+
+    ## version 什么时候 +1
+
+    只在 ``instructions`` 或 ``description`` 真的变了的时候。理由分两头：
+
+    - **不能不涨。** 审核结论会引用 ``sop_version``（见 ``ReviewVerdict``）。
+      不涨的话 admin 改一次 SOP，之前所有结论的依据就都指向一份已经不存在的文本
+      ——三个月后有人问"当时为什么通过"，答不出来。
+    - **不能乱涨。** ``enabled`` 开关、以及"保存了但一个字没改"都不该让它跳。
+      每次保存都 +1 的话这个号很快大到没人看，"版本变了"这个信号也就没用了。
+
+    ``required_inputs`` 变化**也算**：它直接决定 ``ReviewVerdict`` 有几个必填槽位，
+    也就是直接决定审核的严格程度。改了它而版本号不动，等于悄悄放宽了标准。
     """
     cleaned_name = (name or "").strip()
     if not cleaned_name:
@@ -251,23 +275,43 @@ def upsert(
         .first()
     )
     now = datetime.now()
+    cleaned_description = description.strip()[:255]
+    # 存回去的是**归一化之后**的字符串，不是用户原样输入的那行：比较时才对得上，
+    # 否则把「金额，凭证」改成「金额, 凭证」也会算成一次改动、白涨一个版本号。
+    cleaned_inputs = ", ".join(
+        skill_library.parse_required_inputs(required_inputs)
+    )[:500]
     if row is None:
         row = WorkspaceSkill(
             id=str(uuid.uuid4()),
             workspace_id=workspace_id,
             name=cleaned_name,
-            description=description.strip()[:255],
+            description=cleaned_description,
             instructions=instructions,
             enabled=enabled,
+            required_inputs=cleaned_inputs,
+            # 第 1 版。不是 0——结论里引用「第 0 版」读起来像"还没有版本"
+            version=1,
             created_by=created_by,
             created_at=now,
             updated_at=now,
         )
         db.add(row)
     else:
-        row.description = description.strip()[:255]
+        # 先判再写。写完再比就永远相等了，这是这类"变了才 +1"最容易踩的一脚。
+        changed = (
+            row.instructions != instructions
+            or row.description != cleaned_description
+            or (row.required_inputs or "") != cleaned_inputs
+        )
+        row.description = cleaned_description
         row.instructions = instructions
         row.enabled = enabled
+        row.required_inputs = cleaned_inputs
+        if changed:
+            # `or 1` 兜住存量行:0015 给了 server_default,但已经在内存里的对象
+            # 可能是迁移之前读出来的
+            row.version = (row.version or 1) + 1
         row.updated_at = now
     db.commit()
     db.refresh(row)

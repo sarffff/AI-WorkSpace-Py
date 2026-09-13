@@ -85,10 +85,38 @@ class Skill:
     # 存文件名而不是绝对路径：路径要在读取时重新拼并校验，
     # 存下来的路径过一段时间就可能指向别处（同 fs_roots 里那条理由）。
     attachments: tuple[str, ...] = ()
+    # 这份 SOP 下结论之前必须先拿到的东西。frontmatter 里逗号分隔
+    # （解析器只支持一层 key: value，理由见 _parse_frontmatter）。
+    #
+    # 它的作用**不是**提示模型"记得检查"——那是措辞，而这个仓库有六次记录说明
+    # 请求模型多做一件事不成立。它是给 ``structured.ReviewVerdict`` 提供必填的
+    # 槽位：结构里有那个位置，空着就是空着，模型没法悄悄跳过。于是"漏了一项"
+    # 从判断题（该不该主动问）变成填空题（这一项在不在清单里），而后者机械可查。
+    #
+    # 空 tuple 表示"这份 SOP 没有前置材料要求"——不是每个 skill 都是审核型的，
+    # 有些就是写作指导。所以它不进 _REQUIRED_KEYS。
+    required_inputs: tuple[str, ...] = ()
 
     def index_line(self) -> str:
         """注入索引时的一行。"""
         return f"- {self.name}：{self.description}"
+
+
+def parse_required_inputs(raw: str | None) -> tuple[str, ...]:
+    """把 frontmatter 里那行逗号分隔的前置材料解析成 tuple。
+
+    公开而不是私有：工作区 skill（``skill_service``）存在数据库里，那一侧要用
+    同一套解析。两处各写一遍的话，"逗号后面的空格算不算"这种小事迟早分叉，
+    而分叉的表现是同一份 SOP 在内置和工作区两种来源下要求的材料项数不一样。
+
+    中英文逗号都收：这一行是人在界面上手写的，中文输入法下打出「，」是常态，
+    而因为一个全角逗号就把四项解析成一项，表现是"这份 SOP 只要求一样东西"——
+    不报错，只是审核变松了。
+    """
+    if not raw:
+        return ()
+    normalized = raw.replace("，", ",")
+    return tuple(item.strip() for item in normalized.split(",") if item.strip())
 
 
 def _parse_frontmatter(raw: str, where: str) -> tuple[dict[str, str], str]:
@@ -156,6 +184,7 @@ def _load_builtin() -> dict[str, Skill]:
             instructions=body,
             source="builtin",
             attachments=attachments,
+            required_inputs=parse_required_inputs(meta.get("required_inputs")),
         )
     return skills
 
@@ -222,6 +251,7 @@ __all__ = [
     "attachment_path",
     "builtin",
     "enabled",
+    "parse_required_inputs",
     "reload",
     "validate",
 ]
