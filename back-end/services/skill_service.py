@@ -80,6 +80,30 @@ def available(db: Session, workspace_id: str) -> dict[str, Skill]:
     return merged
 
 
+def version_of(db: Session, workspace_id: str, skill: Skill) -> int:
+    """这份 SOP 当前的版本号。审核结论要记下它。
+
+    **内置 skill 返回 0**，含义是"版本由代码仓库决定，不由这张表决定"。
+    它跟着 git 走，没有行级版本号可言；给个 1 会让台账上"第 1 版"同时指两件事
+    （内置的、以及工作区那份从没改过的），而这两者的追溯方式完全不同——
+    前者去查那次部署的 commit，后者查 workspace_skills。
+
+    0 不是"未知"或"出错"：迁移 0016 给工作区行的 server_default 是 1，
+    所以 0 只会出现在内置这一种情形上，读得出来。
+
+    按 ``skill.source`` 判而不是"查库看有没有行"：同名时工作区那份盖内置
+    （见 ``available``），而被盖掉的那一刻 source 就是 workspace 了——
+    查库会在"有行但停用了、实际用的是内置"这个情形上给出错的版本号。
+    """
+    if skill.source != "workspace":
+        return 0
+    row = _workspace_skills(db, workspace_id).get(skill.name)
+    # 拿不到行却声称是 workspace 来源，说明调用方手上的 Skill 比库里的旧
+    # （比如刚被别人删了）。1 是那张表的起始值，比抛异常合适：
+    # 台账少一次记录比整次审核失败更糟。
+    return (row.version if row else 1) or 1
+
+
 def build_index_block(db: Session, workspace_id: str) -> str:
     """注入用的索引。没有任何 skill 时返回空串（调用方据此不发这条消息）。
 
@@ -345,4 +369,5 @@ __all__ = [
     "most_relevant",
     "reset_vector_cache",
     "upsert",
+    "version_of",
 ]

@@ -18,6 +18,7 @@ from services.guardrails import guard, mask_markup
 from services.knowledge_service import KnowledgeService
 from services.memory_service import memory_service
 from services import prose_question
+from services import review_tools
 from services.model_adapter import (
     ModelAdapter,
     ModelCompletion,
@@ -252,6 +253,13 @@ class _ToolScope:
     workspace_id: str
     is_admin: bool
     history: list[HistoryMessage] = field(default_factory=list)
+    # 审核台账要记"这条结论是哪次对话里审出来的"。**只作线索，不是外键**：
+    # 对话被清理之后结论仍然有效（理由写在 models.ReviewRecord）。
+    #
+    # 带默认值，所以子代理那类不填的调用方行为与改动前逐位相同——而它们也确实
+    # 不该填：子代理拿不到用户原话，写操作永远不给它们。
+    chat_id: str | None = None
+    message_id: str | None = None
 
 
 class _Delegations:
@@ -697,6 +705,24 @@ class ChatService:
         tools.extend(skill_defs)
         if skill_sink is not None:
             skill_sink.append(loaded)
+        # 审核台账。按 **workspace_id**（SOP 是组织资产）+ user_id（谁审的）。
+        #
+        # 没有任何声明了必备材料的 SOP 时 build 返回空列表——一个只放写作指导的
+        # 部署给模型 submit_review 只会让它去猜该记什么。
+        #
+        # 不进审批闸门：闸门问"能不能做这个动作"，而这里人要判断的是**结论对不对**，
+        # 那件事发生在读台账的时候（理由写在 review_tools 的模块文档）。
+        tools.extend(
+            review_tools.build(
+                db,
+                workspace_id=scope.workspace_id,
+                user_id=scope.user_id,
+                # getattr：现有测试用 SimpleNamespace 构造 scope，没有这两个字段。
+                # 缺了就是"这条结论没有对话线索"，合法——台账不依赖外键。
+                chat_id=getattr(scope, "chat_id", None),
+                message_id=getattr(scope, "message_id", None),
+            )
+        )
         return tools
 
     def _approvals_for(
@@ -1090,6 +1116,8 @@ class ChatService:
             is_admin=bool(
                 user and user.role == workspace_service.ROLE_ADMIN
             ),
+            chat_id=chat_id,
+            message_id=message_id,
         )
         async with tracer.trace(
             user_id=user_id, chat_id=chat_id, message_id=message_id
@@ -2555,6 +2583,8 @@ class ChatService:
             user_id=state.user_id,
             workspace_id=state.workspace_id,
             is_admin=state.is_admin,
+            chat_id=state.chat_id,
+            message_id=state.message_id,
         )
         async with tracer.trace(
             user_id=state.user_id, chat_id=state.chat_id, message_id=state.message_id
@@ -2694,6 +2724,8 @@ class ChatService:
             user_id=state.user_id,
             workspace_id=state.workspace_id,
             is_admin=state.is_admin,
+            chat_id=state.chat_id,
+            message_id=state.message_id,
         )
         checkpoint_store.update_run(db, run_id, status="running")
         yield {"type": "run_resumed", "runId": run_id, "round": state.round_index}

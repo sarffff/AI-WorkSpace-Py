@@ -29,6 +29,7 @@ from routers import (
     workspace_router,
     fs_router,
     skill_router,
+    review_router,
 )
 from services import approval
 from services import prompt_library
@@ -91,6 +92,7 @@ app.include_router(memory_router.router)
 app.include_router(workspace_router.router)
 app.include_router(fs_router.router)
 app.include_router(skill_router.router)
+app.include_router(review_router.router)
 
 # 静态文件服务：附件上传后的访问入口
 os.makedirs(settings.UPLOAD_DIR, exist_ok=True)

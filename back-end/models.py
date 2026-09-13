@@ -644,3 +644,76 @@ class WorkspaceSkill(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
+
+
+class ReviewRecord(Base):
+    """一条审核结论的台账记录。审核类任务的**交付物**。
+
+    ## 名字为什么不叫 ReviewVerdict
+
+    ``structured.ReviewVerdict`` 是模型产出的那个 Pydantic 结构（inputs / basis /
+    verdict 三件）。这一行装的东西更多：审的是什么、采样几次、有没有人复核过。
+    verdict 是它的一个字段，不是它本身。两个类同名会让 import 处处要起别名，
+    而"到底是哪一个"这件事在代码里必须一眼看出来。
+
+    ## 为什么不塞进 message_tool_steps
+
+    那张表是工具调用轨迹，给排查用，随对话一起被清理。这张表是业务记录：一张单子
+    的审核结论不该因为有人清了聊天记录就消失。所以 ``chat_id`` / ``message_id``
+    只作线索留着（"想看当时怎么审的，去这段对话"），**不设外键约束**——断了不影响
+    这条结论本身的有效性。
+
+    ## needs_human 是一等公民
+
+    三档里它最有价值：审核这份工作的全部意义在于"拿不准就往上抬一级"。把它当成
+    某种错误状态会让人去优化掉它，而那正好优化掉了价值。
+
+    ## sop_version 是快照值不是外键
+
+    引用 ``WorkspaceSkill.version`` 的话，SOP 再改一次这条结论的依据又变了——
+    而这张表存在的理由正是"当时按的第几版"。存下来的数字是事实，外键指向的是现状。
+    """
+
+    __tablename__ = "review_verdicts"
+    __table_args__ = (
+        # 台账按工作区 + 时间倒序翻页
+        Index("ix_review_verdicts_ws_created", "workspace_id", "created_at"),
+        # 待办队列："还有哪些等着人看"
+        Index(
+            "ix_review_verdicts_pending", "workspace_id", "verdict", "resolved_at"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    workspace_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    chat_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # 审的是什么。自由文本：可能是文件名、单号或一句描述，取决于材料从哪来。
+    # 不做成指向文件的外键——文件会被移走、改名、删除，而结论要比它长命
+    subject: Mapped[str] = mapped_column(String(500), nullable=False)
+    sop_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    sop_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 不用枚举类型：三档还会长（"部分通过"是可预见的下一档），
+    # 而 MySQL 改枚举要锁表
+    verdict: Mapped[str] = mapped_column(String(20), nullable=False)
+    # JSON 数组。核对项 3~6 个、只整体读写，拆表要多一次 join 换一个用不上的
+    # 查询能力
+    inputs: Mapped[str] = mapped_column(Text, nullable=False)
+    basis: Mapped[str] = mapped_column(Text, nullable=False)
+    # 一致性检查采样了几次、结论一致吗。
+    #
+    # runs=1 有两种含义且处置不同：没开这个检查，或者开了但只有一次跑通。
+    # 所以 agreed 单独一列——runs=1 且 agreed=True 说的是"没检查过"，
+    # 不是"检查过并且一致"（见 services/review_consensus.combine）
+    runs: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    agreed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # 人复核之后的处置。NULL = 还没人看过。
+    # 转人工必须查得出"接手了没有"，否则它等于扔进一个没人看的队列
+    resolved_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    resolution: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    resolution_note: Mapped[str | None] = mapped_column(String(1000), nullable=True)
