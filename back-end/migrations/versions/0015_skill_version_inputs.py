@@ -38,7 +38,11 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
-revision: str = "0015_skill_version_and_required_inputs"
+# revision id 必须 ≤32 字符：alembic_version.version_num 是 VARCHAR(32)。
+# 超长在 SQLite 上完全没有症状（那边不检查长度），在 MySQL 上是 DataError 1406，
+# 而且发生在**升级过程中**——链会停在这一条，前面几条已经跑完了。
+# 所以这个名字不能再加词。
+revision: str = "0015_skill_version_inputs"
 down_revision: Union[str, None] = "0014_workspace_skills"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

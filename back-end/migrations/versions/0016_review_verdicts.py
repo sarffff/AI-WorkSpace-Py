@@ -42,7 +42,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision: str = "0016_review_verdicts"
-down_revision: Union[str, None] = "0015_skill_version_and_required_inputs"
+down_revision: Union[str, None] = "0015_skill_version_inputs"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
