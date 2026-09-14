@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from config import settings
+from services import prompt_library
 from services.structured import (
     InputCheck,
     ReviewVerdict,
@@ -238,4 +239,96 @@ async def generate(
     return combine(verdicts), reports
 
 
-__all__ = ["ConsensusResult", "combine", "generate"]
+def build_prompt(
+    *,
+    instructions: str,
+    materials: str,
+    required_inputs: tuple[str, ...],
+    sop_name: str,
+    sop_version: int,
+) -> str:
+    """独立复审用的提示词。
+
+    **刻意不包含模型第一次给的结论。** 那正是这件事的全部意义：要的是独立采样，
+    看两次会不会分歧。给它看第一次的答案就是在请它同意——而"请模型同意"这条路
+    在这个仓库有六次失败记录。
+    """
+    return prompt_library.render(
+        "review_verdict",
+        instructions=instructions[: settings.SKILL_MAX_CHARS],
+        materials=materials[: settings.REVIEW_EVIDENCE_MAX_CHARS],
+        required="、".join(required_inputs) or "（这份指导没有声明必备材料）",
+        sop_name=sop_name,
+        sop_version=sop_version,
+    )
+
+
+async def verify_submission(
+    adapter: Any,
+    *,
+    submitted: ReviewVerdict,
+    instructions: str,
+    materials: str,
+    required_inputs: tuple[str, ...],
+    runs: int | None = None,
+) -> ConsensusResult:
+    """拿模型自己提交的结论，和 N-1 次独立复审比对。
+
+    ## 为什么提交的那一份算作第一个样本
+
+    它已经生成过了、钱已经花了，而且"模型自己说的"与"重采样说的"之间的分歧
+    恰恰是最该抓住的那一种——把它排除在外等于白扔一个样本，还少了一次比对。
+
+    ## runs<=1 时原样返回
+
+    此时没有可比的对象。返回的 ``ConsensusResult`` 里 ``runs=1``，而按 ``combine``
+    的约定它读作**"没做一致性检查"**，不是"检查过并且一致"。台账上这两者必须
+    分得开。
+
+    ## 复审失败不让提交失败
+
+    重采样一次都没跑通时（截断、JSON 坏了、模型挂了），退回"只有提交那一份"的
+    结果而不是拒绝落库。理由：这次审核**本身**是成功的，复审只是加固；让加固
+    的故障吃掉一条有效结论是把可观测性变成单点故障（同 ``checkpoint_store`` 与
+    ``approval_audit`` 的取舍）。但 ``runs`` 会如实记成 1，所以台账上看得出
+    这条没被复审过。
+    """
+    total = max(1, runs if runs is not None else settings.REVIEW_CONSENSUS_RUNS)
+    if total <= 1:
+        return ConsensusResult(verdict=submitted, runs=1, agreed=True)
+
+    prompt = build_prompt(
+        instructions=instructions,
+        materials=materials,
+        required_inputs=required_inputs,
+        sop_name=submitted.sop_name,
+        sop_version=submitted.sop_version,
+    )
+    # total - 1 次：提交的那一份算第一个样本
+    result, _reports = await generate(
+        adapter,
+        prompt=prompt,
+        model=settings.review_judge_model,
+        runs=total - 1,
+    )
+    if result is None:
+        logger.warning(
+            "review re-sampling produced nothing over %s runs; "
+            "keeping the submitted verdict unchecked",
+            total - 1,
+        )
+        return ConsensusResult(verdict=submitted, runs=1, agreed=True)
+
+    # 复审可能自己就内部不一致（total-1 >= 2 时）。那种情况下 result.verdict
+    # 已经是合成的 needs_human，把它和提交的那份一起交给 combine 就行——
+    # combine 会再比一次，而结论仍然是转人工。
+    return combine([submitted, result.verdict])
+
+
+__all__ = [
+    "ConsensusResult",
+    "build_prompt",
+    "combine",
+    "generate",
+    "verify_submission",
+]

@@ -406,6 +406,22 @@ class Settings(BaseSettings):
     # REVIEW_CONSENSUS_RUNS=1 时它同样生效(只采一次),所以关着一致性检查的部署
     # 也会走这个温度。0.3 是保守值:够采出分歧,又不至于让单次结论本身变差。
     REVIEW_CONSENSUS_TEMPERATURE: float = 0.3
+    # 依据原文的字符上限。模型调 submit_review 时要把它据以判断的材料一起交上来
+    # （见迁移 0017 里为什么不走"把 messages 传进工具边界"那条路）。
+    #
+    # 给得宽是刻意的:抄不全的后果是复审看到的材料比第一次少,于是更容易给出
+    # needs_human——方向安全(多转人工不是少转),但会让一致性检查的假阳性变多。
+    # 8000 约等于一份合同的关键条款 + 一张单子的全部字段。
+    #
+    # 超限在**入参那侧**明确报错,而不是入库时静默截断:截掉的正好是尾部,
+    # 而尾部常常是签字与日期。
+    REVIEW_EVIDENCE_MAX_CHARS: int = 8000
+    # 独立复审用哪个模型。留空回退 utility_model。
+    #
+    # 为什么可以用小模型:复审要的不是"更聪明的判断",是**独立的一次采样**。
+    # 用同一个模型同一份提示词重采一次就够——分歧本身是信号,而不是要靠更强的
+    # 模型去裁决谁对。真要裁决就该转人工,那正是 needs_human 的含义。
+    REVIEW_JUDGE_MODEL: str = ""
     # 审核台账:submit_review 工具 + review_verdicts 表。
     #
     # 默认关,和其它会改变状态的能力一致(TOOL_FS_* / SKILL_ENABLED 都是关的)。
@@ -910,6 +926,16 @@ class Settings(BaseSettings):
     def utility_model(self) -> str:
         """辅助任务(摘要/改写/重排/记忆抽取)实际使用的模型"""
         return self.LLM_UTILITY_MODEL or self.LLM_MODEL
+
+    @property
+    def review_judge_model(self) -> str:
+        """独立复审实际使用的模型。留空回退辅助模型,再回退主模型。
+
+        和 ``judge_model`` 分开是刻意的:那个是**评估**用的裁判(给答案打分),
+        这个是**线上**审核链路的一环。同一个配置项会让"调评估"和"改线上行为"
+        变成一件事,而它们的取舍完全不同——评估要稳定可比,线上要便宜够用。
+        """
+        return self.REVIEW_JUDGE_MODEL or self.utility_model
 
     @property
     def judge_model(self) -> str:

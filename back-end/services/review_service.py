@@ -50,6 +50,7 @@ def record(
     user_id: str,
     subject: str,
     result: ConsensusResult,
+    evidence: str | None = None,
     chat_id: str | None = None,
     message_id: str | None = None,
 ) -> ReviewRecord:
@@ -81,6 +82,9 @@ def record(
         basis=json.dumps(verdict.basis, ensure_ascii=False),
         runs=result.runs,
         agreed=result.agreed,
+        # None（没给）与空串（给了但是空的）分得开：前者是历史行或调用方没传，
+        # 后者是 bug。不 or "" 掉，那会把两种情形合并
+        evidence=evidence,
         created_at=naive_now(),
     )
     db.add(row)
@@ -118,6 +122,8 @@ def _to_dict(row: ReviewRecord) -> dict[str, Any]:
         # runs=1 且 agreed=True 的含义是"没检查过"，不是"检查过并且一致"。
         # 界面要分开显示，所以两个字段都给，不合成一个布尔
         "agreed": row.agreed,
+        # 人复核时要看的就是这个。None 表示这条是加这一列之前记的
+        "evidence": row.evidence,
         "createdAt": row.created_at.isoformat() if row.created_at else None,
         "chatId": row.chat_id,
         "resolvedBy": row.resolved_by,

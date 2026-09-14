@@ -717,3 +717,13 @@ class ReviewRecord(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     resolution: Mapped[str | None] = mapped_column(String(20), nullable=True)
     resolution_note: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    # 模型据以判断的材料原文。两个用途：人复核时要看的就是它，
+    # 独立复审（review_consensus）拿它重新判一次。
+    #
+    # Text 而不是 String(n)：一整张单子的 OCR 文本可能很长，而给具体上限就一定有
+    # 被截断的那天——静默截掉的正好是尾部，而尾部常常是签字与日期。
+    # 入参那侧由 REVIEW_EVIDENCE_MAX_CHARS 挡着，超限明确报错。
+    #
+    # NULL 读作"这条结论是加这一列之前记的"，与空串（材料是空的，那是 bug）
+    # 分得开。
+    evidence: Mapped[str | None] = mapped_column(Text, nullable=True)

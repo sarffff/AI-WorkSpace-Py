@@ -195,12 +195,17 @@ class _Adapter:
         return ModelCompletion(content=raw or "", tool_calls=[])
 
 
-def _json(verdict="pass", found=True):
+def _json(verdict="pass", found=True, name="金额"):
+    """复审那一侧返回的 JSON。
+
+    ``name`` 默认和 ``_v()`` 的默认项名一致（金额）：项名对不上会被 combine
+    正确判成"形状对不上"，那时测的就不是 verdict 的分歧了。
+    """
     return (
-        '{"inputs": [{"name": "凭证", "value": "有", "found": %s}], '
+        '{"inputs": [{"name": "%s", "value": "有", "found": %s}], '
         '"basis": ["按第 3 条"], "verdict": "%s", '
         '"sop_name": "expense-review", "sop_version": 2}'
-        % ("true" if found else "false", verdict)
+        % (name, "true" if found else "false", verdict)
     )
 
 
@@ -287,3 +292,115 @@ def test_温度不是零():
     assert adapter.calls, "适配器没被调用"
     for call in adapter.calls:
         assert call.get("temperature", 0.0) > 0.0
+
+
+# ========== verify_submission：提交的那份算第一个样本 ==========
+
+
+def test_runs为1时不发复审调用():
+    """没有可比的对象。返回的 runs=1 按 combine 的约定读作"没检查过"。"""
+    from services import review_consensus
+
+    submitted = _v("pass")
+    adapter = _Adapter([_json("reject")])
+    result = run(
+        review_consensus.verify_submission(
+            adapter,
+            submitted=submitted,
+            instructions="按额度审。",
+            materials="住宿 480",
+            required_inputs=("金额",),
+            runs=1,
+        )
+    )
+    assert result.runs == 1 and result.agreed is True
+    assert result.verdict.verdict == "pass"
+    assert adapter.calls == [], "runs=1 时不该发任何复审调用"
+
+
+def test_提交的那份和复审一致时通过():
+    from services import review_consensus
+
+    submitted = _v("pass")
+    adapter = _Adapter([_json("pass")])
+    result = run(
+        review_consensus.verify_submission(
+            adapter,
+            submitted=submitted,
+            instructions="按额度审。",
+            materials="住宿 480",
+            required_inputs=("金额",),
+            runs=2,
+        )
+    )
+    assert result.agreed is True
+    assert result.verdict.verdict == "pass"
+    assert len(adapter.calls) == 1, "runs=2 时只该复审 1 次（提交的那份算第一个样本）"
+
+
+def test_提交的那份和复审不一致就转人工():
+    """这是这条链最该抓住的形状：模型自己说通过，独立采样说不通过。"""
+    from services import review_consensus
+
+    submitted = _v("pass")
+    adapter = _Adapter([_json("reject")])
+    result = run(
+        review_consensus.verify_submission(
+            adapter,
+            submitted=submitted,
+            instructions="按额度审。",
+            materials="住宿 480",
+            required_inputs=("金额",),
+            runs=2,
+        )
+    )
+    assert result.agreed is False
+    assert result.verdict.verdict == "needs_human"
+    assert any("不同结论" in r for r in result.reasons)
+
+
+def test_复审失败不让提交失败():
+    """这次审核本身是成功的，复审只是加固。让加固的故障吃掉一条有效结论，
+    是把可观测性变成单点故障。但 runs 必须如实记成 1，否则台账上看不出
+    这条没被复审过。"""
+    from services import review_consensus
+
+    submitted = _v("pass")
+    adapter = _Adapter([None])
+    result = run(
+        review_consensus.verify_submission(
+            adapter,
+            submitted=submitted,
+            instructions="按额度审。",
+            materials="住宿 480",
+            required_inputs=("金额",),
+            runs=2,
+        )
+    )
+    assert result.verdict.verdict == "pass"
+    assert result.runs == 1, "复审没跑通就该说没检查过，不能谎称检查过两次"
+    assert result.agreed is True
+
+
+def test_复审提示词不包含第一次的结论():
+    """给它看第一次的答案就是在请它同意。那条路在这个仓库失败过六次。"""
+    from services import review_consensus
+
+    submitted = _v("pass", basis=["我第一次判通过"])
+    adapter = _Adapter([_json("pass")])
+    run(
+        review_consensus.verify_submission(
+            adapter,
+            submitted=submitted,
+            instructions="按额度审。",
+            materials="住宿 480",
+            required_inputs=("金额",),
+            runs=2,
+        )
+    )
+    # complete 收到的参数形状由适配器决定，所以整体转成字符串再查——
+    # 断言的是"第一次的结论有没有漏进提示词"，不依赖参数怎么组织
+    blob = str(adapter.calls[0])
+    assert "我第一次判通过" not in blob
+    assert "住宿 480" in blob
+    assert "按额度审" in blob

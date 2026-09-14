@@ -721,6 +721,10 @@ class ChatService:
                 # 缺了就是"这条结论没有对话线索"，合法——台账不依赖外键。
                 chat_id=getattr(scope, "chat_id", None),
                 message_id=getattr(scope, "message_id", None),
+                # 独立复审要真的发一次模型调用。传本回合这个适配器而不是让工具
+                # 自己新建：新建的那个不带本次的埋点上下文，于是复审的 token 与
+                # 成本不会归到这次回答上——而它是这条链里实打实的一笔开销。
+                adapter=self.model_adapter,
             )
         )
         return tools

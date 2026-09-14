@@ -38,7 +38,8 @@ from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from config import settings
-from services import review_service, skill_service
+from services import review_consensus, review_service, skill_service
+from services.model_adapter import OpenAICompatibleAdapter
 from services.review_consensus import ConsensusResult
 from services.structured import ReviewVerdict
 from services.tool_runtime import ToolDefinition
@@ -53,7 +54,14 @@ def _build_submit_tool(
     user_id: str,
     chat_id: str | None,
     message_id: str | None,
+    adapter: Any = None,
 ) -> ToolDefinition:
+    """``adapter`` 只给独立复审用。
+
+    缺省时自己建一个 ``OpenAICompatibleAdapter``——这个工具是在循环内部被调用的，
+    而循环手上那个适配器没有沿着工具构建链传下来。让调用方传是为了测试能给替身：
+    复审要真的发一次模型调用，不给替身的话这条链只能靠跑真模型来测。
+    """
     async def submit_review(arguments: dict[str, Any]) -> str:
         subject = arguments.get("subject")
         if not isinstance(subject, str) or not subject.strip():
@@ -110,6 +118,27 @@ def _build_submit_tool(
                     sorted(extra),
                 )
 
+        # 依据原文。要求它交上来有两个用途：人复核时要看的就是这个，
+        # 独立复审拿它重新判一次。
+        #
+        # 必填而不是可选：一条没有材料的结论**没法被独立检查**，而那正好是这套
+        # 东西存在的理由。允许它为空的话，模型会在拿不准时省掉这个参数，
+        # 于是恰恰是最该复审的那些结论没有复审。
+        evidence = arguments.get("evidence")
+        if not isinstance(evidence, str) or not evidence.strip():
+            return (
+                "提交失败：evidence 必须是你据以判断的材料原文。"
+                "把相关的那几段原文抄进来——台账上要留下依据，"
+                "复审也要拿它重新核对一次。"
+            )
+        limit = max(500, settings.REVIEW_EVIDENCE_MAX_CHARS)
+        if len(evidence) > limit:
+            # 明确报错而不是静默截断：截掉的正好是尾部，而尾部常常是签字与日期
+            return (
+                f"提交失败：evidence 有 {len(evidence)} 字符，超过 {limit} 上限。"
+                "只抄和这次判断直接相关的那几段，不要把整个文件放进来。"
+            )
+
         try:
             verdict = ReviewVerdict(
                 inputs=raw_inputs,
@@ -123,15 +152,30 @@ def _build_submit_tool(
             # 这一条就是 validator 抛的）。重写一遍只会更模糊。
             return f"提交失败：{exc.errors()[0].get('msg', exc)}"
 
+        # 独立复审。拿同一份材料重新判 N-1 次，和提交的这份比对；不一致就转人工。
+        #
+        # 失败不让提交失败（见 verify_submission 的文档串）：这次审核本身是成功的，
+        # 复审只是加固，让加固的故障吃掉一条有效结论是把可观测性变成单点故障。
+        try:
+            result = await review_consensus.verify_submission(
+                adapter or OpenAICompatibleAdapter(),
+                submitted=verdict,
+                instructions=skill.instructions,
+                materials=evidence,
+                required_inputs=skill.required_inputs,
+            )
+        except Exception:
+            logger.exception("review re-sampling failed; recording unchecked")
+            result = ConsensusResult(verdict=verdict, runs=1, agreed=True)
+
         try:
             row = review_service.record(
                 db,
                 workspace_id=workspace_id,
                 user_id=user_id,
                 subject=subject,
-                # runs=1, agreed=True 按 combine 的约定读作"没做一致性检查"。
-                # 一致性检查还没接到这条路上（见模块文档）
-                result=ConsensusResult(verdict=verdict, runs=1, agreed=True),
+                result=result,
+                evidence=evidence,
                 chat_id=chat_id,
                 message_id=message_id,
             )
@@ -147,18 +191,33 @@ def _build_submit_tool(
                 "并说明这次没有归档成功。"
             )
 
-        missing_now = [item.name for item in verdict.inputs if not item.found]
-        if verdict.verdict == "needs_human":
-            tail = (
-                f"缺的材料：{'、'.join(missing_now)}。" if missing_now else ""
+        # 落库的是**合并之后**的结论，不是模型提交的那份——复审不一致时
+        # result.verdict 已经被换成合成的 needs_human。回灌给模型的话也必须以
+        # 它为准，否则模型会照自己原来那份向用户复述"通过"，而台账上记的是转人工。
+        final = result.verdict
+        missing_now = [item.name for item in final.inputs if not item.found]
+        if not result.agreed:
+            # 分歧要说清楚，而且要让模型知道**它自己那份没有被采纳**
+            return (
+                f"已记入台账（{row.id[:8]}），但结论被改成了**需要人判断**："
+                f"{'；'.join(result.reasons)}。"
+                f"你提交的是 {verdict.verdict}，独立复审给出了不同结果，"
+                "所以这一条要交给人。请向用户说明分歧在哪，不要坚持你原来的结论。"
             )
+        if final.verdict == "needs_human":
+            tail = f"缺的材料：{'、'.join(missing_now)}。" if missing_now else ""
             return (
                 f"已记入台账（{row.id[:8]}），结论是**需要人判断**。{tail}"
                 "请向用户说明缺什么、以及需要谁来定，不要替他做判断。"
             )
+        checked = (
+            f"（复审 {result.runs} 次一致）"
+            if result.runs > 1
+            else "（未做独立复审）"
+        )
         return (
-            f"已记入台账（{row.id[:8]}），结论是 {verdict.verdict}，"
-            f"按 {verdict.sop_name} 第 {version} 版。"
+            f"已记入台账（{row.id[:8]}），结论是 {final.verdict}，"
+            f"按 {final.sop_name} 第 {version} 版{checked}。"
             "向用户复述时请带上依据。"
         )
 
@@ -212,8 +271,21 @@ def _build_submit_tool(
                     "items": {"type": "string"},
                     "description": "依据：引用的规程条目 + 材料出处",
                 },
+                "evidence": {
+                    "type": "string",
+                    "description": (
+                        "你据以判断的材料原文，抄相关的那几段。"
+                        "台账要留它作依据，复审也要拿它重新核对"
+                    ),
+                },
             },
-            "required": ["subject", "sop_name", "inputs", "verdict"],
+            "required": [
+                "subject",
+                "sop_name",
+                "inputs",
+                "verdict",
+                "evidence",
+            ],
             "additionalProperties": False,
         },
         handler=submit_review,
@@ -231,6 +303,7 @@ def build(
     user_id: str,
     chat_id: str | None = None,
     message_id: str | None = None,
+    adapter: Any = None,
 ) -> list[ToolDefinition]:
     """按开关与"这个工作区有没有审核型 SOP"组装。
 
@@ -253,6 +326,7 @@ def build(
             user_id=user_id,
             chat_id=chat_id,
             message_id=message_id,
+            adapter=adapter,
         )
     ]
 

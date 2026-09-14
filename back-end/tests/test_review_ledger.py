@@ -67,6 +67,7 @@ def _ok_args(**over):
         ],
         "verdict": "pass",
         "basis": ["额度标准：一线 600，申报 480，未超"],
+        "evidence": "住宿费 480 元，发票号码 7712，一线城市上限 600。",
     }
     args.update(over)
     return args
@@ -250,6 +251,128 @@ def test_没加载过的SOP名字被拒(sop, db_real):
     # 要列出可用的，否则模型只能猜
     assert "expense" in result
     assert db_real.query(ReviewRecord).count() == 0
+
+
+def test_没交依据原文时拒绝提交(sop, db_real):
+    """必填而不是可选：一条没有材料的结论**没法被独立检查**。
+
+    允许它为空的话，模型会在拿不准时省掉这个参数——于是恰恰是最该复审的那些
+    结论没有复审。
+    """
+    args = _ok_args()
+    args.pop("evidence")
+    result = _call(_tool(db_real)["submit_review"], **args)
+    assert "提交失败" in result
+    assert db_real.query(ReviewRecord).count() == 0
+
+
+def test_依据原文超限时明确报错而不是截断(sop, db_real, monkeypatch):
+    """截断掉的正好是尾部，而尾部常常是签字与日期。"""
+    monkeypatch.setattr(settings, "REVIEW_EVIDENCE_MAX_CHARS", 600)
+    result = _call(
+        _tool(db_real)["submit_review"], **_ok_args(evidence="材" * 700)
+    )
+    assert "提交失败" in result
+    assert "超过" in result
+    assert db_real.query(ReviewRecord).count() == 0
+
+
+def test_依据原文落库(sop, db_real):
+    """人复核时要看的就是这一列。"""
+    _call(_tool(db_real)["submit_review"], **_ok_args())
+    row = db_real.query(ReviewRecord).one()
+    assert row.evidence == "住宿费 480 元，发票号码 7712，一线城市上限 600。"
+
+
+# ========== 独立复审 ==========
+
+
+class _ReplayAdapter:
+    """按脚本返回 JSON。复审要真的发一次模型调用，这里给它一个替身。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+
+    async def complete(self, **kwargs):
+        from services.model_adapter import ModelCompletion
+
+        self.calls.append(kwargs)
+        raw = self.script.pop(0) if self.script else None
+        return ModelCompletion(content=raw or "", tool_calls=[])
+
+
+def _resample(verdict="pass", name="金额", found=True, second="凭证"):
+    """复审那一侧的返回。两项都要给，否则会被判成"形状对不上"。"""
+    return (
+        '{"inputs": ['
+        '{"name": "%s", "value": "480", "found": %s}, '
+        '{"name": "%s", "value": "有", "found": true}], '
+        '"basis": ["复审依据"], "verdict": "%s", '
+        '"sop_name": "expense", "sop_version": 0}'
+        % (name, "true" if found else "false", second, verdict)
+    )
+
+
+def test_复审一致时照原样落库(sop, db_real, monkeypatch):
+    monkeypatch.setattr(settings, "REVIEW_CONSENSUS_RUNS", 2)
+    adapter = _ReplayAdapter([_resample("pass")])
+    tools = _tool(db_real, adapter=adapter)
+    result = _call(tools["submit_review"], **_ok_args())
+
+    assert "复审 2 次一致" in result
+    row = db_real.query(ReviewRecord).one()
+    assert row.verdict == "pass"
+    assert row.runs == 2 and row.agreed is True
+
+
+def test_复审不一致时落库的是转人工(sop, db_real, monkeypatch):
+    """最该抓住的形状：模型自己提交 pass，独立复审给出 reject。
+
+    落库必须是**合并之后**的结论。记模型那份的话，台账上是 pass 而回答里说
+    转人工——或者反过来，而两者都比没有这个检查更糟。
+    """
+    monkeypatch.setattr(settings, "REVIEW_CONSENSUS_RUNS", 2)
+    adapter = _ReplayAdapter([_resample("reject")])
+    tools = _tool(db_real, adapter=adapter)
+    result = _call(tools["submit_review"], **_ok_args(verdict="pass"))
+
+    # 要让模型知道它自己那份没被采纳
+    assert "需要人判断" in result
+    assert "不要坚持你原来的结论" in result
+    row = db_real.query(ReviewRecord).one()
+    assert row.verdict == "needs_human"
+    assert row.agreed is False
+    assert row.runs == 2
+
+
+def test_复审跑不通时照常落库但记未检查(sop, db_real, monkeypatch):
+    """这次审核本身是成功的，复审只是加固。
+
+    但 runs 要如实记 1——否则台账上看不出这条没被复审过。
+    """
+    monkeypatch.setattr(settings, "REVIEW_CONSENSUS_RUNS", 2)
+    adapter = _ReplayAdapter([None])
+    tools = _tool(db_real, adapter=adapter)
+    result = _call(tools["submit_review"], **_ok_args())
+
+    assert "已记入台账" in result
+    assert "未做独立复审" in result
+    row = db_real.query(ReviewRecord).one()
+    assert row.verdict == "pass"
+    assert row.runs == 1
+
+
+def test_默认不开复审时不发额外调用(sop, db_real):
+    """默认 REVIEW_CONSENSUS_RUNS=1：它让每次审核贵一倍，该由部署方决定。"""
+    adapter = _ReplayAdapter([_resample("reject")])
+    tools = _tool(db_real, adapter=adapter)
+    result = _call(tools["submit_review"], **_ok_args())
+
+    assert adapter.calls == [], "默认配置下不该发复审调用"
+    assert "未做独立复审" in result
+    row = db_real.query(ReviewRecord).one()
+    assert row.verdict == "pass"
 
 
 def test_台账记的runs是1表示没做一致性检查(sop, db_real):
