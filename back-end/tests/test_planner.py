@@ -21,20 +21,9 @@ from conftest import ScriptedAdapter, run
 from services import planner, structured
 
 
-class Adapter(ScriptedAdapter):
-    """ScriptedAdapter 的 complete 不收 purpose，而 request_structured 会传。"""
-
-    async def complete(
-        self, *, messages, tools, model, temperature=0.7, max_tokens=2048, top_p=1.0, purpose="chat"
-    ):
-        return await super().complete(
-            messages=messages,
-            tools=tools,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            top_p=top_p,
-        )
+# ``ScriptedAdapter.complete`` 自己就收 purpose 了（2026-09-05 并进 conftest），
+# 这里不再需要一个本地子类。
+Adapter = ScriptedAdapter
 
 
 @pytest.fixture(autouse=True)

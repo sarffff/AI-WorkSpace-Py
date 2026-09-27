@@ -147,6 +147,21 @@ SPECS: dict[str, PromptSpec] = {
         default_version="v1",
         required=("question", "context", "tools", "max_steps"),
     ),
+    # 独立复审。不开 setting：这份提示词的版本由谁定，和主对话提示词的版本
+    # 应当解耦——它是审核链路的一环，改它影响的是"复审严不严"，
+    # 而那和"对话怎么答"是两件不相干的事。等真有 v2 再加。
+    "review_verdict": PromptSpec(
+        key="review_verdict",
+        purpose="拿同一份材料独立重判一次，用来和模型自己提交的结论比对",
+        default_version="v1",
+        required=(
+            "instructions",
+            "materials",
+            "required",
+            "sop_name",
+            "sop_version",
+        ),
+    ),
     # 子代理各自一个 key,而不是共用一个带 [[if role]] 分支的模板:三个角色的
     # 约束几乎不重叠(researcher 要讲出处分层,analyst 要讲"缺输入就停",
     # critic 要讲"没依据别提"),塞进一版会变成一个谁都不好改的大文件,

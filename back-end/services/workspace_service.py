@@ -43,12 +43,15 @@
 """
 from __future__ import annotations
 
+import logging
 import secrets
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from models import Document, User, Workspace
+
+logger = logging.getLogger("workspace_service")
 
 ROLE_ADMIN = "admin"
 ROLE_USER = "user"
@@ -168,9 +171,8 @@ def require_admin(user: User) -> None:
 def rename(db: Session, user: User, name: str) -> Workspace:
     """改工作区名(仅 admin)。
 
-    只开放改名这一项。删空间、转让 admin、移除成员都还没有——它们各自要先定
-    语义(空间删了里面的共享文档归谁?最后一个 admin 能不能把自己降级?),
-    而定不清楚的权限操作比没有这个操作更危险。
+    删空间还没有:它要先定"里面的共享文档归谁"。改角色与移除成员见下面
+    ``set_member_role`` / ``remove_member``——它们的语义 2026-09-12 定了。
     """
     require_admin(user)
     cleaned = name.strip()
@@ -181,6 +183,149 @@ def rename(db: Session, user: User, name: str) -> Workspace:
     db.commit()
     db.refresh(workspace)
     return workspace
+
+
+# ---- 成员管理 -------------------------------------------------------------
+#
+# 2026-09-12 加。此前这个模块能做的事是:看空间、凭邀请码加入、改名、重置邀请码。
+# 也就是说 **admin 看不到自己空间里有谁,不能改谁的角色,更不能把人移出去**——
+# 邀请码是个单向阀,进得来出不去,重置它只防新人。员工离职之后他的账号仍然在
+# 工作区里,仍然能检索全部共享文档,而产品内没有任何办法处理这件事(只能改库)。
+#
+# 两条不变量,写在这里而不是分散在三个函数里,因为它们是同一件事的两面:
+#
+# 1. **最后一个 admin 既不能被降级,也不能被移除。** 这个产品里没有超级管理员,
+#    没有 admin 的工作区是**不可恢复**的:改不了名、重置不了邀请码、管不了共享
+#    文档、也再没人能把谁提成 admin。宁可留一个走不掉的 admin,也不要一个
+#    谁都进不去的空间。
+# 2. **移除自己不走这条路。** 那是"退出工作区",一个语义不同的动作(要先决定
+#    自己去哪儿)。用移除成员的接口把自己踢掉,会让下一次请求由
+#    ``resolve_for_user`` 静默补建一个个人空间——从一个"移除成员"按钮触发这种
+#    事太出人意料。
+
+
+def _admin_count(db: Session, workspace_id: str, *, excluding: str | None = None) -> int:
+    """本空间还有几个 admin。``excluding`` 用来问"把这个人拿掉之后还剩几个"。"""
+    query = db.query(User).filter(
+        User.workspace_id == workspace_id, User.role == ROLE_ADMIN
+    )
+    if excluding:
+        query = query.filter(User.id != excluding)
+    return query.count()
+
+
+def _member_in(db: Session, workspace_id: str, member_id: str) -> User:
+    """取本空间内的一个成员,不在就报错。
+
+    错误消息统一成"不在这个工作区",不区分"这个人不存在"和"存在但在别的空间"——
+    后者会把别人的归属漏给调用方,而 admin 并不需要知道那件事。
+    """
+    member = (
+        db.query(User)
+        .filter(User.id == member_id, User.workspace_id == workspace_id)
+        .first()
+    )
+    if member is None:
+        raise WorkspaceError("该成员不在这个工作区")
+    return member
+
+
+def set_member_role(db: Session, user: User, member_id: str, role: str) -> dict:
+    """改一个成员的角色(仅 admin)。
+
+    允许 admin 改自己——但仍然受"最后一个 admin"约束。自己降级和别人降级用同一条
+    规则,不特例:特例会让"我是不是最后一个"变成调用方要判断的事,而它判断错的
+    后果是一个谁都管不了的空间。
+    """
+    require_admin(user)
+    if role not in (ROLE_ADMIN, ROLE_USER):
+        raise WorkspaceError("角色只能是 admin 或 user")
+    workspace = resolve_for_user(db, user)
+    member = _member_in(db, workspace.id, member_id)
+
+    current = ROLE_ADMIN if is_admin(member) else ROLE_USER
+    if current == role:
+        raise WorkspaceError("该成员已经是这个角色")
+    if current == ROLE_ADMIN and _admin_count(
+        db, workspace.id, excluding=member.id
+    ) == 0:
+        raise WorkspaceError(
+            "这是工作区最后一个管理员,不能降级。请先把另一个人提为管理员。"
+        )
+
+    member.role = role
+    db.commit()
+    return {
+        "id": member.id,
+        "name": member.name or member.username or member.email,
+        "role": role,
+    }
+
+
+def remove_member(db: Session, user: User, member_id: str) -> dict:
+    """把一个成员移出工作区(仅 admin)。
+
+    ## 私有文档不需要迁移
+
+    这一点我第一版想错了,值得写下来:被移除的人的私有文档**不需要任何搬运**。
+    ``listable_documents`` 判的是"所有者当前在不在这个工作区"(见那个函数的
+    文档串),不是文档行上的 ``workspace_id``。所以人一走:
+
+    * 旧 admin 的管理列表里,他的私有文档自动消失;
+    * 他自己在新空间里照样看得到(自己那一支不限工作区)。
+
+    按 ``workspace_id`` 去搬反而会两头都错——那正是那个函数当初改掉的写法。
+    共享文档留在原地:它们是组织资产,不跟人走。
+
+    ## 被移除的人去哪儿
+
+    ``workspace_id`` 置空,下一次访问由 ``resolve_for_user`` 补建个人空间。
+    不在这里立刻建:那会在"移除"这个动作里写两个空间的数据,而懒初始化那条路
+    本来就存在、而且被测过。
+
+    ## 为什么要清一次语义缓存
+
+    缓存按工作区分桶。被移除的人此前在这个空间里问过的问题,答案可能引用了他的
+    私有文档,而那份答案还躺在本空间的桶里——移除之后它仍然可能被别的成员命中。
+    这个窗口不是移除引入的(任何引用私有文档的回答被缓存都有),但移除让它变得
+    具体,而清一次桶是一行的事。
+    """
+    require_admin(user)
+    workspace = resolve_for_user(db, user)
+    if member_id == user.id:
+        raise WorkspaceError(
+            "不能移除自己。要离开这个工作区请用邀请码加入别的空间,"
+            "或先把管理员转给别人。"
+        )
+    member = _member_in(db, workspace.id, member_id)
+
+    # 这里**没有**"最后一个 admin 不能被移除"的判断,不是漏了:它不可能发生。
+    # ``require_admin`` 保证调用者是 admin,上面那一句保证被移除的不是调用者本人,
+    # 所以移除之后至少还剩调用者这一个 admin。
+    #
+    # 我第一版确实写了那个判断,反向验证时发现它一条用例都覆盖不到——把
+    # ``_admin_count`` 改成永远返回 99,14 条里只有降级那条转红。不可达的守卫
+    # 比没有守卫更糟:它读起来像一道防线,而实际上是一句永远为假的条件。
+    #
+    # **这条不变量因此挂在"不能移除自己"那一句上。** 以后如果加"退出工作区"
+    # (允许自己走),那个新入口必须自己带 admin 计数判断——它不在这条路上。
+    # test_移除之后还剩管理员就允许 钉的就是这个推理。
+
+    label = member.name or member.username or member.email
+    member.workspace_id = None
+    member.role = ROLE_USER
+    db.commit()
+
+    # 延迟导入,理由同 adopt_orphaned_documents:两个模块都 import 到 models,
+    # 顶层导入会绕成环。
+    from services.semantic_cache import semantic_cache
+
+    try:
+        semantic_cache.invalidate_user(workspace.id)
+    except Exception:  # noqa: BLE001 - 缓存清理失败不该让移除失败
+        logger.warning("移除成员后清理语义缓存失败", exc_info=True)
+
+    return {"id": member_id, "name": label}
 
 
 def listable_documents(
@@ -347,7 +492,27 @@ def require_can_modify(user: User, document: Document) -> None:
 
 
 def workspace_info(db: Session, user: User) -> dict:
-    """前端展示用:工作区归属、成员列表与邀请码。"""
+    """前端展示用:工作区归属、成员列表与邀请码。
+
+    ## 成员列表对全员可见,管理字段只给 admin
+
+    名册本身(谁在这个空间、是什么角色)一直是全员可见的,这里不收窄——同一个空间
+    里的人知道彼此是谁不是特权,而且界面上早就这么显示了。
+
+    admin 多拿三样**管理**信息:``email``(要联系或核对身份)、``isActive``、
+    ``isSelf``(自己那一行的移除按钮要禁掉,前端不该靠比对 email 去猜)。
+    email 是 PII,给全员看等于把同事的邮箱发给所有人。
+
+    ## 为什么不另开一个 list_members
+
+    想过,写了一半删掉了:那会变成第二处回答"这个空间里有谁"的代码,而两处
+    返回值不同的成员列表迟早会漂移。这里加字段是一处真相。
+
+    ## admin 排在前面
+
+    管理这份列表时第一个要确认的是"还剩几个管理员"(那是能不能移除某人的前提),
+    而那件事不该靠在几十行里翻。
+    """
     workspace = resolve_for_user(db, user)
     members = (
         db.query(User)
@@ -355,16 +520,35 @@ def workspace_info(db: Session, user: User) -> dict:
         .order_by(User.created_at.asc())
         .all()
     )
+    viewer_is_admin = is_admin(user)
+
+    def _entry(member: User) -> dict:
+        row = {
+            "id": member.id,
+            "name": member.name or member.username or member.email,
+            "role": member.role,
+        }
+        if viewer_is_admin:
+            row["email"] = member.email
+            row["isActive"] = bool(member.is_active)
+            row["isSelf"] = member.id == user.id
+        return row
+
+    entries = [_entry(member) for member in members]
+    # admin 在前,组内保持创建顺序(上面已按 created_at 排过,sorted 是稳定的)
+    entries.sort(key=lambda item: item["role"] != ROLE_ADMIN)
+
     return {
         "id": workspace.id,
         "name": workspace.name,
         "role": user.role,
-        "isAdmin": is_admin(user),
+        "isAdmin": viewer_is_admin,
         "memberCount": len(members),
-        "members": [
-            {"id": m.id, "name": m.name or m.username or m.email, "role": m.role}
-            for m in members
-        ],
+        "members": entries,
+        # 还剩几个 admin。界面靠它决定"最后一个管理员"那两个按钮要不要禁掉——
+        # 让前端自己数 members 里的 admin 也能算出来,但那是把一条不变量抄到
+        # 第二个地方,而它在后端是拒绝的依据。
+        "adminCount": sum(1 for member in members if is_admin(member)),
         # 邀请码只给 admin:user 看不到就不会转发给不该进来的人
-        "inviteCode": workspace.invite_code if is_admin(user) else None,
+        "inviteCode": workspace.invite_code if viewer_is_admin else None,
     }

@@ -2,17 +2,39 @@ import React from "react";
 import type { TraceSpanNode } from "@/shared/types/api.types";
 import { fmtCost, fmtInt, fmtMs, spanLabel } from "@/shared/lib/format";
 import { DetailRow } from "./DetailRow";
+import { AgentSignals, partitionAttributes } from "./AgentSignals";
 
 export const SpanDetail: React.FC<{ node: TraceSpanNode }> = ({ node }) => {
+  // attributes 可能是 JSON 字符串（后端 _encode_attributes 的产物）、已解析的对象，
+  // 或者根本解析不了。三种都要落到"看得见"，不能因为解析失败就整块消失。
   let attributesStr = "{}";
+  let signals: ReturnType<typeof partitionAttributes>["signals"] = [];
   if (node.attributes) {
+    let parsed: Record<string, unknown> | null = null;
     try {
+      parsed =
+        typeof node.attributes === "string"
+          ? (JSON.parse(node.attributes) as Record<string, unknown>)
+          : (node.attributes as Record<string, unknown>);
+    } catch {
+      parsed = null;
+    }
+
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const split = partitionAttributes(parsed);
+      signals = split.signals;
+      // 只把**没被抬成命名行**的键留在原始块里。认识的那些已经在上面显示了,
+      // 再原样重复一遍只是噪音。
+      attributesStr =
+        Object.keys(split.rest).length > 0
+          ? JSON.stringify(split.rest, null, 2)
+          : "{}";
+    } else {
+      // 解析不出来就原样打印,总比"属性"整块不见了好。
       attributesStr =
         typeof node.attributes === "string"
           ? node.attributes
-          : JSON.stringify(node.attributes, null, 2);
-    } catch {
-      attributesStr = String(node.attributes);
+          : String(node.attributes);
     }
   }
 
@@ -61,10 +83,11 @@ export const SpanDetail: React.FC<{ node: TraceSpanNode }> = ({ node }) => {
           />
         )}
       </div>
+      <AgentSignals signals={signals} />
       {attributesStr !== "{}" && (
         <div>
           <div className="text-[10px] font-semibold text-[#6e6b63] dark:text-[#a19f96] mb-1">
-            属性
+            {signals.length > 0 ? "其它属性" : "属性"}
           </div>
           <pre
             className="text-[10px] text-[#1f1e1d] dark:text-[#edece8] bg-[#f3f0e6] dark:bg-[#201f1c] rounded-lg p-2.5 overflow-x-auto"

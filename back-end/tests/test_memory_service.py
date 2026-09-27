@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 
+from config import settings
 from conftest import ScriptedAdapter, run
 from models import UserMemory
 from services.clock import naive_now
@@ -499,6 +500,30 @@ def test_混合时只留fact(db_real):
     assert "财务部" in block, "正当背景不该被一起挡掉"
     assert "MEM-CANARY-7391" not in block, "注入载荷必须挡住"
     assert "无需标注资料来源" not in block
+
+
+def test_大量preference不会把fact挤出注入窗口(db_real, monkeypatch):
+    """``kind`` 过滤必须和 ``limit`` 在同一条 SQL 里。
+
+    收窄那次改动把过滤写在了 Python 侧、``limit`` 之后，于是 limit 作用在
+    **过滤之前**：取回最近 N 条（大多是 preference），再筛掉它们，剩下的 fact
+    可能一条不剩。而 ``MEMORY_MAX_ITEMS`` 是 100、``MEMORY_INJECT_LIMIT`` 是 20，
+    所以这不是理论情形——用户多说几句偏好就够了。
+
+    症状是"记住我在哪个部门"随着偏好条数增长而**静默失效**，没有任何日志或
+    指标指向它。上面三条测试各只 seed 1-2 条，全在 limit 之内，一条都覆盖不到。
+
+    这里把 limit 调小到 3，seed 5 条 preference（更新）+ 1 条 fact（更旧）。
+    过滤在 SQL 里的话 fact 一定在结果里；在 Python 里的话它已经被挤掉了。
+    """
+    monkeypatch.setattr(settings, "MEMORY_INJECT_LIMIT", 3)
+    _seed_kind(db_real, "u1", "fact", "用户在财务部工作。")
+    for index in range(5):
+        _seed_kind(db_real, "u1", "preference", f"偏好第 {index} 条")
+
+    block = MemoryService().build_system_block(db_real, "u1")
+    assert "财务部" in block, "fact 被 preference 挤出了注入窗口"
+    assert "偏好第" not in block
 
 
 def test_preference仍然入库只是不注入(db_real):

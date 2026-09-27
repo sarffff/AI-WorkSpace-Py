@@ -8,12 +8,15 @@
 """
 from __future__ import annotations
 
+import json
+import uuid
 from datetime import timedelta
 
 import pytest
 
+from conftest import run
 from config import settings
-from models import AgentRun
+from models import AgentRun, User
 from services import checkpoint_store
 from services.agent_state import TurnState
 from services.clock import naive_now
@@ -26,6 +29,30 @@ def cp_on(monkeypatch):
     monkeypatch.setattr(settings, "LLM_CHAT_TIMEOUT_SECONDS", 120.0)
     monkeypatch.setattr(settings, "LLM_CHAT_MAX_RETRIES", 2)
     return settings
+
+
+@pytest.fixture
+def own_session_is_test_db(db_real, monkeypatch):
+    """让 ``mark_interrupted`` 自建的会话落到测试库上。
+
+    它刻意不用请求作用域的 db（生成器被回收时那个很可能已经关了，见
+    ``checkpoint_store.mark_interrupted`` 的文档串），而是 ``SessionLocal()``
+    自己开一个——那指向 ``DATABASE_URL`` 里的 MySQL，测试里连不上也看不到。
+
+    ``close()`` 要吞掉：``mark_interrupted`` 用的是 ``with SessionLocal() as ...``，
+    真关掉的话后面的断言就拿着一个关了的 session。
+    """
+    import database
+
+    class _Borrowed:
+        def __enter__(self):
+            return db_real
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(database, "SessionLocal", lambda: _Borrowed())
+    return db_real
 
 
 def _run_row(db, *, run_id="run-1", user_id="u1", status="running", age_seconds=0.0):
@@ -265,3 +292,177 @@ def test_interrupted超时后一并回收(db_real, cp_on):
 
     assert checkpoint_store.reap_orphan_runs(db_real, "u1") == 1
     assert db_real.get(AgentRun, "run-1").status == "failed"
+
+
+def _drive_then_disconnect(response, *, stop_after: int) -> list[dict]:
+    """消费 SSE 响应的前 ``stop_after`` 条事件，然后**关掉它**（= 客户端断线）。
+
+    断线在 ASGI 层的表现就是响应体迭代器被提前 ``aclose()``，生成器于是在
+    ``yield`` 处收到 ``GeneratorExit``，``finally`` 随之执行。这正是要验的东西，
+    所以这里直接驱动 ``body_iterator`` 而不用 ``TestClient``——后者会把整条流
+    读完（那是"正常结束"，一条也测不到断线）。
+    """
+    seen: list[dict] = []
+
+    async def drive():
+        iterator = response.body_iterator.__aiter__()
+        try:
+            while len(seen) < stop_after:
+                chunk = await iterator.__anext__()
+                payload = chunk["data"] if isinstance(chunk, dict) else str(chunk)
+                try:
+                    seen.append(json.loads(payload))
+                except (TypeError, json.JSONDecodeError):
+                    continue
+        except StopAsyncIteration:
+            pass
+        finally:
+            # 提前关闭 = 断线。finally 在这里跑。
+            await response.body_iterator.aclose()
+
+    run(drive())
+    return seen
+
+
+def test_sse断线触发finally标记interrupted(
+    db_real, cp_on, own_session_is_test_db, monkeypatch
+):
+    """关键缺口：SSE 生成器的 ``finally`` 在客户端断线时真的执行。
+
+    现有的 ``test_interrupted的run能接续`` 调的是 ``mark_interrupted`` 本身，
+    那是单元测试——它证明那个函数能改状态，不证明**有人会调它**。这条从路由层
+    驱动：拿到 ``EventSourceResponse``，消费几条事件，然后关掉迭代器。
+
+    **必须测路由层，不能测服务层。** ``mark_interrupted`` 在
+    ``chat_router.stream_completions`` 的 ``finally`` 里，``chat_service`` 那一层
+    压根没有这个块。改动之前这条测试驱动的是服务层的生成器，于是它就算跑通也
+    什么都没验证到——而它连方法名都是错的（``agent_answer`` 不存在）。
+
+    脚本给两轮：第一轮调 calculate（于是有 ``run_started`` / ``tool_start`` 可消费，
+    并且会落一份 ``post_tools`` 快照），断在第二轮的模型调用之前。
+    """
+    import routers.chat_router as chat_router
+    from tests.test_sse_contract import make_service
+    from tests.test_checkpoint_resume import seed_admin
+
+    monkeypatch.setattr(settings, "AGENT_APPROVAL_MODE", "off")
+    monkeypatch.setattr(settings, "RAG_PREFETCH", False)
+    monkeypatch.setattr(settings, "TOOL_CALCULATE_ENABLED", True)
+    monkeypatch.setattr(settings, "TOOL_WEB_SEARCH_ENABLED", False)
+    monkeypatch.setattr(settings, "TOOL_READ_ATTACHMENT_ENABLED", False)
+    monkeypatch.setattr(settings, "TOOL_WRITE_KNOWLEDGE_ENABLED", False)
+    monkeypatch.setattr(settings, "MEMORY_ENABLED", False)
+
+    admin_id = seed_admin(db_real)
+    service, _adapter = make_service(
+        [
+            {"tool_calls": [("calculate", {"expression": "1+1"})]},
+            {"text": "等于 2。"},
+        ]
+    )
+    # 路由持有一个模块级 ChatService。要让它用脚本化的适配器,只能换掉那一个。
+    monkeypatch.setattr(chat_router, "chat_service", service)
+
+    chat = run(service.create_chat(db_real, user_id=admin_id, title="断线"))
+    # ChatRequest.message_id 是 uuid.UUID，不是任意字符串
+    message_id = str(uuid.uuid4())
+    run(
+        service.save_message(
+            db_real, chat.id, "user", "算 1+1", "gpt-4o-mini", message_id
+        )
+    )
+
+    response = run(
+        chat_router.stream_completions(
+            chat_router.ChatRequest(
+                chat_id=chat.id,
+                prompt="算 1+1",
+                use_rag=False,
+                message_id=message_id,
+            ),
+            db=db_real,
+            current_user=db_real.get(User, admin_id),
+        )
+    )
+    # run_started 是第一条带 runId 的事件,刻意早发就是为了断线时有接续凭证。
+    events = _drive_then_disconnect(response, stop_after=2)
+
+    run_id = next(
+        (event.get("runId") for event in events if event.get("type") == "run_started"),
+        None,
+    )
+    assert run_id, f"没拿到 run_started 的 runId，实际事件：{[e.get('type') for e in events]}"
+
+    db_real.expire_all()
+    row = db_real.get(AgentRun, run_id)
+    assert row is not None, f"run {run_id} 没落库"
+    # 断线之后立刻可接续,不必等 780 秒的孤儿回收。
+    assert row.status == "interrupted", f"应标成 interrupted，实际 {row.status}"
+
+
+def test_恢复流断线也标interrupted(db_real, cp_on, own_session_is_test_db, monkeypatch):
+    """断线修复必须覆盖**三个恢复端点**，不只是 /completions/stream。
+
+    ``_continuation_sse`` 起初没有 ``finally``：一次"点了同意、恢复到一半又断了"
+    的执行会停在 ``running`` 直到孤儿回收（约 780 秒），而静默重连等不了那么久。
+    症状是用户点了同意、看着它转、然后什么都没有，十三分钟内也接不回来。
+
+    这里直接测那个包装函数：给它一个发几条事件的流，消费一条就断。
+    """
+    import routers.chat_router as chat_router
+
+    _run_row(db_real, status="running")
+
+    async def fake_stream():
+        yield {"type": "approval_resolved", "runId": "run-1", "approved": True}
+        yield {"type": "message_delta", "content": "已经保存好了。"}
+
+    response = chat_router._continuation_sse(
+        fake_stream(),
+        db=db_real,
+        user_id="u1",
+        run_id="run-1",
+        chat_id="chat-1",
+        assistant_message_id=None,
+        prefix="",
+        model="gpt-4o-mini",
+        state_before=None,
+        what="恢复",
+    )
+    _drive_then_disconnect(response, stop_after=1)
+
+    db_real.expire_all()
+    assert db_real.get(AgentRun, "run-1").status == "interrupted"
+
+
+def test_恢复流正常跑完不标interrupted(db_real, cp_on):
+    """``settled`` 的另一半：完整消费掉的流绝不能被标成断线。
+
+    只测上一条的话，一个"永远标 interrupted"的实现也会通过——而那会把每一次
+    正常的恢复都变成待接续项，用户每答完一次澄清都看到一个"接着跑吗"的提示。
+    """
+    import routers.chat_router as chat_router
+
+    _run_row(db_real, status="running")
+
+    async def fake_stream():
+        yield {"type": "message_delta", "content": "答完了。"}
+
+    response = chat_router._continuation_sse(
+        fake_stream(),
+        db=db_real,
+        user_id="u1",
+        run_id="run-1",
+        chat_id="chat-1",
+        # 落库要 assistant id,给 None 就只发事件不写库——这条测的是状态,不是落库
+        assistant_message_id=None,
+        prefix="",
+        model="gpt-4o-mini",
+        state_before=None,
+        what="恢复",
+    )
+    # 消费到底
+    _drive_then_disconnect(response, stop_after=50)
+
+    db_real.expire_all()
+    assert db_real.get(AgentRun, "run-1").status == "running"

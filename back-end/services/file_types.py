@@ -90,6 +90,49 @@ DELIBERATELY_EXCLUDED: frozenset[str] = frozenset({
 })
 
 
+# ========== 本机文件工具用：按文本读不出东西的 ==========
+# 2026-09-05 加。文件系统工具（``services/fs_tools.py``）要回答一个这个模块原本
+# 没有的问题：**这个文件按纯文本读会不会只得到乱码**。
+#
+# 它和上面几个集合的关系是"不是白名单，是黑名单"：``read_file`` / ``search_files``
+# 面对的是用户机器上的任意文件，白名单式的"只读这些扩展名"会把没登记过的正当
+# 文本文件（.toml、.gitignore、.env.example、没有扩展名的 Makefile）全部拒掉，
+# 而那些恰恰是用户最想让 agent 读的东西。所以这里反过来列"读不了的"。
+#
+# 为什么不直接用 ``IMAGE | DOCUMENT``：那两个集合回答的是"上传链路收不收"，
+# 而这里问的是"能不能按文本解码"。压缩包、可执行文件、字体、媒体文件都不在
+# 上传白名单里（所以无需登记），但它们**必须**在这里——不然 search_files 会去
+# 解码一个 200MB 的 zip，产出的乱码原样进模型上下文。
+#
+# 定义成派生 + 补充，而不是重新列一遍图片和文档格式：那样改一处漏一处的老问题
+# 会以第三种形式回来。
+_EXTRA_BINARY: frozenset[str] = frozenset({
+    # 压缩包
+    "zip", "gz", "tar", "7z", "rar", "bz2", "xz",
+    # 可执行与目标文件
+    "dll", "so", "dylib", "bin", "obj", "lib",
+    # 媒体
+    "mp3", "mp4", "avi", "mov", "wav", "flac", "mkv", "webm",
+    # 字体
+    "woff", "woff2", "ttf", "eot", "otf",
+    # 编译产物
+    "pyc", "pyo", "jar", "wasm",
+    # 本地数据库
+    "sqlite", "sqlite3", "mdb",
+    # 上传链路不收、但同族的办公格式（doc/xls/ppt 是旧二进制格式，
+    # docx/xlsx 已在 DOCUMENT 里）
+    "doc", "xls", "ppt", "pptx",
+})
+
+# ``exe``/``bat``/``ps1``/``vbs`` 从 DELIBERATELY_EXCLUDED 里来——它们在那儿是
+# 因为"不许上传"，在这里是因为"读不出文本"，两个理由不同但结论一致，
+# 所以取并集而不是各列一遍。``svg``/``html``/``htm`` 是文本，要排除掉。
+BINARY_UNREADABLE: frozenset[str] = (
+    IMAGE | DOCUMENT | _EXTRA_BINARY
+    | (DELIBERATELY_EXCLUDED - {"svg", "html", "htm"})
+)
+
+
 def accept_attribute(extensions: frozenset[str]) -> str:
     """渲染成 <input type="file"> 的 accept 值：``.md,.pdf,.txt``。
 
@@ -124,3 +167,17 @@ def payload() -> dict[str, object]:
         "knowledgeAccept": accept_attribute(KNOWLEDGE),
         "attachmentAccept": accept_attribute(ATTACHMENT),
     }
+
+
+# ========== skill 附带文件用：能给模型当参考资料读的 ==========
+# 2026-09-05 加。skill 可以在目录里带模板与参考资料（``services/skill_tools.py``
+# 的 read_skill_file 读它们），而"哪些格式能当参考资料"是这个模块该回答的第三个
+# 问题——前两个是"上传收不收"与"按文本读不读得出来"。
+#
+# 比 ``TEXT`` 窄：源码扩展名（.py/.ts/.go…）不在内。skill 的附带文件是给人和模型
+# 读的规程与模板，而不是代码——真要让 agent 读代码，那是文件工具的活，
+# 那边有完整的沙箱与授权。窄一点也让"往 skill 目录里误丢一个源文件"不会静默地
+# 变成一份参考资料。
+SKILL_ATTACHMENT: frozenset[str] = frozenset({
+    "md", "txt", "json", "yaml", "yml", "csv",
+})

@@ -539,3 +539,191 @@ class MessageFeedback(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime)
     # 是否已被导出进评估数据集,避免每次导出都重复追加同一条
     exported_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class WorkspaceRoot(Base):
+    """一个被授权给文件系统工具的本机目录。
+
+    文件系统工具（``list_directory`` / ``read_file`` / ``search_files`` /
+    ``write_file`` / ``edit_file`` / ``delete_file``）只能在这张表里登记过的目录
+    之下工作。一个用户名下没有任何一行时，这些工具**根本不注册**——没有沙箱根，
+    它们除了报错什么都做不了，而注册一个每轮都失败的工具只会白烧上下文
+    （同 ``workspace_tools.build`` 里那条理由）。
+
+    ## 判据是 user_id，不是 workspace_id
+
+    授权是**本机行为**：用户在自己那台机器上点了一次系统对话框。而工作区是多人
+    共享的（邀请码加入、admin/member 两种角色）。按工作区授权的话，一个成员选的
+    目录会让同工作区的另一个人"有权"读它——而那个人的机器上可能根本没有这个路径，
+    或者更糟，有一个同路径但内容完全不同的目录。
+
+    ``workspace_id`` 存下来是为了回答"这次授权是在哪个工作区的上下文里给的"，
+    它不参与权限判断。
+
+    ## path 原样存
+
+    不在入库时做规范化改写。``fs_roots.resolve_within_roots`` 每次校验都对两边
+    重新 ``realpath``——那才是符号链接会变的地方，入库时解析一次并不能保证之后
+    那个链接指向的还是同一处。存原样也让界面上显示的与用户当初选的是同一个字符串。
+    """
+
+    __tablename__ = "workspace_roots"
+    __table_args__ = (
+        # 同一个人重复授权同一个目录是幂等的，而不是攒出两行让撤销只撤掉一半
+        UniqueConstraint("user_id", "path", name="uq_workspace_roots_user_path"),
+        Index("ix_workspace_roots_user_id", "user_id"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    workspace_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # 512 而不是 255：Windows 长路径 + 中文目录名很容易超过 255 字节，而截断的
+    # 后果是沙箱根变成一个**不同的目录**——前缀校验照样通过，只是通过的是错的那个
+    path: Mapped[str] = mapped_column(String(512), nullable=False)
+    label: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class WorkspaceSkill(Base):
+    """一个工作区自己写的 skill（作业指导）。
+
+    skill 回答"这件事在本组织该怎么做"。内置 skill 在 ``back-end/skills/`` 里跟
+    代码版本化，这张表装的是各家自己的 SOP——admin 在界面上写，不改代码不重启。
+
+    ## 判据是 workspace_id，和 WorkspaceRoot 相反
+
+    两者的对比正好说明判据是怎么定的：文件夹授权是**本机行为**（这台机器上的
+    这个目录，换个人就不成立），而 SOP 是**组织资产**（全公司同一套报销流程）。
+    按 user 存的话每个员工都要自己录一遍，而且会录出互相矛盾的版本——那时
+    "到底按谁的流程审"没有答案。
+
+    ## 同名盖掉内置
+
+    ``(workspace_id, name)`` 唯一，查找时工作区优先。不做"两份正文合并"：
+    拼在一起时哪一句生效取决于模型，而那不可预测。
+
+    ## description 是模型选 skill 的唯一依据
+
+    索引里只有名字和这一句（正文按需用 ``load_skill`` 取），所以它写不好就等于
+    这个 skill 不存在——不会报错，只是永远不被选中。
+    """
+
+    __tablename__ = "workspace_skills"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "name", name="uq_workspace_skills_ws_name"),
+        Index("ix_workspace_skills_workspace_id", "workspace_id"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    workspace_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+    description: Mapped[str] = mapped_column(String(255), nullable=False)
+    instructions: Mapped[str] = mapped_column(Text, nullable=False)
+    # 关掉而不是删掉：改坏一条 SOP 之后想先停用看看，比删了重录便宜
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # 正文或描述变化时 +1（在 service 层判定）。审核结论要引用它，否则 admin 改一次
+    # SOP，之前所有结论的依据就都指向一份已经不存在的文本——三个月后有人问"当时
+    # 为什么通过"，答不出来。enabled 开关和改错别字不让它跳，否则这个号很快大到
+    # 没人看，"版本变了"这个信号也就没用了。
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    # 下结论之前必须先拿到的东西，逗号分隔。解析走 skill_library.parse_required_inputs
+    # （和内置 skill 的 frontmatter 共用一套，各写一遍迟早在"逗号后空格算不算"上分叉）。
+    #
+    # 它不是给模型看的提示，是给 structured.ReviewVerdict 提供必填槽位：结构里有
+    # 那个位置，空着就是空着。于是"漏了一项"从判断题变成填空题。
+    required_inputs: Mapped[str] = mapped_column(
+        String(500), default="", nullable=False
+    )
+    # SOP 出问题时第一个要问的就是这个
+    created_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ReviewRecord(Base):
+    """一条审核结论的台账记录。审核类任务的**交付物**。
+
+    ## 名字为什么不叫 ReviewVerdict
+
+    ``structured.ReviewVerdict`` 是模型产出的那个 Pydantic 结构（inputs / basis /
+    verdict 三件）。这一行装的东西更多：审的是什么、采样几次、有没有人复核过。
+    verdict 是它的一个字段，不是它本身。两个类同名会让 import 处处要起别名，
+    而"到底是哪一个"这件事在代码里必须一眼看出来。
+
+    ## 为什么不塞进 message_tool_steps
+
+    那张表是工具调用轨迹，给排查用，随对话一起被清理。这张表是业务记录：一张单子
+    的审核结论不该因为有人清了聊天记录就消失。所以 ``chat_id`` / ``message_id``
+    只作线索留着（"想看当时怎么审的，去这段对话"），**不设外键约束**——断了不影响
+    这条结论本身的有效性。
+
+    ## needs_human 是一等公民
+
+    三档里它最有价值：审核这份工作的全部意义在于"拿不准就往上抬一级"。把它当成
+    某种错误状态会让人去优化掉它，而那正好优化掉了价值。
+
+    ## sop_version 是快照值不是外键
+
+    引用 ``WorkspaceSkill.version`` 的话，SOP 再改一次这条结论的依据又变了——
+    而这张表存在的理由正是"当时按的第几版"。存下来的数字是事实，外键指向的是现状。
+    """
+
+    __tablename__ = "review_verdicts"
+    __table_args__ = (
+        # 台账按工作区 + 时间倒序翻页
+        Index("ix_review_verdicts_ws_created", "workspace_id", "created_at"),
+        # 待办队列："还有哪些等着人看"
+        Index(
+            "ix_review_verdicts_pending", "workspace_id", "verdict", "resolved_at"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    workspace_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    chat_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # 审的是什么。自由文本：可能是文件名、单号或一句描述，取决于材料从哪来。
+    # 不做成指向文件的外键——文件会被移走、改名、删除，而结论要比它长命
+    subject: Mapped[str] = mapped_column(String(500), nullable=False)
+    sop_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    sop_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 不用枚举类型：三档还会长（"部分通过"是可预见的下一档），
+    # 而 MySQL 改枚举要锁表
+    verdict: Mapped[str] = mapped_column(String(20), nullable=False)
+    # JSON 数组。核对项 3~6 个、只整体读写，拆表要多一次 join 换一个用不上的
+    # 查询能力
+    inputs: Mapped[str] = mapped_column(Text, nullable=False)
+    basis: Mapped[str] = mapped_column(Text, nullable=False)
+    # 一致性检查采样了几次、结论一致吗。
+    #
+    # runs=1 有两种含义且处置不同：没开这个检查，或者开了但只有一次跑通。
+    # 所以 agreed 单独一列——runs=1 且 agreed=True 说的是"没检查过"，
+    # 不是"检查过并且一致"（见 services/review_consensus.combine）
+    runs: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    agreed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    # 人复核之后的处置。NULL = 还没人看过。
+    # 转人工必须查得出"接手了没有"，否则它等于扔进一个没人看的队列
+    resolved_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    resolution: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    resolution_note: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    # 模型据以判断的材料原文。两个用途：人复核时要看的就是它，
+    # 独立复审（review_consensus）拿它重新判一次。
+    #
+    # Text 而不是 String(n)：一整张单子的 OCR 文本可能很长，而给具体上限就一定有
+    # 被截断的那天——静默截掉的正好是尾部，而尾部常常是签字与日期。
+    # 入参那侧由 REVIEW_EVIDENCE_MAX_CHARS 挡着，超限明确报错。
+    #
+    # NULL 读作"这条结论是加这一列之前记的"，与空串（材料是空的，那是 bug）
+    # 分得开。
+    evidence: Mapped[str | None] = mapped_column(Text, nullable=True)

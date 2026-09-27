@@ -30,6 +30,7 @@ import type {
   Citation,
   GuardrailNotice,
   MessageFeedback,
+  PlanStep,
   ServerCapabilities,
   ToolStep,
 } from "@/shared/types/api.types";
@@ -37,6 +38,9 @@ import { MessageContent } from "./MessageContent";
 import { FeedbackButtons } from "@/features/message-feedback/ui/FeedbackButtons";
 import { ToolTrace } from "@/widgets/tool-trace/ui/ToolTrace";
 import { ToolApprovalCard } from "@/widgets/tool-approval";
+import { ClarificationCard } from "@/widgets/clarification";
+import { PlanCard } from "@/widgets/plan";
+import { FileTree } from "@/widgets/file-tree";
 import {
   ChatInsightPanel,
   type InsightEvent,
@@ -49,6 +53,7 @@ import {
   Send,
   Bot,
   FlaskConical,
+  FolderTree,
   User,
   Sparkles,
   Paperclip,
@@ -186,6 +191,9 @@ export const ChatPage: React.FC = () => {
   const [replyStarted, setReplyStarted] = useState(false);
   const [insightEvents, setInsightEvents] = useState<InsightEvent[]>([]);
   const [insightOpen, setInsightOpen] = useState(true);
+  // 文件树默认**收起**。洞察面板默认展开是因为每一轮都有东西看；文件树是
+  // "要用才打开"的东西，一进来就占掉 256px 会把消息区挤窄,而多数回合根本不碰文件。
+  const [fileTreeOpen, setFileTreeOpen] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
   const [attaching, setAttaching] = useState(false);
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
@@ -205,6 +213,16 @@ export const ChatPage: React.FC = () => {
   const [toolStepsByMessage, setToolStepsByMessage] = useState<
     Record<string, ToolStep[]>
   >({});
+  /**
+   * 事前规划的步骤，按**用户消息 id** 存（和 toolStepsByMessage 同一个键）。
+   *
+   * 只活在这次会话的内存里：计划没有落库，刷新页面之后就没了。这是有意的取舍——
+   * 计划的用处是"答案还没出来时先知道模型打算干什么"，而刷新之后答案已经在那儿，
+   * 一份事后的计划只是噪声。真要事后核对，看工具轨迹（那个是落库的）。
+   */
+  const [planByMessage, setPlanByMessage] = useState<Record<string, PlanStep[]>>(
+    {},
+  );
   /**
    * 后端实际开了哪些工具。附件怎么传取决于 read_attachment 在不在——
    * 前端猜不出来，猜错的后果是把附件内容彻底丢掉。
@@ -230,6 +248,29 @@ export const ChatPage: React.FC = () => {
     assistantId: string | null;
   } | null>(null);
   const [approvalBusy, setApprovalBusy] = useState(false);
+  /**
+   * 当前会话里停着的那次澄清提问（模型调了 ask_user）。
+   *
+   * 与 pendingApproval 分开而不是合成一个"待处理中断"：两者要渲染的东西不一样
+   * （一个列参数等裁决，一个显示问题等输入），能同时存在的可能也不该被类型允许
+   * ——一个 run 要么在等裁决，要么在等回答。
+   *
+   * 注意它**没有** GET /chats/runs/pending 那条恢复路径：那个接口查的是
+   * waiting_approval。刷新页面之后这张卡片会消失，而 run 还留在 waiting_input
+   * 里，只能从"可接续"列表里接回去。这是已知缺口，见下面渲染处的注释。
+   */
+  const [pendingClarification, setPendingClarification] = useState<{
+    runId: string;
+    question: string;
+    resumable: boolean;
+    /**
+     * 这句问题是框架从回答正文里收编来的（模型没调 ask_user）。
+     * 只影响卡片文案：问题已经在上面那段回答里出现过一次了。
+     */
+    adopted: boolean;
+    assistantId: string | null;
+  } | null>(null);
+  const [clarificationBusy, setClarificationBusy] = useState(false);
   // 静默重连试满之后的提示。null = 没发生过。
   //
   // 与 pendingApproval 分开：那个在等人做决定（批不批），这个只是告诉人
@@ -250,6 +291,23 @@ export const ChatPage: React.FC = () => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  /**
+   * 文件树里点了一个文件：把路径**追加进输入框**，不直接发。
+   *
+   * 不自动发是因为光有路径不是一个请求——用户还得说要拿它干什么（"总结一下"、
+   * "跟上个月的对比"）。自动发等于替他猜意图，而猜错的代价是白烧一整回合。
+   *
+   * 用引号包起来：路径里有空格时（"我的 文档/a.txt"）不包会被模型读成两段。
+   */
+  const handlePickFile = useCallback((entry: { path: string }) => {
+    setInput((prev) => {
+      const quoted = `"${entry.path}"`;
+      if (prev.includes(quoted)) return prev;
+      return prev ? `${prev.replace(/\s+$/, "")} ${quoted}` : quoted;
+    });
+    textareaRef.current?.focus();
+  }, []);
   const attachInputRef = useRef<HTMLInputElement>(null);
 
   const adjustTextareaHeight = () => {
@@ -534,6 +592,7 @@ export const ChatPage: React.FC = () => {
   useEffect(() => {
     if (!currentChatId) {
       setPendingApproval(null);
+      setPendingClarification(null);
       return;
     }
     let cancelled = false;
@@ -542,13 +601,37 @@ export const ChatPage: React.FC = () => {
       .then((items) => {
         if (cancelled) return;
         const hit = items.find((item) => item.chatId === currentChatId);
+        // 按 kind 分派。这个列表里有三种中断，恢复端点不是同一个：审批走
+        // /resume（带裁决），两种澄清走 /answer（带一句话）。
+        //
+        // 这里原来把**所有**待恢复的 run 都塞进 pendingApproval，因为这个接口
+        // 加入 waiting_input 之前只可能是审批。后果是刷新之后一次澄清会被渲染成
+        // 审批卡片：用户看到"同意/拒绝"两个按钮，点哪个都是 409，因为那个 run
+        // 在等的是一句话。后端从加 kind 起就在发这个字段，前端一直没读。
+        const isClarification =
+          hit?.kind === "user_input" || hit?.kind === "prose_question";
         setPendingApproval(
-          hit
+          hit && !isClarification
             ? {
                 runId: hit.runId,
                 tool: hit.tool ?? "",
                 reason: hit.reason ?? "",
                 preview: hit.preview ?? {},
+                assistantId: null,
+              }
+            : null,
+        );
+        setPendingClarification(
+          hit && isClarification
+            ? {
+                runId: hit.runId,
+                // question 由后端从 arguments 里抬出来。空串时退回 reason——
+                // 那是同一句话（收编与 ask_user 两条路都把问题填进了 reason），
+                // 总比给一张没有标题的空卡片好。
+                question: hit.question || hit.reason || "",
+                // 能从这个列表里被读到，就说明快照还在（列表本身来自快照）
+                resumable: true,
+                adopted: hit.kind === "prose_question",
                 assistantId: null,
               }
             : null,
@@ -565,9 +648,9 @@ export const ChatPage: React.FC = () => {
   /**
    * 轨迹按用户消息归属，但要显示在回答下面，所以这里做一次映射。
    *
-   * 按消息顺序把"最近一条用户消息"的轨迹挂到紧随其后的那条回答上，而不是去前端
+   * 按消息顺序把"最近一条用户消息"的东西挂到紧随其后的那条回答上，而不是去前端
    * 复算后端那个 uuid5 推导出来的 assistant id——推导规则一改，前端会安静地
-   * 显示不出轨迹，而顺序关系不会变。
+   * 显示不出来，而顺序关系不会变。
    */
   const traceByAssistant = useMemo(() => {
     const result: Record<string, ToolStep[]> = {};
@@ -589,6 +672,24 @@ export const ChatPage: React.FC = () => {
     }
     return result;
   }, [messages, toolStepsByMessage]);
+
+  /** 计划走同一条归属规则（键是用户消息 id，要显示在回答上方）。 */
+  const planByAssistant = useMemo(() => {
+    const result: Record<string, PlanStep[]> = {};
+    let pendingKey: string | null = null;
+    for (const message of messages) {
+      if (message.role === "user") {
+        pendingKey = message.messageId ?? message.id;
+        continue;
+      }
+      if (message.role === "assistant" && pendingKey) {
+        const steps = planByMessage[pendingKey];
+        if (steps?.length) result[message.id] = steps;
+        pendingKey = null;
+      }
+    }
+    return result;
+  }, [messages, planByMessage]);
 
   const flushBuffer = useCallback(() => {
     const { id, content, sessionId } = bufferRef.current;
@@ -713,19 +814,34 @@ export const ChatPage: React.FC = () => {
       userMsg: string,
       userMessageId: string,
       /**
-       * 带上它表示这不是一次新提问，而是从审批快照接着跑。
+       * 带上它表示这不是一次新提问，而是从快照接着跑。
        *
        * 走同一个渲染循环：恢复之后模型还要继续调工具、继续流式输出，事件和普通
        * 对话完全一样。抄第二份循环的代价是以后往流里加字段得改两处，漏一处的
        * 症状只在用过审批的会话里出现，很难对上原因。
+       *
+       * 两种中断用判别联合而不是两个可选参数：它们互斥（一个 run 不可能同时
+       * 在等裁决和等回答），联合能让类型系统保证这件事。下面所有
+       * `if (!resume)` 判的都是"这是不是一次接续"——两种都算，所以它们不用改。
        */
-      resume?: {
-        runId: string;
-        approved: boolean;
-        note: string;
-        /** 被打断时那条 assistant 气泡；续写到它上面而不是新建 */
-        assistantId: string | null;
-      },
+      resume?:
+        | {
+            kind: "approval";
+            runId: string;
+            approved: boolean;
+            note: string;
+            /** 改过参数再放行；只含用户动过的键。没编辑时 undefined */
+            editedArguments?: Record<string, unknown>;
+            /** 被打断时那条 assistant 气泡；续写到它上面而不是新建 */
+            assistantId: string | null;
+          }
+        | {
+            kind: "clarification";
+            runId: string;
+            /** 用户回答的那句话 */
+            answer: string;
+            assistantId: string | null;
+          },
     ) => {
       const ts = new Date().toLocaleTimeString([], {
         hour: "2-digit",
@@ -744,6 +860,13 @@ export const ChatPage: React.FC = () => {
       // 旧轨迹删掉再重新记，前端不清就会把新旧两份接在一起，看起来像它查了两倍的东西。
       if (!resume) {
         setToolStepsByMessage((prev) => {
+          if (!prev[userMessageId]) return prev;
+          const next = { ...prev };
+          delete next[userMessageId];
+          return next;
+        });
+        // 计划同理：重新生成会重新规划一次，不清就会把两份计划接在一起。
+        setPlanByMessage((prev) => {
           if (!prev[userMessageId]) return prev;
           const next = { ...prev };
           delete next[userMessageId];
@@ -771,15 +894,22 @@ export const ChatPage: React.FC = () => {
         setReplyStarted(true);
       }
 
-      // 审批恢复不套重连：它是用户刚点的一次明确动作，失败了该让他看到错误，
-      // 而不是悄悄重试一个"已经批准过"的写操作。
+      // 审批恢复与澄清接续都不套重连：它们是用户刚点的一次明确动作，失败了该让他
+      // 看到错误，而不是悄悄重试一个"已经批准过"的写操作、或者把答案送出去两次。
       const stream = resume
-        ? apiClient.resumeRun(
-            resume.runId,
-            resume.approved,
-            resume.note,
-            controller.signal,
-          )
+        ? resume.kind === "approval"
+          ? apiClient.resumeRun(
+              resume.runId,
+              resume.approved,
+              resume.note,
+              controller.signal,
+              resume.editedArguments,
+            )
+          : apiClient.answerClarification(
+              resume.runId,
+              resume.answer,
+              controller.signal,
+            )
         : streamWithReconnect({
             open: () =>
               apiClient.streamMessage(
@@ -944,6 +1074,46 @@ export const ChatPage: React.FC = () => {
                 label: chunk.approved ? "已同意执行" : "已拒绝执行",
                 detail: toolLabel(chunk.tool),
               },
+            ]);
+            continue;
+          }
+
+          if (chunk.type === "clarification") {
+            // 和 approval_required 同一个收尾：后端已经挂起这一轮并结束了这条流。
+            // 在这个分支存在之前，这个事件匹配不到任何分支、被静默丢掉——后端在等
+            // 答案，而界面上只是"生成突然停了"，用户没有任何可点的东西。
+            stopFlushTimer();
+            flushBuffer();
+            setShowThinking(false);
+            setToolStatus(null);
+            dispatch(setIsGenerating(false));
+            if (chunk.question) {
+              setPendingClarification({
+                // runId 只在可续的那种形状里有（后端两处 yield：开了 checkpoint
+                // 的带 runId + resumable，没开的只有 question）。
+                runId: chunk.runId ?? "",
+                question: chunk.question,
+                resumable: Boolean(chunk.resumable && chunk.runId),
+                adopted: Boolean(chunk.adopted),
+                assistantId: assistantMsgId || null,
+              });
+            }
+            setInsightEvents((prev) => [
+              ...prev,
+              {
+                type: "approval",
+                label: chunk.adopted ? "已接住正文里的提问" : "等待你的回答",
+                detail: chunk.resumable ? "已保存执行状态" : "答案将作为新一轮",
+              },
+            ]);
+            // 气泡要留着——接续时续写到它上面
+            break;
+          }
+
+          if (chunk.type === "clarification_answered") {
+            setInsightEvents((prev) => [
+              ...prev,
+              { type: "approval", label: "已回答", detail: "接着原来那一轮继续" },
             ]);
             continue;
           }
@@ -1122,6 +1292,27 @@ export const ChatPage: React.FC = () => {
                 detail: `${chunk.summarized ?? 0}条摘要`,
               },
             ]);
+            continue;
+          }
+
+          if (chunk.type === "plan") {
+            // 后端只在计划非空时发这个事件，但仍然判一次：空数组渲染出来是一张
+            // 写着「0 步」的空卡片。
+            const planSteps = chunk.planSteps ?? [];
+            if (planSteps.length) {
+              setPlanByMessage((prev) => ({
+                ...prev,
+                [userMessageId]: planSteps,
+              }));
+              setInsightEvents((prev) => [
+                ...prev,
+                {
+                  type: "plan",
+                  label: "已规划",
+                  detail: `${planSteps.length} 步`,
+                },
+              ]);
+            }
             continue;
           }
 
@@ -1309,16 +1500,22 @@ export const ChatPage: React.FC = () => {
    * 那不是错误，把卡片收掉就行。
    */
   const handleApprovalDecision = useCallback(
-    async (approved: boolean, note: string) => {
+    async (
+      approved: boolean,
+      note: string,
+      editedArguments?: Record<string, unknown>,
+    ) => {
       const pending = pendingApproval;
       if (!pending || !currentChatId || approvalBusy) return;
       setApprovalBusy(true);
       setPendingApproval(null);
       try {
         await runCompletion(currentChatId, "", "", {
+          kind: "approval",
           runId: pending.runId,
           approved,
           note,
+          editedArguments,
           assistantId: pending.assistantId,
         });
         // 刷新过页面的情况下本地没有那条 assistant 气泡，恢复流里也只有后半段
@@ -1437,6 +1634,96 @@ export const ChatPage: React.FC = () => {
       activeRunRef.current = null;
     }
   }, [dispatch, toast]);
+
+  /**
+   * 把澄清的答案送回去，接着原来那一轮跑完。
+   *
+   * `resumable=false` 时走另一条路：没有快照可接，答案只能当成新一轮提问发出去。
+   * 这时模型问问题之前检索到的东西全部丢掉，它会重新查一遍——卡片上已经把这件事
+   * 告诉用户了（见 ClarificationCard 的提示），这里不再弹一次。
+   *
+   * 409（STALE_CLARIFICATION）表示这个 run 已经不在等回答了：别的标签页答过、
+   * 或者挂太久被标成 abandoned。同审批，收掉卡片就行，不当错误弹。
+   */
+  const handleClarificationAnswer = useCallback(
+    async (answer: string) => {
+      const pending = pendingClarification;
+      if (!pending || !currentChatId || clarificationBusy) return;
+      setClarificationBusy(true);
+      setPendingClarification(null);
+      try {
+        if (!pending.resumable) {
+          // 退回旧行为：当成一次新提问。**这是默认路径**——
+          // AGENT_CHECKPOINT_ENABLED 默认是 false，所以不开快照时走的就是这里。
+          //
+          // 没有复用 handleSend：那个还要建会话、拼附件、清输入框，而这里会话
+          // 已经在了、答案是纯文本、输入框根本没被用过。抽一个公共函数出来的话
+          // 两边都得带一堆用不上的参数。
+          const ts = new Date().toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          });
+          const userMessageId = crypto.randomUUID();
+          dispatch(
+            addMessage({
+              id: userMessageId,
+              sessionId: currentChatId,
+              role: "user",
+              content: answer,
+              timestamp: ts,
+            }),
+          );
+          requestAnimationFrame(() => scrollToBottom(true));
+          await runCompletion(currentChatId, answer, userMessageId);
+          return;
+        }
+        await runCompletion(currentChatId, "", "", {
+          kind: "clarification",
+          runId: pending.runId,
+          answer,
+          assistantId: pending.assistantId,
+        });
+        if (!pending.assistantId) {
+          // 同审批恢复：刷新过页面时本地没有那条气泡，拉后端拼好的完整回答。
+          const msgs = await apiClient.getMessages(currentChatId);
+          dispatch(
+            setMessages({
+              sessionId: currentChatId,
+              messages: msgs.map((m) => ({
+                id: m.id,
+                sessionId: m.chatId,
+                role: m.role,
+                content: m.content,
+                timestamp: new Date(m.createdAt).toLocaleTimeString([], {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                }),
+                model: m.model,
+              })),
+            }),
+          );
+        }
+      } catch (err) {
+        if ((err as Error)?.message === "STALE_CLARIFICATION") {
+          toast.info("这次提问已经回答过了");
+        } else if ((err as Error)?.name !== "AbortError") {
+          toast.error(toastMessageFrom(err, "继续执行失败"));
+        }
+        dispatch(setIsGenerating(false));
+      } finally {
+        setClarificationBusy(false);
+      }
+    },
+    [
+      pendingClarification,
+      currentChatId,
+      clarificationBusy,
+      runCompletion,
+      dispatch,
+      toast,
+      scrollToBottom,
+    ],
+  );
 
   const handleSend = useCallback(
     async (e: React.FormEvent) => {
@@ -1622,6 +1909,25 @@ export const ChatPage: React.FC = () => {
 
   return (
     <div className="flex h-full bg-[#fbf9f5] dark:bg-[#141413] transition-colors duration-200">
+      {/* 文件树只在**工具真的注册了**的时候出现。后端没开、或者用户一个文件夹都
+          没授权时,摆一个点开是空的面板只会让人以为功能坏了——引导去设置页那件事
+          由设置页自己的 WorkspaceFolderPanel 负责,聊天页不抢这个活。 */}
+      {capabilities?.fs?.enabled &&
+        capabilities.fs.hasRoots &&
+        (fileTreeOpen ? (
+          <FileTree
+            onPick={handlePickFile}
+            onClose={() => setFileTreeOpen(false)}
+          />
+        ) : (
+          <button
+            onClick={() => setFileTreeOpen(true)}
+            className="w-8 border-r border-[#e6e2d8] dark:border-[#282724] flex items-center justify-center text-[#918d83] hover:text-[#da7756] hover:bg-[#f3f0e6] dark:hover:bg-[#262522] transition-colors shrink-0"
+            title="展开工作区文件"
+          >
+            <FolderTree className="w-4 h-4" />
+          </button>
+        ))}
       <div className="flex flex-col flex-1 min-w-0">
         <div
           ref={messagesContainerRef}
@@ -1748,6 +2054,16 @@ export const ChatPage: React.FC = () => {
                       </span>
                       <span>{msg.timestamp}</span>
                     </div>
+
+                    {/*
+                      执行计划在**回答上方**，和工具轨迹（下方）相反：计划是事前的，
+                      它的用处是让人在答案还在生成时就看到模型打算怎么做。放在回答
+                      下面就只是一份事后清单了。
+                    */}
+                    {msg.role === "assistant" &&
+                      !!planByAssistant[msg.id]?.length && (
+                        <PlanCard steps={planByAssistant[msg.id]} />
+                      )}
 
                     {editingMsgId === msg.id ? (
                       <div className="space-y-2">
@@ -1942,6 +2258,31 @@ export const ChatPage: React.FC = () => {
                   preview={pendingApproval.preview}
                   busy={approvalBusy}
                   onDecide={handleApprovalDecision}
+                />
+              </div>
+            </div>
+          )}
+          {/*
+            澄清卡片。和审批卡片并列而不是嵌套：一个 run 只会处于其中一种状态
+            （waiting_approval / waiting_input），两张卡片不会同时出现。
+
+            刷新之后这张卡片能找回来：GET /chats/runs/pending 两种状态都查
+            （waiting_approval + waiting_input），上面那个 effect 按 kind 分派。
+            分派是必须的——不分派的话一次澄清会被渲染成审批卡片，用户看到
+            "同意/拒绝"，点哪个都是 409，因为那个 run 在等的是一句话。
+          */}
+          {pendingClarification && (
+            <div className="flex items-start gap-4 max-w-3xl">
+              <div className="w-8 h-8 rounded-xl bg-[#282724] dark:bg-[#2e2d2a] flex items-center justify-center text-sky-500 shadow-sm">
+                <Bot className="w-4 h-4" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <ClarificationCard
+                  question={pendingClarification.question}
+                  resumable={pendingClarification.resumable}
+                  adopted={pendingClarification.adopted}
+                  busy={clarificationBusy}
+                  onAnswer={handleClarificationAnswer}
                 />
               </div>
             </div>

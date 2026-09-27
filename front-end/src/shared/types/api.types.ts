@@ -124,6 +124,18 @@ export interface WorkspaceMember {
   name: string;
   /** `member` 是历史值，语义等同 `user`（见 WorkspaceInfo.role） */
   role: "admin" | "user" | "member";
+  /**
+   * 下面三个是**管理字段**，只有 admin 拿得到（后端按 is_admin 决定发不发）。
+   * 普通成员看到的成员项里它们完全不存在——名册本身全员可见（同一个空间里
+   * 知道彼此是谁不是特权），但 email 是 PII。
+   *
+   * 所以它们都是可选的，而界面上要按 `isAdmin` 判断该不该渲染管理列，
+   * 不要靠"email 有没有值"去推断权限。
+   */
+  email?: string;
+  isActive?: boolean;
+  /** 这一行是不是当前登录的人。自己那行的移除按钮要禁掉 */
+  isSelf?: boolean;
 }
 
 export interface WorkspaceInfo {
@@ -139,8 +151,26 @@ export interface WorkspaceInfo {
   isAdmin?: boolean;
   memberCount: number;
   members: WorkspaceMember[];
+  /**
+   * 还剩几个管理员。界面靠它决定"最后一个管理员"那两个动作要不要禁掉。
+   *
+   * 后端直接给，而不是让前端数 `members` 里的 admin：那是把一条不变量抄到
+   * 第二个地方，而它在后端是拒绝的依据。两处算法漂移的表现是按钮可点、
+   * 点了报错。
+   *
+   * 可选是为了兼容旧后端。
+   */
+  adminCount?: number;
   /** 邀请码只发给 admin；user 拿到的是 null，界面上就不该出现它 */
   inviteCode?: string | null;
+}
+
+/** PATCH/DELETE /workspace/members/... 的返回。带整份 info，省一次 GET */
+export interface WorkspaceMemberMutationResponse {
+  success: boolean;
+  workspace: WorkspaceInfo;
+  member?: { id: string; name: string; role: string };
+  removed?: { id: string; name: string };
 }
 
 export interface JoinWorkspaceResponse {
@@ -241,6 +271,25 @@ export interface ServerCapabilities {
   approval?: ApprovalCapability;
   /** 旧版后端不返回这一块 */
   fileTypes?: FileTypesCapability;
+  /** 旧版后端不返回这一块 */
+  fs?: FsCapability;
+}
+
+/**
+ * 本机文件能力。
+ *
+ * `enabled` 报的是**工具真的注册了吗**，不是单个开关值——和 `webSearch` 同一个
+ * 道理。而 `hasRoots` 单独给，是因为这两种"没有文件能力"该给用户相反的下一步：
+ *
+ * - `enabled=false`：后端没开。授权文件夹也没用，别引导他去点。
+ * - `enabled=true` 且 `hasRoots=false`：开着但没授权。这时该引导去设置里选一个，
+ *   而不是摆出一个点开是空的文件树。
+ */
+export interface FsCapability {
+  enabled: boolean;
+  hasRoots: boolean;
+  writeEnabled: boolean;
+  deleteEnabled: boolean;
 }
 
 /**
@@ -342,6 +391,23 @@ export interface Citation {
   channels?: string[];
 }
 
+/**
+ * 事前规划里的一步。
+ *
+ * `goal` 是"要得到什么"，`tool` 是手段且**允许为空**：纯推理的步骤（比较两处
+ * 规定、汇总、下结论）没有对应工具，后端提示词里明确要求这类步骤把 tool 留空，
+ * 硬安一个工具等于鼓励模型乱调（prompts/agent_plan/v1.md）。
+ *
+ * 没有"已完成"字段，因为后端不跟踪进度：一轮里可能并行调三个工具，也可能一轮
+ * 什么都没做完，没有可靠信号说明"这一步完成了"。按轮次推游标是个看起来精确的
+ * 假数字（理由写在 services/planner.py 的模块文档）。所以这张卡片显示的是
+ * **计划**，不是进度条。
+ */
+export interface PlanStep {
+  goal: string;
+  tool?: string;
+}
+
 export interface StreamChunk {
   type?:
     | "message_delta"
@@ -353,6 +419,13 @@ export interface StreamChunk {
     | "run_started"
     /** 接续成功，携带从第几轮接上 */
     | "run_resumed"
+    /**
+     * 事前规划产出的步骤（AGENT_PLAN_MODE=plan_execute）。
+     *
+     * 只在计划非空时到达：模型判断"直接答就行"是正确输出，那时后端不发这个事件，
+     * 给一张空计划卡片纯属噪声。
+     */
+    | "plan"
     | "tool_start"
     | "tool_result"
     | "tool_rounds_ended"
@@ -393,6 +466,14 @@ export interface StreamChunk {
   steps?: number;
   truncated?: boolean;
   /**
+   * plan 携带：事前规划的步骤列表。
+   *
+   * 键名不是 `steps`——那个已经被上面子代理的步骤**数**占了。同一个键在一处是
+   * number、另一处是对象数组，是等着被写错的形状，而写错的表现是计划步数显示成
+   * 工具步数，看起来像个正常数字。
+   */
+  planSteps?: PlanStep[];
+  /**
    * approval_required / approval_resolved / agent_state 携带：执行记录 id。
    * 审批要靠它调 POST /chats/runs/{runId}/resume——中断活在数据库里，
    * 不活在那条已经断掉的 SSE 连接里，所以这个 id 是唯一的接续凭证。
@@ -419,6 +500,15 @@ export interface StreamChunk {
    * 行为：把回答当成新一轮发出去，代价是前面几轮的工具结果全部丢掉。
    */
   resumable?: boolean;
+  /**
+   * clarification 携带：这句问题是**框架从回答正文里收编来的**，模型并没有调
+   * `ask_user`（后端 chat_service._maybe_adopt_prose_question，开关
+   * CLARIFY_ADOPT_PROSE_QUESTION）。
+   *
+   * 恢复端点和模型主动问的那种完全相同（`/answer`），差别只在卡片文案：收编来的
+   * 那句问题在上面那段回答的末尾已经出现过一次，卡片不该再重复渲染一遍。
+   */
+  adopted?: boolean;
   /** approval_required 携带：这一回合最终回答将要落在哪条 assistant 消息上 */
   message_id?: string;
   /** SSE 的子代理状态会额外出现 started / completed / failed */
@@ -587,6 +677,19 @@ export interface PendingApproval {
   reason: string;
   /** 参数预览，已在服务端脱敏截断 */
   preview: Record<string, unknown>;
+  /**
+   * 哪一种中断。这个列表里现在有三种，**恢复端点不同**，分派错了会拿到 409：
+   *
+   * - `tool_approval`  等裁决 → `POST /chats/runs/{runId}/resume`
+   * - `user_input`     等回答（模型调了 ask_user）→ `POST .../answer`
+   * - `prose_question` 等回答（框架从回答正文里收编的）→ `POST .../answer`
+   *
+   * 可选 + 缺省按 `tool_approval` 处理：这个接口加入 waiting_input 之前只可能是
+   * 审批，老快照的 interrupt_request 里没有这个字段（后端同样这么缺省）。
+   */
+  kind?: "tool_approval" | "user_input" | "prose_question";
+  /** `user_input` / `prose_question` 时携带：要问用户的那句话 */
+  question?: string;
 }
 
 /**
@@ -817,4 +920,205 @@ export interface KnowledgeQueryResult {
   query: string;
   results: KnowledgeQueryChunk[];
   total: number;
+}
+
+/** 一个被授权给文件工具的本机文件夹。 */
+export interface FsRoot {
+  id: string;
+  /** 用户当初在系统对话框里选的绝对路径，原样存 */
+  path: string;
+  /** 界面上显示的名字，默认是目录名 */
+  label: string;
+}
+
+/**
+ * GET /fs/roots 的返回。
+ *
+ * 开关状态和授权列表一起返回，因为"没有文件能力"有两种完全不同的原因，
+ * 而给用户的下一步动作相反：
+ *
+ * - `enabled=false`：后端没开这个功能。选文件夹也没用，该说清楚而不是让用户
+ *   点完发现什么都没变。
+ * - `enabled=true` 且 `roots` 为空：功能开着但还没授权。这时该引导他去选一个。
+ */
+export interface FsRootsResponse {
+  roots: FsRoot[];
+  enabled: boolean;
+  writeEnabled: boolean;
+  deleteEnabled: boolean;
+  /** 当前配置下会注册的文件工具名 */
+  tools: string[];
+}
+
+/**
+ * 一份写操作留下的旧版本。
+ *
+ * 这是**给用户的撤销**，不是给模型的工具：要撤销的是用户自己批准过的那次写——
+ * 审批卡片上只看得到 diff 的前 60 行，同意之后才发现覆盖掉的是别的东西。
+ */
+export interface FsBackup {
+  id: string;
+  /** 被写/删的那个文件的绝对路径 */
+  path: string;
+  /** write / edit / delete / restore */
+  action: string;
+  size: number;
+  createdAt: string;
+  /** 文件此刻还在不在。删除留下的备份这里是 false */
+  exists: boolean;
+}
+
+export interface FsBackupsResponse {
+  backups: FsBackup[];
+  /** 后端没开写工具时为 false：这时列表必然是空的，界面要能区分"没开"和"没写过" */
+  enabled: boolean;
+}
+
+/** /fs/browse 里的一个条目。 */
+export interface FsEntry {
+  name: string;
+  /** 绝对路径，直接拿去请求下一层 */
+  path: string;
+  isDir: boolean;
+  /** 目录为 null；取不到大小时也是 null */
+  size: number | null;
+  /** 这一条是授权根本身，不是根里的内容 */
+  isRoot: boolean;
+  /**
+   * 受凭据保护：agent 读不到、也改删不了（`.env`、私钥、`.ssh/` 之类）。
+   *
+   * 后端只标记不隐藏——这是用户在浏览自己的文件夹，藏起来等于骗他。他要知道的
+   * 恰恰是「授权了这个文件夹，但助手看不到这几个文件」。
+   *
+   * 可选是为了兼容旧后端：缺这个字段时按 false 处理，而不是让整棵树渲染不出来。
+   */
+  protected?: boolean;
+}
+
+/**
+ * GET /fs/browse 的返回。
+ *
+ * `parent` 只在上一级**还在沙箱内**时才有值。根目录的上一级在授权范围外，
+ * 后端给 null，界面就不该显示"返回上级"——显示了点下去必然 400。
+ */
+export interface FsBrowseResponse {
+  /** 省略 path 请求根列表时为 null */
+  path: string | null;
+  /** 相对授权根的显示名，如 `资料/sub` */
+  label: string | null;
+  parent: string | null;
+  entries: FsEntry[];
+  /** 条目超过 FS_LIST_MAX_ENTRIES 被截断 */
+  truncated: boolean;
+}
+
+/** 一份内置作业指导（仓库里的，只读）。 */
+export interface BuiltinSkill {
+  name: string;
+  description: string;
+  /** 附带文件名。模型用 read_skill_file 读它们 */
+  attachments: string[];
+  /**
+   * 下结论之前必须先拿到的材料，逗号分隔。内置的来自 SKILL.md 的 frontmatter。
+   *
+   * 它不是提示词，是给结论结构提供必填槽位：缺一项就只能是"需要人判断"，
+   * 由后端强制。空串表示这份指导不是审核型的（写作指导就没有）。
+   */
+  requiredInputs: string;
+  /**
+   * 是否被同名的工作区 skill 盖掉了。
+   *
+   * 必须显示出来：不显示的话 admin 写了一份同名的却看不出内置那份已经不生效，
+   * 反过来也会以为自己写的那份没被采用。
+   */
+  overridden: boolean;
+}
+
+/** 一份工作区作业指导（数据库里的，admin 可改）。 */
+export interface WorkspaceSkill {
+  id: string;
+  name: string;
+  description: string;
+  instructions: string;
+  enabled: boolean;
+  /** 同 BuiltinSkill.requiredInputs，逗号分隔 */
+  requiredInputs: string;
+  /**
+   * 规程版本号。正文、描述或前置材料声明变了才 +1（切启用开关不算）。
+   *
+   * 审核结论会引用它，所以它要显示出来：admin 才能对上"这条结论按的是哪一版"。
+   * 改一次 SOP 而版本号不动的话，历史结论的依据就指向一份已经不存在的文本。
+   */
+  version: number;
+  updatedAt: string | null;
+}
+
+/**
+ * GET /skills 的返回。
+ *
+ * 两层分开返回，因为它们能做的操作不同（内置只读）。`canEdit` 是后端按工作区角色
+ * 判的——前端不自己推，那件事的判据在服务端（一条 SOP 影响全工作区所有人的执行
+ * 方式，不是"上传自己的资料"那个权限级别）。
+ */
+export interface SkillsResponse {
+  builtin: BuiltinSkill[];
+  workspace: WorkspaceSkill[];
+  /** 后端有没有开 SKILL_ENABLED。关着时写了也不生效，要说清楚 */
+  enabled: boolean;
+  canEdit: boolean;
+}
+
+/** 审核结论的一档：通过 / 不通过 / 需要人判断。 */
+export type ReviewVerdict = "pass" | "reject" | "needs_human";
+
+/** submit_review 逐项核对的一条必备材料。 */
+export interface ReviewInputCheck {
+  name: string;
+  /** 找到的原值；没找到时为空 */
+  value?: string | null;
+  found: boolean;
+}
+
+/** 台账里的一条审核结论（GET /reviews 的 items[]）。 */
+export interface ReviewLedgerItem {
+  id: string;
+  /** 审的是什么（文件名 / 单号 / 一句话描述） */
+  subject: string;
+  /** 按哪份作业指导审的 */
+  sopName: string;
+  /** 当时那份 SOP 的版本号。内置 SOP 是 0（版本跟 git 走，不由这张表决定） */
+  sopVersion: number;
+  verdict: ReviewVerdict;
+  /** 逐项核对的必备材料 */
+  inputs: ReviewInputCheck[];
+  /** 依据：引用的规程条目 + 材料出处 */
+  basis: string[];
+  /**
+   * 复审跑了几次。1 表示**没做一致性检查**（不是"检查过且一致"）——要和 agreed
+   * 一起读，界面上分开显示，否则一条没复审过的结论会看起来像通过了复审。
+   */
+  runs: number;
+  /** 复审是否一致。runs=1 时它恒为 true，那时读作"没检查过" */
+  agreed: boolean;
+  /** 据以判断的材料原文。null 表示这条是加这一列之前记的 */
+  evidence: string | null;
+  createdAt: string | null;
+  /** 触发这次审核的那段对话，用来回溯"当时怎么审的" */
+  chatId: string | null;
+  resolvedBy: string | null;
+  resolvedAt: string | null;
+  /** 人复核后的处置：approved / rejected / amended。null = 还没人处置 */
+  resolution: string | null;
+  resolutionNote: string | null;
+}
+
+/**
+ * GET /reviews 的返回。
+ *
+ * `enabled` 一起返回：关着开关时台账是空的，而"没开这个功能"和"还没审过任何东西"
+ * 在界面上长得一样——不说清用户会以为审核记录丢了。
+ */
+export interface ReviewListResponse {
+  items: ReviewLedgerItem[];
+  enabled: boolean;
 }

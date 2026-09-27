@@ -28,6 +28,21 @@ from services.telemetry import SpanKind, tracer
 from conftest import run
 
 
+# rerank 的两条用例要把 ``LLM_API_KEY`` 清空(``rerank_client.configured`` 会回落到
+# 它),而 ``HybridRetriever.__init__`` 会顺手构造一个 ``EmbeddingService``——那里的
+# ``AsyncOpenAI(api_key=...)`` 在**没有任何 key** 时直接抛。
+#
+# 于是这两条用例的成败取决于跑它的机器有没有配 ``EMBEDDING_API_KEY``:
+# 本地 .env 里有,所以 ``embedding_api_key`` 回落不到被清空的那个,一路绿;
+# CI 的 env 里没有(从来没有过),回落到刚被清空的 ``LLM_API_KEY``,构造即抛。
+# 也就是说这不是"CI 坏了",是这两条用例一直依赖着一个它并不关心的设置。
+#
+# ``_rerank_via_api`` 从头到尾没碰过 ``self._embedding``,所以给个替身就行。
+# 比"顺带把 EMBEDDING_API_KEY 也 monkeypatch 成非空"好:那样用例仍然拴在一个
+# 与它无关的设置上,下一个环境差异照样能把它打红。
+_NO_EMBEDDING = object()
+
+
 @pytest.fixture(autouse=True)
 def _telemetry_on(monkeypatch):
     """降级要写到 span 上，所以埋点必须开——关掉时 current_span() 是 NoopSpan。
@@ -82,9 +97,9 @@ def test_rerank_api_request_failure_is_marked(monkeypatch):
     monkeypatch.setattr(rerank.rerank_client, "rerank", boom)
 
     async def body():
-        out = await retriever.HybridRetriever()._rerank_via_api(
-            "q", ["c1", "c2"], ["s1", "s2"]
-        )
+        out = await retriever.HybridRetriever(
+            embedding=_NO_EMBEDDING
+        )._rerank_via_api("q", ["c1", "c2"], ["s1", "s2"])
         # 退回融合序：返回空列表，让调用方保持原顺序
         assert out == []
 
@@ -108,9 +123,9 @@ def test_rerank_api_unconfigured_is_marked(monkeypatch):
     monkeypatch.setattr(settings, "RERANK_MODEL", "")
 
     async def body():
-        out = await retriever.HybridRetriever()._rerank_via_api(
-            "q", ["c1", "c2"], ["s1", "s2"]
-        )
+        out = await retriever.HybridRetriever(
+            embedding=_NO_EMBEDDING
+        )._rerank_via_api("q", ["c1", "c2"], ["s1", "s2"])
         assert out == []
 
     attrs = run(_capture(body))
@@ -185,9 +200,9 @@ def test_successful_rerank_is_not_marked(monkeypatch):
     monkeypatch.setattr(rerank.rerank_client, "rerank", ok)
 
     async def body():
-        out = await retriever.HybridRetriever()._rerank_via_api(
-            "q", ["c1", "c2"], ["s1", "s2"]
-        )
+        out = await retriever.HybridRetriever(
+            embedding=_NO_EMBEDDING
+        )._rerank_via_api("q", ["c1", "c2"], ["s1", "s2"])
         assert out == ["c2", "c1"]
 
     attrs = run(_capture(body))
@@ -210,7 +225,9 @@ def test_http_failure_carries_the_status_code_as_a_reason(monkeypatch):
     monkeypatch.setattr(rerank.rerank_client, "rerank", boom)
 
     async def body():
-        await retriever.HybridRetriever()._rerank_via_api("q", ["c1"], ["s1"])
+        await retriever.HybridRetriever(embedding=_NO_EMBEDDING)._rerank_via_api(
+            "q", ["c1"], ["s1"]
+        )
 
     attrs = run(_capture(body))
     reasons = [a["degraded_reason"] for a in attrs if a.get("degraded_reason")]
@@ -242,7 +259,9 @@ def test_unconfigured_endpoint_has_its_own_reason(monkeypatch):
     monkeypatch.setattr(settings, "RERANK_MODEL", "")
 
     async def body():
-        await retriever.HybridRetriever()._rerank_via_api("q", ["c1"], ["s1"])
+        await retriever.HybridRetriever(embedding=_NO_EMBEDDING)._rerank_via_api(
+            "q", ["c1"], ["s1"]
+        )
 
     attrs = run(_capture(body))
     reasons = [a["degraded_reason"] for a in attrs if a.get("degraded_reason")]

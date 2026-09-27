@@ -7,14 +7,15 @@ import {
   setServerStatus,
 } from "@/entities/chat/model/chatSlice";
 import { apiClient } from "@/shared/api/client";
-import { useTheme } from "@/shared/lib/ThemeContext";
-import { ChevronDown, ShieldCheck, Sun, Moon, Sparkles } from "lucide-react";
+import { ChevronDown, ShieldCheck, Sparkles } from "lucide-react";
 
 const TITLES: Record<string, { title: string; eyebrow: string }> = {
   dashboard: { title: "工作台", eyebrow: "Overview" },
-  chat: { title: "智能对话", eyebrow: "Studio" },
+  chat: { title: "对话 · 审核", eyebrow: "Studio" },
+  reviews: { title: "审核台账", eyebrow: "Ledger" },
   traces: { title: "运行轨迹", eyebrow: "Replay" },
   knowledge: { title: "知识库", eyebrow: "Retrieval" },
+  skills: { title: "作业指导", eyebrow: "SOPs" },
   prompts: { title: "提示词工作台", eyebrow: "Lab" },
   settings: { title: "设置", eyebrow: "System" },
 };
@@ -22,7 +23,6 @@ const TITLES: Record<string, { title: string; eyebrow: string }> = {
 export const Header: React.FC = () => {
   const dispatch = useDispatch();
   const location = useLocation();
-  const { theme, toggleTheme } = useTheme();
   const { selectedModel, serverStatus, sessions } = useSelector(
     (state: RootState) => state.chat,
   );
@@ -114,19 +114,6 @@ export const Header: React.FC = () => {
           <ShieldCheck className="w-3.5 h-3.5" />
           <span className="hidden sm:inline">{statusLabel}</span>
         </div>
-
-        <button
-          onClick={toggleTheme}
-          className="p-2 rounded-full bg-[#f3f0e6] hover:bg-[#eae6db] dark:bg-[#1e1d1b] dark:hover:bg-[#262522] border border-[#e3dfd5] dark:border-[#2e2d2a] text-[#1f1e1d] dark:text-[#edece8] transition-all duration-300 shadow-sm hover:rotate-[20deg] hover:border-[#da7756]/40"
-          title={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"}
-          aria-label={theme === "dark" ? "切换到浅色模式" : "切换到深色模式"}
-        >
-          {theme === "dark" ? (
-            <Sun className="w-4 h-4 text-amber-400" />
-          ) : (
-            <Moon className="w-4 h-4 text-slate-700" />
-          )}
-        </button>
       </div>
     </header>
   );

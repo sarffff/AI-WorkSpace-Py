@@ -77,10 +77,22 @@ _DIAGNOSTICS = [
     ("extractionWritten", "抽取入库条数"),
     ("approvalInterrupts", "审批中断次数"),
     ("planSteps", "计划步数"),
+    # SKILL_ENABLED 开着的变体上为 0 就是"索引白注入"——那时 skillsLoaded 那份
+    # 名单也是空的,后面的数字都不用读。关着的变体上恒为 0,是预期的。
+    ("skillLoadTurns", "加载过 skill 的轮次"),
     ("fabricatedToolOutput", "谎称调过工具"),
     ("writtenDocuments", "写入文档数"),
     ("turnErrors", "出错轮次"),
     ("judgeFailures", "裁判失败"),
+    # 非零就意味着「任务成功」那一列不可用。和「裁判失败」不是一回事:
+    # 那个是裁判调用挂了(没有分数),这个是裁判给了一个**被确定性判据证伪**的分数。
+    # 非零 = 写操作声称做完了、而磁盘不是那样。比裁判分更硬:它是确定性检查。
+    ("fileStateFailures", "磁盘状态不符"),
+    ("judgeContradictions", "裁判自相矛盾"),
+    # 非零 = 判据把正常回答当成提问,本该 done 的回合被挂起。
+    # 这是 CLARIFY_ADOPT_PROSE_QUESTION 能不能默认打开的**唯一**判据:
+    # 澄清那几列全按"这条用例准备了答案"过滤,误伤天然不在它们的分母里。
+    ("unexpectedAdoptions", "误收编"),
     ("stubMisses", "搜索替身未命中"),
 ]
 
@@ -93,6 +105,120 @@ def _format(value: Any) -> str:
     if isinstance(value, float):
         return f"{value:.3f}" if abs(value) < 100 else f"{value:.0f}"
     return str(value)
+
+
+# 人在环路里的三条中断链。**必须成对读**,所以不进上面那张诊断表——
+# 那张表每格一个数,而这三条的意义全在分母上:``clarificationAsked: 0`` 单看像
+# "功能坏了",写成 ``0 / 2 用例`` 才看得出是"这一条路压根没被走进去"。
+#
+# 三条链的 0 各有各的含义,不能混:
+#   approvalInterrupts  0 = 闸门没触发(模型没调 gated 工具,或闸门失效)
+#   editWrites          0 = 改完参数之后写入没发生(编辑那条路断了)
+#   clarificationAsked  0 = 模型没调 ask_user(它可能改在正文里问了,那不算)
+_INTERRUPT_CHAINS = [
+    ("审批", "approvalInterrupts", "approvalCases", "次中断"),
+    ("改参放行", "editWrites", "editCases", "次写入"),
+    ("澄清提问", "clarificationAsked", "clarificationCases", "次提问"),
+    # 上一行里框架收编的有几次。两行**必须相减着读**：
+    #   澄清提问 − 其中框架收编 = 模型自己调 ask_user 的次数
+    # 三次实测那个差值是 0。少了这一行,打开 CLARIFY_ADOPT_PROSE_QUESTION 之后
+    # 「澄清提问」会从 0 变成 2,读起来像模型改了行为,而它一次都没调。
+    ("其中框架收编", "clarificationAdopted", "clarificationCases", "次收编"),
+    ("澄清接续", "clarificationResumed", "clarificationCases", "条接上"),
+]
+
+
+def _render_interrupt_chains(summaries: list[dict[str, Any]]) -> list[str]:
+    """渲染人在环路的三条中断链。
+
+    这五个值 ``agent_runner`` 从加进 summary 起就在算,但和 ``unpricedModels``
+    ``toolOrderRate`` 一样**从没被渲染过**——数据在 JSON 里躺着,而结论写在
+    Markdown 里。2026-08-31 那次澄清对照就是这么读的:我从 JSON 里手抄出
+    ``clarificationAsked: 0``,而看报告的人在报告里找不到这个数。
+
+    分母为 0 的行整行不渲染:没有这类用例时,``0 / 0`` 会被读成"功能坏了"。
+    """
+    rows: list[str] = []
+    for label, num_key, den_key, unit in _INTERRUPT_CHAINS:
+        cells: list[str] = []
+        any_case = False
+        for summary in summaries:
+            denominator = summary.get(den_key)
+            numerator = summary.get(num_key)
+            if not denominator:
+                # 这一批任务里没有这类用例,和"有用例但没触发"是两回事
+                cells.append("-")
+                continue
+            any_case = True
+            cells.append(f"{_format(numerator)} / {denominator} 用例")
+        if any_case:
+            rows.append(f"| {label}（{unit}） | " + " | ".join(cells) + " |")
+    if not rows:
+        return []
+    header = "| 中断链 | " + " | ".join(s["variant"] for s in summaries) + " |"
+    divider = "| " + " | ".join("---" for _ in range(len(summaries) + 1)) + " |"
+    return [
+        "",
+        "## 人在环路的中断链",
+        "",
+        header,
+        divider,
+        *rows,
+        "",
+        "分子为 0 而分母非 0 是**功能从没被走进去**,不是打分低——三条链的 0 "
+        "含义各不相同,读法见下方「读法」一节。",
+    ]
+
+
+def _render_review_chain(summaries: list[dict[str, Any]]) -> list[str]:
+    """审核链:审 review 用例时,模型有没有在该记账时调 submit_review、又在不该记账时忍住。
+
+    两行各配自己的分母:记账率用 ``reviewRecordExpected``(expect_tools 点了 submit_review
+    的用例),未经要求记账率用 ``reviewRestraintCases``(forbid_tools 点了的)。分子必须配
+    分母——``submitReviewCalls`` 单看为 0 像"功能坏了",写成 ``0 / N 用例`` 才看得出是
+    "这条路没被走进去"。两个分母都为 0 时整节不渲染(``0 / 0`` 会被读成"坏了")。
+    """
+    record_cells: list[str] = []
+    restraint_cells: list[str] = []
+    any_case = False
+    any_restraint = False
+    for summary in summaries:
+        denominator = summary.get("reviewRecordExpected")
+        if not denominator:
+            record_cells.append("-")
+        else:
+            any_case = True
+            record_cells.append(
+                f"{_format(summary.get('submitReviewCalls'))} / {denominator} 用例"
+            )
+        restraint_total = summary.get("reviewRestraintCases")
+        if not restraint_total:
+            restraint_cells.append("-")
+        else:
+            any_restraint = True
+            restraint_cells.append(
+                f"{_format(summary.get('reviewUnbiddenRecords'))} / {restraint_total} 用例"
+            )
+    if not any_case and not any_restraint:
+        return []
+    header = "| 审核链 | " + " | ".join(s["variant"] for s in summaries) + " |"
+    divider = "| " + " | ".join("---" for _ in range(len(summaries) + 1)) + " |"
+    rows = ["", "## 审核链", "", header, divider]
+    if any_case:
+        rows.append("| 记入台账（应记账用例） | " + " | ".join(record_cells) + " |")
+    if any_restraint:
+        rows.append("| 未经要求记账（不应记账用例） | " + " | ".join(restraint_cells) + " |")
+    rows += [
+        "",
+        "记账率分子为 0 = 模型审完没调 submit_review，结论只留在回答正文里、台账是空的"
+        "——那正是这套东西要取代的形状，此时 review 探针的成功率不用再读。"
+        "分子非零但成功率低，才轮到看 verdict 判得对不对（缺料该 needs_human、超额该 reject）。",
+        "",
+        "“未经要求记账”是反向信号：分子非零 = 用户没要求记账、模型却调了 submit_review，"
+        "那是一次未经授权的状态变更（同 write-unbidden 那条“没让保存就不该写”）。"
+        "两行要一起读——一个永远不记的退化实现记账率是 0（坏）、这条却满分（假好）。",
+    ]
+    return rows
 
 
 def _corpus_line(summaries: list[dict[str, Any]]) -> list[str]:
@@ -145,9 +271,109 @@ def render_markdown(report: dict[str, Any]) -> str:
         cells = [_format(summary.get(key)) for key, _label in _DIAGNOSTICS]
         lines.append(f"| {summary['variant']} | " + " | ".join(cells) + " |")
 
+    lines += _render_interrupt_chains(summaries)
+    lines += _render_review_chain(summaries)
+
+    # 出错轮次的原因。「出错轮次 2」单看读不出是"跑崩了"还是"功能没被走进去",
+    # 而两者的处置完全相反。计数在诊断表里,原因必须跟着一起出现。
+    with_errors = [s for s in summaries if s.get("turnErrorReasons")]
+    if with_errors:
+        lines += ["", "## 出错轮次的原因", ""]
+        for summary in with_errors:
+            reasons = "、".join(summary["turnErrorReasons"])
+            lines.append(f"- **{summary['variant']}**：{reasons}")
+        lines.append("")
+        lines.append(
+            "`clarification_never_asked` 这类是**功能没被走进去**，代码没坏；"
+            "`model_error` 才是这一行的其它数字都不能用。两者在「出错轮次」"
+            "那个计数上同形，处置相反。"
+        )
+
     # 漏价模型。``agent_runner`` 从一开始就算了这个值,但它**从没被渲染过**——
     # 数据在 JSON 里躺着,而结论写在 Markdown 里,于是"成本这一列不完整"这件事
     # 谁都读不到。这正是本轮要修的那个形状。
+    # 裁判自相矛盾。必须显式冒泡，而且要排在计价缺口**之前**：它作废的是
+    # 「任务成功」那一列，也就是这份报告里量程最大、最容易被单独引用的那个数。
+    #
+    # 2026-09-01 实测：裁判给 5.0、理由写「给出唯一数字900（450×2）」，而
+    # must_include=["900"] 的命中率是 0.0——那个数不在答案里。旁边就摆着一个
+    # 确定性判据能证伪它，却没有任何地方把这件事说出来。
+    contradicting = [s for s in summaries if s.get("judgeContradictions")]
+    if contradicting:
+        lines += ["", "## ⚠ 裁判自相矛盾", ""]
+        for summary in contradicting:
+            count = summary["judgeContradictions"]
+            lines.append(
+                f"- **{summary['variant']}**：{count} 条用例裁判给了 ≥4 分，"
+                "而 `must_include` 的命中率是 0——**必需内容一个都没出现在答案里**。"
+                "这一行的「任务成功」不能用，去逐题明细里读 `judgeReason` 和 "
+                "`answer` 对照。"
+            )
+        lines.append("")
+        lines.append(
+            "这不是靠改 rubric 能修的：措辞写得越强，裁判越容易抓住其中一句给满分"
+            "（2026-09-01 就是改完 rubric 之后立刻踩到的）。要修的是判据本身——"
+            "让旁边那个确定性判据去证伪它，就像这一节做的事。"
+        )
+
+    # 正文提问误收编。和上面那节并列而不是合并：裁判矛盾作废的是「任务成功」
+    # 那一列，这一节作废的是「这个开关能不能默认打开」那个结论。
+    misfired = [s for s in summaries if s.get("unexpectedAdoptions")]
+    if misfired:
+        lines += ["", "## ⚠ 正文提问误收编", ""]
+        for summary in misfired:
+            lines.append(
+                f"- **{summary['variant']}**：{summary['unexpectedAdoptions']} 次收编"
+                "发生在**没有声明澄清答案**的用例上——判据把正常回答当成了提问，"
+                "那些回合本该 `done`，却挂成了 `waiting_input`，"
+                "用户会看到一个莫名其妙的输入框。"
+            )
+        lines.append("")
+        lines.append(
+            "**这个数非零时 `CLARIFY_ADOPT_PROSE_QUESTION` 不能默认打开。**"
+            "澄清那三列全按「这条用例准备了答案」过滤，误伤不在它们的分母里，"
+            "所以只看那三列会得出「判据很准」的结论。"
+        )
+
+    # 跨轮波动。只有 --repeat > 1 时才有内容，而它是那个开关存在的全部理由：
+    # 汇总行的均值回答不了"这条用例是不稳、还是真的退化了"。
+    rounds = report.get("runs") or 1
+    if rounds > 1:
+        lines += ["", f"## 跨轮波动（{rounds} 轮）", ""]
+        any_volatile = False
+        for summary in summaries:
+            details = report.get("details", {}).get(summary["variant"]) or []
+            volatile = agent_runner.volatile_tasks(details)
+            if not volatile:
+                continue
+            any_volatile = True
+            lines += [
+                f"**{summary['variant']}**：{len(volatile)} 条用例跨轮摆动 ≥ "
+                f"{agent_runner._VOLATILE_SPAN}",
+                "",
+                "| 用例 | 探针 | 幅度 | 每轮分数 |",
+                "| --- | --- | --- | --- |",
+            ]
+            for row in volatile:
+                shown = "、".join(
+                    "—" if value is None else f"{value:g}" for value in row["values"]
+                )
+                lines.append(
+                    f"| {row['id']} | {row['probe']} | {row['span']:g} | {shown} |"
+                )
+            lines.append("")
+        if not any_volatile:
+            lines += [
+                f"{rounds} 轮里没有用例摆动 ≥ {agent_runner._VOLATILE_SPAN}。"
+                "这一轮的分数可以按面值读。",
+                "",
+            ]
+        lines += [
+            "摆动的用例**不能按单轮分数下结论**——它这次红了不代表退化了。"
+            "要判它到底行不行，只能加轮数或者改用例让判据变确定（比如磁盘状态检查"
+            "那种，它不经过裁判，所以不摆）。",
+        ]
+
     unpriced = [s for s in summaries if s.get("unpricedModels")]
     if unpriced:
         lines += ["", "## ⚠ 计价缺口", ""]
@@ -203,6 +429,20 @@ def render_markdown(report: dict[str, Any]) -> str:
         "  里已经发生过五次，所以先确认规划真的产出了，再看它有没有被照做。",
         "  遵从率低说明计划是装饰：模型列了步骤然后按自己的想法做。那不一定是坏事",
         "  （计划可能就是错的），要连着关键词命中和轮次一起判断这笔交易值不值。",
+        "- 人在环路的三条中断链要成对读，分母是「有多少条这样的用例」。分子为 0",
+        "  时三条链的含义完全不同，不能一起归成「功能坏了」：",
+        "  审批 0 = 闸门没触发（模型没调 gated 工具，或闸门自己失效了）；",
+        "  改参放行 0 = 参数改完之后写入没发生，编辑那条路断了；",
+        "  「澄清提问」减去「其中框架收编」才是**模型自己调 ask_user 的次数**。",
+        "  这两行不相减就会读错：打开 CLARIFY_ADOPT_PROSE_QUESTION 之后「澄清提问」",
+        "  会从 0 变成 2，看着像模型改了行为，而它一次都没调——那 2 次是框架从回答",
+        "  正文里把问题接住的。差值三次实测都是 0。",
+        "  澄清提问 0 = 模型没调 ask_user——它很可能**在回答正文里问了同一个问题**，",
+        "  对用户看起来一样，但那一轮是正常收尾的，没有 waiting_input、没有快照，",
+        "  用户回答变成新一轮，这一轮检索到的东西全部丢掉。所以这一列是 0 的时候，",
+        "  要去逐题明细里读答案原文，而不是先怀疑 ask_user 的实现。",
+        "  「澄清接续」的分子必须 ≤「澄清提问」：没问过的东西不可能接上，反过来",
+        "  就是接续那条路有问题（问了、答了，却没接上去）。",
         "- 「搜索替身未命中」是模型搜了但罐头数据里没有对应关键词的次数。它不是",
         "  模型的错，而是数据集与替身没对齐；逐题明细里有实际搜索词，照它调。",
         "- 成本列为空表示没配价目表（见 model_prices.example.json），不代表零成本。",
@@ -226,6 +466,14 @@ async def main() -> None:
         help="只跑指定探针，逗号分隔（如 memory_extract,injection）。"
         "在 --limit 之前生效——新加的用例都在文件末尾，--limit 取的是前 N 条，"
         "单独调一组用例时用这个。",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="每个变体重复跑几轮，报告给均值 + 每轮原值。同配置的分数会摆"
+        "（实测同一条用例能从 2.0 摆到 5.0），单次跑出来的红和绿都不可判定。"
+        "耗时与花费按轮数线性增长。默认 1",
     )
     parser.add_argument("--dataset", default=None, help="改用别的任务集文件")
     parser.add_argument("--out", default=_REPORT_DIR, help="报告输出目录")
@@ -285,7 +533,16 @@ async def main() -> None:
             raise SystemExit("修好之后再跑，或者加 --force 明知故犯。")
         print("--force：继续运行，审批相关的列可能不可用。\n")
 
-    report = await agent_runner.run(variants, tasks)
+    rounds = max(1, args.repeat)
+    if rounds > 1:
+        # 开跑之前把代价说出来。48 个任务一轮约 30 分钟，--repeat 3 就是一个半
+        # 小时和三倍 API 花费——那是应该在按回车之前知道的事，不是跑到一半才发现。
+        print(
+            f"--repeat {rounds}：{len(variants)} 个变体 × {len(tasks)} 个任务 × "
+            f"{rounds} 轮，耗时与花费都是单轮的 {rounds} 倍。\n"
+        )
+
+    report = await agent_runner.run(variants, tasks, repeat=rounds)
     markdown = render_markdown(report)
 
     os.makedirs(args.out, exist_ok=True)

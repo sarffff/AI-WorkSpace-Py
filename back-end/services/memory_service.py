@@ -238,15 +238,20 @@ class MemoryService:
         主防线仍然是定界 + 声明,以及抽取侧的排除段(prompts/memory_extract/)。
         顺序没变:检测是最不可靠的一层,只作观测与兜底。
         """
+        # 2026-09-03：只注入 fact，不注入 preference。见函数文档。
+        #
+        # ``kind`` 过滤必须在 SQL 里,和 ``limit`` 同一条查询——不能取回 20 条
+        # 再在 Python 里筛。反过来做的话 limit 作用在**过滤之前**:用户最近
+        # 20 条记忆恰好都是 preference 时,fact 一条都注入不进去,而库里明明有
+        # (MEMORY_MAX_ITEMS 是 100,装得下)。表现是"记住我在哪个部门"随着用户
+        # 多说几句偏好而静默失效,没有任何日志或指标指向它。
         memories = (
             db.query(UserMemory)
-            .filter(UserMemory.user_id == user_id)
+            .filter(UserMemory.user_id == user_id, UserMemory.kind == "fact")
             .order_by(UserMemory.created_at.desc(), UserMemory.id.desc())
             .limit(max(1, settings.MEMORY_INJECT_LIMIT))
             .all()
         )
-        # 2026-09-03：只注入 fact，不注入 preference。见函数文档。
-        memories = [m for m in memories if m.kind == "fact"]
 
         if not memories:
             return ""

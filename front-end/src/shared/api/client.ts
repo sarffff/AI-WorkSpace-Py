@@ -10,6 +10,7 @@ import type {
   JoinWorkspaceResponse,
   UploadDocumentResponse,
   WorkspaceInfo,
+  WorkspaceMemberMutationResponse,
   LoginRequest,
   RegisterRequest,
   AuthResponse,
@@ -29,6 +30,15 @@ import type {
    UserMemory,
    ToolStep,
   AgentMetrics,
+  FsBrowseResponse,
+  FsRoot,
+  FsBackup,
+  FsBackupsResponse,
+  FsRootsResponse,
+  SkillsResponse,
+  WorkspaceSkill,
+  ReviewLedgerItem,
+  ReviewListResponse,
   PendingApproval,
   ResumableRun,
   AgentRunDetail,
@@ -498,10 +508,27 @@ export class ApiClient {
     approved: boolean,
     note = "",
     signal?: AbortSignal,
+    /**
+     * 改过参数再放行。只传**用户真正改过的键**——后端按
+     * `{**原参数, **这里给的}` 合并，没给的键用原值。
+     *
+     * 不能把整份预览回传：预览是 `build_preview` 的产物，字符串被 `mask_markup`
+     * 中和过、还截断到 800 字，整份回传会用有损副本覆盖原文。
+     *
+     * 后端要求 `approved=true` 才接受它（`approved=false` 配编辑是自相矛盾的
+     * 请求，会 422）。
+     */
+    editedArguments?: Record<string, unknown>,
   ): AsyncGenerator<StreamChunk, void, undefined> {
     const response = await this.openStream(
       `/chats/runs/${runId}/resume`,
-      { approved, note },
+      {
+        approved,
+        note,
+        // 没有编辑时**不带这个键**，而不是传 null：后端 `editedArguments: dict | None`
+        // 两者等价，但省掉它让请求体如实反映"这是一次原样批准"。
+        ...(editedArguments ? { editedArguments } : {}),
+      },
       signal,
     );
     if (response.status === 409) {
@@ -509,6 +536,40 @@ export class ApiClient {
     }
     if (!response.ok) {
       throw new Error(`Failed to resume run: ${response.statusText}`);
+    }
+    yield* this.readStream(response);
+  }
+
+  /**
+   * 回答模型的澄清问题，并**接着原来那一轮**跑下去。
+   * POST /chats/runs/{runId}/answer
+   *
+   * 与 `resumeRun` 分开而不是共用一个带 mode 的方法：载荷没有交集（那个是
+   * 裁决 + 可选的参数修改，这个是一句话），后端的前置状态校验也不同
+   * （`waiting_approval` vs `waiting_input`）。
+   *
+   * **为什么必须接续而不是当成新一轮**：模型问问题的时候，手里还攥着它这一轮
+   * 检索到的一切。把答案作为新消息发出去会丢掉那些工具结果，模型得从头再查一遍
+   * ——用户看到的是"我回答完它又重新搜了一次"。
+   *
+   * 409 表示这个 run 已经不在 `waiting_input`（别的标签页答过了，或者审批
+   * 已超时被标成 abandoned）。同 `resumeRun`，调用方据此把卡片收掉。
+   */
+  async *answerClarification(
+    runId: string,
+    answer: string,
+    signal?: AbortSignal,
+  ): AsyncGenerator<StreamChunk, void, undefined> {
+    const response = await this.openStream(
+      `/chats/runs/${runId}/answer`,
+      { answer },
+      signal,
+    );
+    if (response.status === 409) {
+      throw new Error("STALE_CLARIFICATION");
+    }
+    if (!response.ok) {
+      throw new Error(`Failed to answer clarification: ${response.statusText}`);
     }
     yield* this.readStream(response);
   }
@@ -784,6 +845,62 @@ export class ApiClient {
         .then((body) => body?.detail)
         .catch(() => null);
       throw new Error(detail || `加入工作区失败: ${response.statusText}`);
+    }
+
+    return response.json();
+  }
+
+  /**
+   * 改一个成员的角色(仅管理员)。
+   * PATCH /workspace/members/{id}
+   *
+   * 四种失败(非管理员、人不在本空间、角色非法、最后一个管理员)后端都回 400,
+   * detail 是面向用户的中文——直接透出去,调用方不需要分辨是哪一种。
+   */
+  async setMemberRole(
+    memberId: string,
+    role: "admin" | "user",
+  ): Promise<WorkspaceMemberMutationResponse> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/workspace/members/${encodeURIComponent(memberId)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role }),
+      },
+    );
+
+    if (!response.ok) {
+      const detail = await response
+        .json()
+        .then((body) => body?.detail)
+        .catch(() => null);
+      throw new Error(detail || `修改角色失败: ${response.statusText}`);
+    }
+
+    return response.json();
+  }
+
+  /**
+   * 把一个成员移出工作区(仅管理员)。
+   * DELETE /workspace/members/{id}
+   *
+   * 响应里带整份 workspace,调用方直接拿去替换本地状态——再发一次 GET 会闪。
+   */
+  async removeMember(
+    memberId: string,
+  ): Promise<WorkspaceMemberMutationResponse> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/workspace/members/${encodeURIComponent(memberId)}`,
+      { method: "DELETE" },
+    );
+
+    if (!response.ok) {
+      const detail = await response
+        .json()
+        .then((body) => body?.detail)
+        .catch(() => null);
+      throw new Error(detail || `移除成员失败: ${response.statusText}`);
     }
 
     return response.json();
@@ -1176,6 +1293,242 @@ export class ApiClient {
     if (!response.ok) {
       throw new Error(`Failed to delete memory: ${response.statusText}`);
     }
+  }
+
+  /**
+   * 已授权给文件工具的本机文件夹，以及文件能力的开关状态
+   * GET /fs/roots
+   */
+  async getFsRoots(): Promise<FsRootsResponse> {
+    const response = await this.authedFetch(`${this.baseUrl}/fs/roots`);
+    if (!response.ok) {
+      throw new Error(`Failed to load folders: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 授权一个本机文件夹
+   * POST /fs/roots
+   *
+   * 后端会校验它此刻真的是一个目录，不是就返回 400——错误消息可直接展示给用户
+   * （"D:\\nope 不是一个存在的目录"比一句 400 有用）。
+   */
+  async addFsRoot(path: string, label?: string): Promise<FsRoot> {
+    const response = await this.authedFetch(`${this.baseUrl}/fs/roots`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, label }),
+    });
+    if (!response.ok) {
+      const detail = await response
+        .json()
+        .then((body) => body?.detail)
+        .catch(() => null);
+      throw new Error(detail || `Failed to add folder: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 撤销一个文件夹的授权
+   * DELETE /fs/roots/{id}
+   */
+  async removeFsRoot(rootId: string): Promise<void> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/fs/roots/${rootId}`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to remove folder: ${response.statusText}`);
+    }
+  }
+
+  /**
+   * 写操作留下的旧版本，最新的在前
+   * GET /fs/backups
+   */
+  async getFsBackups(): Promise<FsBackupsResponse> {
+    const response = await this.authedFetch(`${this.baseUrl}/fs/backups`);
+    if (!response.ok) {
+      throw new Error(`Failed to load backups: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 把某份旧版本放回原位
+   * POST /fs/backups/{id}/restore
+   *
+   * 恢复本身也会先备份当前内容，所以点错了还能再撤回来。
+   */
+  async restoreFsBackup(backupId: string): Promise<{ path: string }> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/fs/backups/${backupId}/restore`,
+      { method: "POST" },
+    );
+    if (!response.ok) {
+      // 400 的 detail 是面向用户的文案（"该备份不存在"、"原来的目录已经不存在"），
+      // 照抄 addFsRoot 那边的形状
+      const detail = await response
+        .json()
+        .then((body) => body?.detail)
+        .catch(() => null);
+      throw new Error(detail || `恢复失败：${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 浏览一个已授权目录
+   * GET /fs/browse
+   *
+   * 省略 path 时返回授权根列表本身——界面第一次打开时还不知道有什么。
+   * 越界路径后端返回 400，detail 里是可直接展示的中文。
+   */
+  async browseFs(path?: string): Promise<FsBrowseResponse> {
+    const query = path ? `?path=${encodeURIComponent(path)}` : "";
+    const response = await this.authedFetch(
+      `${this.baseUrl}/fs/browse${query}`,
+    );
+    if (!response.ok) {
+      const detail = await response
+        .json()
+        .then((body) => body?.detail)
+        .catch(() => null);
+      throw new Error(detail || `Failed to browse: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 作业指导：内置（只读）+ 工作区（admin 可改）
+   * GET /skills
+   */
+  async getSkills(): Promise<SkillsResponse> {
+    const response = await this.authedFetch(`${this.baseUrl}/skills`);
+    if (!response.ok) {
+      throw new Error(`Failed to load skills: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 新增或按 name 更新一份工作区作业指导
+   * PUT /skills
+   *
+   * upsert 而不是 POST/PATCH 分开：admin 最常做的是改一条 SOP 的正文，
+   * 而"它是不是新的"这个判断在服务端更准（唯一约束就在那里）。
+   */
+  async saveSkill(payload: {
+    name: string;
+    description: string;
+    instructions: string;
+    enabled?: boolean;
+    /**
+     * 逗号分隔的前置材料。**必须传**——PUT 是整体覆盖，不传就会把已有的声明
+     * 覆盖成空串，而那不报错：审核从此少了几个必填槽位，安静地松了一档。
+     */
+    requiredInputs?: string;
+  }): Promise<
+    Pick<
+      WorkspaceSkill,
+      "id" | "name" | "description" | "enabled" | "requiredInputs" | "version"
+    >
+  > {
+    const response = await this.authedFetch(`${this.baseUrl}/skills`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      // 逐字段列出而不是原样 JSON.stringify(payload)：后端字段是 snake_case
+      // （同 joinWorkspace 的 invite_code）。整体透传的话 requiredInputs 会被
+      // Pydantic 当成未知键丢掉，而 required_inputs 取默认空串——保存成功、
+      // 声明消失，一声不响。
+      body: JSON.stringify({
+        name: payload.name,
+        description: payload.description,
+        instructions: payload.instructions,
+        enabled: payload.enabled,
+        required_inputs: payload.requiredInputs ?? "",
+      }),
+    });
+    if (!response.ok) {
+      const detail = await response
+        .json()
+        .then((body) => body?.detail)
+        .catch(() => null);
+      throw new Error(detail || `Failed to save skill: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 删除一份工作区作业指导
+   * DELETE /skills/{id}
+   */
+  async deleteSkill(skillId: string): Promise<void> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/skills/${skillId}`,
+      { method: "DELETE" },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to delete skill: ${response.statusText}`);
+    }
+  }
+
+  // ========== 审核台账 API ==========
+
+  /**
+   * 审核台账，按时间倒序。
+   * GET /reviews
+   *
+   * `pendingOnly` 取的是"还等着人看"——needs_human 且没人处置过。这个筛选不是
+   * 便利功能：转人工如果没有"待办在哪"的入口，就等于把结论扔进一个没人看的队列。
+   */
+  async getReviews(
+    pendingOnly = false,
+    limit = 50,
+  ): Promise<ReviewListResponse> {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (pendingOnly) params.set("pending_only", "true");
+    const response = await this.authedFetch(
+      `${this.baseUrl}/reviews?${params.toString()}`,
+      { method: "GET" },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch reviews: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 记下人复核之后的处置。
+   * POST /reviews/{id}/resolve
+   *
+   * 处置不限 admin：定规矩（改 SOP）是管理行为，按规矩复核一张单子是日常工作，
+   * 锁给 admin 会让待办堵在一个人身上，而那正好是转人工要避免的形状。
+   * 已处置过的再改会被后端 400 挡回（台账要能作依据，可反复改写就作不了依据）。
+   */
+  async resolveReview(
+    verdictId: string,
+    resolution: string,
+    note = "",
+  ): Promise<ReviewLedgerItem> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/reviews/${verdictId}/resolve`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resolution, note }),
+      },
+    );
+    if (!response.ok) {
+      const detail = await response
+        .json()
+        .then((body) => body?.detail)
+        .catch(() => null);
+      throw new Error(detail || `处置失败：${response.statusText}`);
+    }
+    return response.json();
   }
 }
 

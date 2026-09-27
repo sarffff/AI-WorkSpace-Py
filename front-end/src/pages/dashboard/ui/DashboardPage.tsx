@@ -4,45 +4,37 @@ import { useNavigate } from "react-router-dom";
 import { RootState } from "@/app/providers/store";
 import { apiClient } from "@/shared/api/client";
 import type {
-  FeedbackSummary,
   UsageSummary,
   TraceSummary,
+  ReviewLedgerItem,
 } from "@/shared/types/api.types";
-import { fmtCost, fmtInt, fmtMs, spanLabel } from "@/shared/lib/format";
+import { fmtCost, fmtInt, fmtMs } from "@/shared/lib/format";
 import { PageHeader } from "@/shared/ui/PageHeader";
-import { CapabilityStrip } from "@/shared/ui/CapabilityStrip";
-import { toastMessageFrom, useToast } from "@/shared/ui/Toast";
-import {
-  Activity,
-  Coins,
-  Loader2,
-  Timer,
-  MessageSquare,
-  Cpu,
-  Sparkles,
-  ThumbsDown,
-  ThumbsUp,
-  Zap,
-  ShieldCheck,
-  BookOpen,
-  Route as RouteIcon,
-} from "lucide-react";
-import { AgentMetricsPanel } from "@/widgets/agent-metrics";
-import { AgentLoopPanel } from "../components/AgentLoopPanel";
 import { MetricCard } from "../components/MetricCard";
 import { BarRow } from "../components/BarRow";
 import { ShortcutCard } from "../components/ShortcutCard";
+import { toastMessageFrom, useToast } from "@/shared/ui/Toast";
+import {
+  Loader2,
+  ClipboardCheck,
+  MessageSquare,
+  BookOpen,
+  ScrollText,
+  Coins,
+  Zap,
+  MessagesSquare,
+  Timer,
+  ArrowRight,
+  AlertTriangle,
+} from "lucide-react";
 
 const RANGES = [1, 7, 30] as const;
 
-/** 差评原因 -> 展示文案。与后端 feedback_service.REASONS 对应 */
-const DOWN_REASON_LABELS: Record<string, string> = {
-  inaccurate: "内容不准确",
-  no_citation: "缺少引用",
-  off_topic: "答非所问",
-  bad_format: "排版糟糕",
-  other: "其他",
-};
+const VERDICT_META = {
+  pass: { label: "通过", cls: "text-emerald-600 dark:text-emerald-400" },
+  reject: { label: "不通过", cls: "text-rose-600 dark:text-rose-400" },
+  needs_human: { label: "需要人判断", cls: "text-amber-600 dark:text-amber-400" },
+} as const;
 
 const hour = new Date().getHours();
 const greeting =
@@ -50,34 +42,42 @@ const greeting =
 
 export const DashboardPage: React.FC = () => {
   const navigate = useNavigate();
-  const { serverStatus, selectedModel, sessions } = useSelector(
-    (state: RootState) => state.chat,
-  );
-  const { user } = useSelector((state: RootState) => state.auth);
+  const { user } = useSelector((s: RootState) => s.auth);
+  const toast = useToast();
 
   const [days, setDays] = useState(7);
+  const [pending, setPending] = useState<ReviewLedgerItem[]>([]);
+  const [ledger, setLedger] = useState<ReviewLedgerItem[]>([]);
   const [usage, setUsage] = useState<UsageSummary | null>(null);
   const [traces, setTraces] = useState<TraceSummary[]>([]);
-  const [feedback, setFeedback] = useState<FeedbackSummary | null>(null);
+  const [docCount, setDocCount] = useState<number | null>(null);
+  const [skillCount, setSkillCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
-  const toast = useToast();
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     Promise.all([
+      apiClient.getReviews(true, 200),
+      apiClient.getReviews(false, 200),
       apiClient.getUsage(days),
-      apiClient.getTraces(undefined, 6),
-      apiClient.getFeedbackSummary(),
+      apiClient.getTraces(undefined, 5),
+      apiClient.getDocuments().catch(() => []),
+      apiClient.getSkills().catch(() => null),
     ])
-      .then(([u, t, f]) => {
+      .then(([p, all, u, t, docs, skills]) => {
         if (cancelled) return;
+        setPending(p.items);
+        setLedger(all.items);
         setUsage(u);
         setTraces(t);
-        setFeedback(f);
+        setDocCount(docs.length);
+        setSkillCount(
+          skills ? skills.builtin.length + skills.workspace.length : null,
+        );
       })
       .catch((e) => {
-        if (!cancelled) toast.error(toastMessageFrom(e, "加载仪表盘数据失败"));
+        if (!cancelled) toast.error(toastMessageFrom(e, "加载工作台数据失败"));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -87,346 +87,262 @@ export const DashboardPage: React.FC = () => {
     };
   }, [days, toast]);
 
-  const maxCalls = usage ? Math.max(...usage.byName.map((r) => r.calls), 1) : 1;
-  const maxModelCalls = usage
-    ? Math.max(...usage.byModel.map((r) => r.calls), 1)
-    : 1;
+  const tally = { pass: 0, reject: 0, needs_human: 0 };
+  ledger.forEach((r) => {
+    tally[r.verdict] += 1;
+  });
+  const ledgerTotal = ledger.length || 1;
 
-  const cache = usage?.cache;
-  const hitPct =
-    cache?.hitRate != null ? Math.round(cache.hitRate * 100) : null;
-  // 提供商侧上下文缓存：语义缓存关着时它是唯一在工作的缓存层
+  const totals = usage?.totals;
+  const cost = usage?.costs.length
+    ? usage.costs.map((c) => fmtCost(c.amount, c.currency)).join(" / ")
+    : "无数据";
   const promptHit =
-    usage?.totals.promptCacheHitRate != null
-      ? Math.round(usage.totals.promptCacheHitRate * 100)
+    totals?.promptCacheHitRate != null
+      ? Math.round(totals.promptCacheHitRate * 100)
       : null;
-  const cacheCard = cache?.enabled
-    ? {
-        value: hitPct == null ? "待命" : `${hitPct}%`,
-        hint: `语义缓存 · 省 ${fmtInt(cache.tokensSaved)} tok`,
-      }
-    : promptHit != null
-      ? {
-          value: `${promptHit}%`,
-          hint: `上下文缓存 · 省读 ${fmtInt(usage!.totals.cachedTokens)} tok`,
-        }
-      : { value: "暂无数据", hint: undefined };
-
-  const satisfactionPct =
-    feedback?.satisfaction != null
-      ? Math.round(feedback.satisfaction * 100)
-      : null;
-  const maxReasonCount = feedback?.downReasons.length
-    ? Math.max(...feedback.downReasons.map((r) => r.count), 1)
-    : 1;
 
   return (
     <div className="page-shell app-atmosphere transition-colors duration-200">
-      <div className="relative z-10 space-y-7 max-w-6xl">
+      <div className="relative z-10 space-y-6 max-w-6xl">
         <PageHeader
           eyebrow="工作台"
           title={`${greeting}${user?.name ? `，${user.name}` : ""}`}
-          description="看见模型怎么想——用量、轨迹、缓存与护栏都摊在台面上。"
+          description="此刻该关心什么：待办审核、审结走向、资产与用量，一屏看全。"
           actions={
             <div className="seg-switch">
-              {RANGES.map((range) => (
+              {RANGES.map((r) => (
                 <button
-                  key={range}
-                  data-active={days === range}
-                  onClick={() => setDays(range)}
+                  key={r}
+                  data-active={days === r}
+                  onClick={() => setDays(r)}
                 >
-                  {range} 天
+                  {r} 天
                 </button>
               ))}
             </div>
           }
         />
 
-        <CapabilityStrip className="anim-fade-up stagger-1" />
-
-        <AgentLoopPanel
-          serverStatus={serverStatus}
-          selectedModel={selectedModel}
-          sessionCount={sessions.length}
-          onChat={() => navigate("/chat")}
-          onKnowledge={() => navigate("/knowledge")}
-          onTraces={() => navigate("/traces")}
-        />
-
         {loading && (
           <div className="flex items-center gap-2 text-xs text-[#6e6b63] dark:text-[#a19f96]">
-            <Loader2 className="w-4 h-4 animate-spin" /> 正在统计...
+            <Loader2 className="w-4 h-4 animate-spin" /> 正在汇总...
           </div>
         )}
 
-        {usage && !loading && (
-          <>
-            <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3 anim-fade-up stagger-1">
-              <MetricCard
-                label="回答次数"
-                value={fmtInt(usage.totals.turns)}
-                icon={<MessageSquare className="w-3.5 h-3.5" />}
-              />
-              <MetricCard
-                label="输入 token"
-                value={fmtInt(usage.totals.promptTokens)}
-                icon={<Activity className="w-3.5 h-3.5" />}
-              />
-              <MetricCard
-                label="输出 token"
-                value={fmtInt(usage.totals.completionTokens)}
-                icon={<Sparkles className="w-3.5 h-3.5" />}
-              />
-              <MetricCard
-                label="成本"
-                value={
-                  usage.costs.length
-                    ? usage.costs
-                        .map((c) => fmtCost(c.amount, c.currency))
-                        .join(" / ")
-                    : "无数据"
-                }
-                icon={<Coins className="w-3.5 h-3.5" />}
-              />
-              <MetricCard
-                label="缓存命中"
-                value={cacheCard.value}
-                icon={<Zap className="w-3.5 h-3.5" />}
-                hint={cacheCard.hint}
-              />
-              <MetricCard
-                label="失败片段"
-                value={fmtInt(usage.totals.failures)}
-                icon={<Timer className="w-3.5 h-3.5" />}
-                warn={usage.totals.failures > 0}
-              />
-            </div>
-
-            <div className="grid grid-cols-1 lg:grid-cols-5 gap-5 anim-fade-up stagger-2">
-              <div className="lg:col-span-3 card-surface rounded-2xl p-5 space-y-3">
-                <h3 className="label-eyebrow">按环节</h3>
-                <div className="space-y-2.5">
-                  {usage.byName.map((row, i) => (
-                    <BarRow
-                      key={row.name ?? "unknown"}
-                      label={spanLabel(row.name ?? "-")}
-                      value={fmtInt(row.calls)}
-                      pct={row.calls / maxCalls}
-                      delay={i * 0.06}
-                    />
-                  ))}
-                  {usage.byName.length === 0 && (
-                    <p className="text-xs text-[#918d83]">暂无数据</p>
-                  )}
-                </div>
-              </div>
-              <div className="lg:col-span-2 card-surface rounded-2xl p-5 space-y-3">
-                <h3 className="label-eyebrow">按模型</h3>
-                <div className="space-y-2.5">
-                  {usage.byModel.map((row, i) => (
-                    <BarRow
-                      key={row.model ?? "unknown"}
-                      label={row.model || "未记录模型"}
-                      title={
-                        row.model ||
-                        "工具、检索等本地执行的 span 不经过模型，聚合时没有模型名"
-                      }
-                      value={`${fmtInt(row.calls)}次 · ${fmtCost(row.cost, row.currency)}`}
-                      pct={row.calls / maxModelCalls}
-                      delay={i * 0.06}
-                    />
-                  ))}
-                  {usage.byModel.length === 0 && (
-                    <p className="text-xs text-[#918d83]">暂无数据</p>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            <div className="card-surface rounded-2xl p-5 space-y-3 anim-fade-up stagger-3">
-              <div className="flex items-center justify-between">
-                <h3 className="label-eyebrow">回答反馈</h3>
-                {satisfactionPct != null && (
-                  <span className="text-[11px] text-[#918d83]">
-                    满意度 {satisfactionPct}% · 共 {feedback!.rated} 人次评价
+        <div className="card-surface rounded-2xl p-6 anim-fade-up">
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <span className="w-11 h-11 rounded-xl bg-[#da7756]/12 text-[#da7756] flex items-center justify-center">
+                <ClipboardCheck className="w-5 h-5" />
+              </span>
+              <div>
+                <div className="label-eyebrow">待办审核</div>
+                <div className="font-display text-[28px] font-semibold leading-tight text-[#1f1e1d] dark:text-[#edece8]">
+                  {pending.length}
+                  <span className="text-sm font-sans text-[#918d83] ml-1.5">
+                    条需要人判断
                   </span>
-                )}
+                </div>
               </div>
-              {!feedback || feedback.rated === 0 ? (
-                <p className="text-xs text-[#918d83]">
-                  还没有人评价回答。在聊天页对任意回答点 👍 / 👎 并写一句期望答案，
-                  差评会变成现成的回归用例。
-                </p>
-              ) : (
-                <div className="grid grid-cols-1 md:grid-cols-5 gap-5">
-                  <div className="md:col-span-2 grid grid-cols-2 gap-3">
-                    <div className="rounded-xl bg-emerald-500/10 px-4 py-3">
-                      <div className="flex items-center gap-1.5 text-emerald-700 dark:text-emerald-400 text-[11px] font-medium">
-                        <ThumbsUp className="w-3.5 h-3.5" /> 点赞
-                      </div>
-                      <div className="text-xl font-semibold text-[#1f1e1d] dark:text-[#edece8] mt-1">
-                        {fmtInt(feedback.up)}
-                      </div>
-                    </div>
-                    <div className="rounded-xl bg-rose-500/10 px-4 py-3">
-                      <div className="flex items-center gap-1.5 text-rose-700 dark:text-rose-400 text-[11px] font-medium">
-                        <ThumbsDown className="w-3.5 h-3.5" /> 点踩
-                      </div>
-                      <div className="text-xl font-semibold text-[#1f1e1d] dark:text-[#edece8] mt-1">
-                        {fmtInt(feedback.down)}
-                      </div>
-                    </div>
-                    {feedback.pendingExport > 0 && (
-                      <p className="col-span-2 text-[11px] text-[#918d83]">
-                        {feedback.pendingExport} 条差评待导出为回归用例
-                      </p>
-                    )}
-                  </div>
-                  <div className="md:col-span-3 space-y-2.5">
-                    <div className="text-[11px] text-[#918d83]">差评原因分布</div>
-                    {feedback.downReasons.map((row, i) => (
-                      <BarRow
-                        key={row.reason}
-                        label={DOWN_REASON_LABELS[row.reason] ?? row.reason}
-                        value={fmtInt(row.count)}
-                        pct={row.count / maxReasonCount}
-                        delay={i * 0.06}
-                      />
-                    ))}
-                    {feedback.down === 0 && (
-                      <p className="text-xs text-[#918d83]">暂无差评</p>
-                    )}
-                  </div>
+            </div>
+            {pending.length > 0 && (
+              <button
+                onClick={() => navigate("/reviews?filter=pending")}
+                className="btn-accent px-4 py-2 rounded-xl text-white text-xs font-medium flex items-center gap-2"
+              >
+                <ArrowRight className="w-3.5 h-3.5" />
+                去处理
+              </button>
+            )}
+          </div>
+          {pending.length === 0 ? (
+            <p className="text-xs text-[#918d83] mt-4">
+              没有等着人判断的结论。转人工的单据会先落在这里，别让它们堆进没人看的队列。
+            </p>
+          ) : (
+            <div className="mt-4 space-y-0.5">
+              {pending.slice(0, 4).map((it) => (
+                <button
+                  key={it.id}
+                  onClick={() => navigate("/reviews?filter=pending")}
+                  className="w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl hover:bg-[#f3f0e6] dark:hover:bg-[#262522] text-xs text-left transition-colors"
+                >
+                  <AlertTriangle className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                  <span className="flex-1 truncate text-[#1f1e1d] dark:text-[#edece8]">
+                    {it.subject}
+                  </span>
+                  <span className="text-[#918d83] shrink-0">{it.sopName}</span>
+                </button>
+              ))}
+              {pending.length > 4 && (
+                <div className="text-[11px] text-[#918d83] px-3.5 pt-1">
+                  还有 {pending.length - 4} 条…
                 </div>
               )}
             </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 anim-fade-up stagger-3">
-              <ShortcutCard
-                icon={<BookOpen className="w-4 h-4" />}
-                title="检索调试"
-                body="不经过对话，直接看 dense / sparse 命中了什么。"
-                onClick={() => navigate("/knowledge")}
-              />
-              <ShortcutCard
-                icon={<RouteIcon className="w-4 h-4" />}
-                title="运行回放"
-                body="把一次回答拆成 span 瀑布，核对耗时与失败。"
-                onClick={() => navigate("/traces")}
-              />
-              <ShortcutCard
-                icon={<Sparkles className="w-4 h-4" />}
-                title="提示词实验"
-                body="对比系统提示词版本，挂到下一轮对话上。"
-                onClick={() => navigate("/prompts")}
-              />
-            </div>
-
-            <div className="card-surface rounded-2xl p-5 space-y-3 anim-fade-up stagger-4">
-              <div className="flex items-center justify-between">
-                <h3 className="label-eyebrow">最近的回答</h3>
-                <button
-                  onClick={() => navigate("/traces")}
-                  className="text-[11px] text-[#da7756] hover:underline"
-                >
-                  全部轨迹 →
-                </button>
-              </div>
-              <div className="space-y-1">
-                {traces.length === 0 && (
-                  <p className="text-xs text-[#918d83] py-6 text-center">
-                    还没有埋点数据。去对话一次，这里就会出现一条可回放的轨迹。
-                  </p>
-                )}
-                {traces.map((t) => (
-                  <button
-                    key={t.traceId}
-                    onClick={() => navigate(`/traces?trace=${t.traceId}`)}
-                    className="w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl hover:bg-[#f3f0e6] dark:hover:bg-[#262522] text-xs text-left transition-colors"
-                  >
-                    <span
-                      className={`w-2 h-2 rounded-full shrink-0 ${
-                        t.failures > 0 ? "bg-rose-500" : "bg-emerald-500"
-                      }`}
-                    />
-                    <span className="text-[#6e6b63] dark:text-[#a19f96] w-36 shrink-0">
-                      {t.startedAt
-                        ? new Date(t.startedAt).toLocaleString()
-                        : t.traceId.slice(0, 8)}
-                    </span>
-                    <span className="flex items-center gap-1 text-[#1f1e1d] dark:text-[#edece8]">
-                      <Timer className="w-3 h-3" /> {fmtMs(t.durationMs)}
-                    </span>
-                    <span className="text-[#6e6b63] dark:text-[#a19f96]">
-                      {fmtInt(t.promptTokens + t.completionTokens)} tok
-                    </span>
-                    <span className="text-[#6e6b63] dark:text-[#a19f96]">
-                      {fmtCost(t.cost, t.currency)}
-                    </span>
-                    {t.failures > 0 && (
-                      <span className="text-rose-500">{t.failures} 失败</span>
-                    )}
-                    <span className="ml-auto text-[#da7756]">查看 →</span>
-                  </button>
-                ))}
-              </div>
-            </div>
-          </>
-        )}
-
-        <div className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-[#f3f0e6]/50 dark:bg-[#1e1d1b]/50 border border-[#e3dfd5] dark:border-[#2e2d2a] text-xs anim-fade-up stagger-5">
-          <span className="relative flex w-2 h-2 shrink-0">
-            {serverStatus === "online" && (
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-50" />
-            )}
-            <span
-              className={`relative inline-flex rounded-full h-2 w-2 ${
-                serverStatus === "online"
-                  ? "bg-emerald-500"
-                  : serverStatus === "offline"
-                    ? "bg-rose-500"
-                    : "bg-amber-500"
-              }`}
-            />
-          </span>
-          <span className="text-[#6e6b63] dark:text-[#a19f96]">
-            {serverStatus === "online"
-              ? "在线"
-              : serverStatus === "offline"
-                ? "离线"
-                : "检查中"}
-          </span>
-          <span className="text-[#918d83]">·</span>
-          <Cpu className="w-3.5 h-3.5 text-[#da7756]" />
-          <span className="text-[#1f1e1d] dark:text-[#edece8] font-medium">
-            {selectedModel}
-          </span>
-          {(cache?.enabled || promptHit != null) && (
-            <>
-              <span className="text-[#918d83]">·</span>
-              <Zap className="w-3.5 h-3.5 text-[#da7756]" />
-              <span className="text-[#6e6b63] dark:text-[#a19f96]">
-                {cache?.enabled
-                  ? `语义缓存 ${hitPct == null ? "待命" : `${hitPct}%`}`
-                  : `上下文缓存 ${promptHit}%`}
-              </span>
-            </>
           )}
-          <span className="text-[#918d83]">·</span>
-          <ShieldCheck className="w-3.5 h-3.5 text-emerald-500" />
-          <span className="text-[#6e6b63] dark:text-[#a19f96]">护栏就绪</span>
-          <button
-            onClick={() => navigate("/chat")}
-            className="ml-auto flex items-center gap-1.5 btn-accent px-3 py-1.5 rounded-lg text-[11px] font-medium"
-          >
-            <MessageSquare className="w-3.5 h-3.5" />
-            去对话
-          </button>
         </div>
 
-        <AgentMetricsPanel />
+        {usage && (
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 anim-fade-up stagger-1">
+            <MetricCard
+              label="回答次数"
+              value={fmtInt(totals!.turns)}
+              icon={<MessagesSquare className="w-3.5 h-3.5" />}
+            />
+            <MetricCard
+              label="成本"
+              value={cost}
+              icon={<Coins className="w-3.5 h-3.5" />}
+            />
+            <MetricCard
+              label="上下文缓存"
+              value={promptHit != null ? `${promptHit}%` : "暂无"}
+              icon={<Zap className="w-3.5 h-3.5" />}
+            />
+            <MetricCard
+              label="失败片段"
+              value={fmtInt(totals!.failures)}
+              icon={<Timer className="w-3.5 h-3.5" />}
+              warn={totals!.failures > 0}
+            />
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 lg:grid-cols-5 gap-5 anim-fade-up stagger-2">
+          <div className="lg:col-span-3 card-surface rounded-2xl p-5 space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="label-eyebrow">审结概览（近 {ledger.length} 条）</h3>
+              <button
+                onClick={() => navigate("/reviews?filter=all")}
+                className="text-[11px] text-[#da7756] hover:underline"
+              >
+                全部台账 →
+              </button>
+            </div>
+            {ledger.length === 0 ? (
+              <p className="text-xs text-[#918d83]">
+                还没有审核结论。让 Agent 按作业指导审一份材料，结论会记进台账。
+              </p>
+            ) : (
+              <div className="space-y-2.5">
+                {(["pass", "reject", "needs_human"] as const).map((v, i) => (
+                  <BarRow
+                    key={v}
+                    label={VERDICT_META[v].label}
+                    value={fmtInt(tally[v])}
+                    pct={tally[v] / ledgerTotal}
+                    delay={i * 0.06}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+          <div className="lg:col-span-2 grid grid-rows-2 gap-3">
+            <button
+              onClick={() => navigate("/knowledge")}
+              className="card-surface card-lift rounded-2xl p-5 text-left flex items-center gap-3"
+            >
+              <span className="w-10 h-10 rounded-xl bg-[#da7756]/12 text-[#da7756] flex items-center justify-center shrink-0">
+                <BookOpen className="w-5 h-5" />
+              </span>
+              <div>
+                <div className="text-2xl font-semibold text-[#1f1e1d] dark:text-[#edece8] leading-none">
+                  {docCount ?? "—"}
+                </div>
+                <div className="label-eyebrow mt-1">知识库文档</div>
+              </div>
+            </button>
+            <button
+              onClick={() => navigate("/skills")}
+              className="card-surface card-lift rounded-2xl p-5 text-left flex items-center gap-3"
+            >
+              <span className="w-10 h-10 rounded-xl bg-[#da7756]/12 text-[#da7756] flex items-center justify-center shrink-0">
+                <ScrollText className="w-5 h-5" />
+              </span>
+              <div>
+                <div className="text-2xl font-semibold text-[#1f1e1d] dark:text-[#edece8] leading-none">
+                  {skillCount ?? "—"}
+                </div>
+                <div className="label-eyebrow mt-1">作业指导</div>
+              </div>
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 anim-fade-up stagger-3">
+          <ShortcutCard
+            icon={<MessageSquare className="w-4 h-4" />}
+            title="开始一次审核"
+            body="把材料交给 Agent，按作业指导逐项核对、给出有据结论。"
+            onClick={() => navigate("/chat")}
+          />
+          <ShortcutCard
+            icon={<ClipboardCheck className="w-4 h-4" />}
+            title="审核台账"
+            body="看结论依据、处置转人工的待办、追溯当时按的哪版 SOP。"
+            onClick={() => navigate("/reviews")}
+          />
+          <ShortcutCard
+            icon={<BookOpen className="w-4 h-4" />}
+            title="知识库检索"
+            body="不经过对话，直接看混合检索命中了什么。"
+            onClick={() => navigate("/knowledge")}
+          />
+        </div>
+
+        <div className="card-surface rounded-2xl p-5 space-y-3 anim-fade-up stagger-4">
+          <div className="flex items-center justify-between">
+            <h3 className="label-eyebrow">最近运行</h3>
+            <button
+              onClick={() => navigate("/traces")}
+              className="text-[11px] text-[#da7756] hover:underline"
+            >
+              全部轨迹 →
+            </button>
+          </div>
+          <div className="space-y-1">
+            {traces.length === 0 && (
+              <p className="text-xs text-[#918d83] py-6 text-center">
+                还没有埋点数据。去对话一次，这里会出现一条可回放的轨迹。
+              </p>
+            )}
+            {traces.map((t) => (
+              <button
+                key={t.traceId}
+                onClick={() => navigate(`/traces?trace=${t.traceId}`)}
+                className="w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl hover:bg-[#f3f0e6] dark:hover:bg-[#262522] text-xs text-left transition-colors"
+              >
+                <span
+                  className={`w-2 h-2 rounded-full shrink-0 ${
+                    t.failures > 0 ? "bg-rose-500" : "bg-emerald-500"
+                  }`}
+                />
+                <span className="text-[#6e6b63] dark:text-[#a19f96] w-36 shrink-0">
+                  {t.startedAt
+                    ? new Date(t.startedAt).toLocaleString()
+                    : t.traceId.slice(0, 8)}
+                </span>
+                <span className="flex items-center gap-1 text-[#1f1e1d] dark:text-[#edece8]">
+                  <Timer className="w-3 h-3" /> {fmtMs(t.durationMs)}
+                </span>
+                <span className="text-[#6e6b63] dark:text-[#a19f96]">
+                  {fmtInt(t.promptTokens + t.completionTokens)} tok
+                </span>
+                {t.failures > 0 && (
+                  <span className="text-rose-500">{t.failures} 失败</span>
+                )}
+                <span className="ml-auto text-[#da7756]">查看 →</span>
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
     </div>
   );
 };
+
+
+
 

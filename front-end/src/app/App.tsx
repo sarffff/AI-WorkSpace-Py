@@ -9,6 +9,8 @@ import { RegisterPage } from "@/pages/auth/ui/RegisterPage";
 import { ChatPage } from "@/pages/chat/ui/ChatPage";
 import { KnowledgePage } from "@/pages/knowledge/ui/KnowledgePage";
 import { PromptsPage } from "@/pages/prompts/ui/PromptsPage";
+import { ReviewsPage } from "@/pages/reviews/ui/ReviewsPage";
+import { SkillsPage } from "@/pages/skills/ui/SkillsPage";
 import { DashboardPage } from "@/pages/dashboard/ui/DashboardPage";
 import { TracesPage } from "@/pages/traces/ui/TracesPage";
 import { SettingsPage } from "@/pages/settings/ui/SettingsPage";
@@ -37,7 +39,9 @@ export function App() {
               <Route path="chat" element={<ChatPage />} />
               <Route path="traces" element={<TracesPage />} />
               <Route path="knowledge" element={<KnowledgePage />} />
+              <Route path="skills" element={<SkillsPage />} />
               <Route path="prompts" element={<PromptsPage />} />
+              <Route path="reviews" element={<ReviewsPage />} />
               <Route path="settings" element={<SettingsPage />} />
             </Route>
 

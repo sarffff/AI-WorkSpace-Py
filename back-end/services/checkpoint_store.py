@@ -295,14 +295,24 @@ def get_run(db: Session, run_id: str) -> AgentRun | None:
 
 
 def list_pending(db: Session, user_id: str, limit: int = 20) -> list[AgentRun]:
-    """这个用户所有等待审批的执行。
+    """这个用户所有**在等人**的执行：等裁决的，以及等回答的。
 
-    刷新页面之后前端靠它把审批卡片找回来——中断活在数据库里，不活在那条
+    刷新页面之后前端靠它把卡片找回来——中断活在数据库里，不活在那条
     已经断掉的 SSE 连接里，这正是可恢复执行与"一个长连接等着用户点"的区别。
+
+    两个状态一起查，而不是只查 ``waiting_approval``：``waiting_input``
+    （模型调了 ``ask_user``）同样是"停在这里等人"，同样刷新之后就只剩数据库里
+    这一份。2026-08-30 之前这里漏了它，症状是澄清卡片刷新一次就消失，而 run
+    还挂在 ``waiting_input`` 里没人管——注意上面 ``expire_stale_runs`` 两个状态
+    都覆盖了，所以它还会照常超时，只是用户再也看不到它。
+    调用方按 ``interrupt_request.kind`` 分派该渲染哪张卡片。
     """
     return (
         db.query(AgentRun)
-        .filter(AgentRun.user_id == user_id, AgentRun.status == "waiting_approval")
+        .filter(
+            AgentRun.user_id == user_id,
+            AgentRun.status.in_(["waiting_approval", "waiting_input"]),
+        )
         .order_by(AgentRun.updated_at.desc())
         .limit(limit)
         .all()

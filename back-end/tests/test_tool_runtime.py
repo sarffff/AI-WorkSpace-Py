@@ -98,3 +98,23 @@ def test_handler_exception_maps_to_unavailable():
 
     assert result.status is ToolStatus.UNAVAILABLE
     assert "暂时不可用" in result.content
+
+
+def test_工具失败时明确禁止用记忆里的数字顶替():
+    """失败消息不能只说"基于已有信息回答"——那在邀请模型编。
+
+    起因是评估里 recovery-search-down：web_search 故障之后模型编了一个汇率
+    （"通常在 6.3-6.8 之间，假设 6.5"）再拿它算出 6500。当那次检索**就是唯一的
+    信息来源**时，"直接基于已有信息回答"读起来就是"那你直接答吧"。
+
+    这条钉住的是"撤掉那句邀请"，不是某个具体措辞：断言的是禁止编造这个语义在场。
+    """
+    async def boom(_arguments: dict[str, Any]) -> str:
+        raise RuntimeError("search down")
+
+    result = run(_runtime(handler=boom).execute(_call(arguments='{"text": "hi"}')))
+
+    assert result.status is ToolStatus.UNAVAILABLE
+    assert "不要用记忆里的数字" in result.content
+    # 原来那句话还留着（它本身没错，错在只有它）
+    assert "基于已有信息" in result.content

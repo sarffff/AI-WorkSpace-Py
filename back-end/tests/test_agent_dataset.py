@@ -61,6 +61,132 @@ def test_expect_and_forbid_never_overlap():
             assert not overlap, f"{task.id} 第 {index} 轮自相矛盾：{overlap}"
 
 
+def test_声明了工具的用例必须真的能拿到那个工具():
+    """用例期望的工具,在它自己的配置下必须是**注册得出来**的。
+
+    这条拦的是一类特别安静的错:``fs-skills`` 刻意关着 ``TOOL_FS_DELETE_ENABLED``,
+    而一条用例写了 ``expect_tools: [delete_file]``。跑起来不会报错——那个工具压根
+    不在工具面里,模型当然不调,于是工具召回扣分、用例失败,而失败原因看起来像
+    "模型不肯删",实际是"它没有这个工具"。
+
+    判据只覆盖文件工具的三个开关:它们是唯一"按开关注册"且被用例点名的一组。
+    知识库那几个工具在 ``_BASE`` 里全程开着,不需要这条。
+    """
+    gated = {
+        "write_file": "TOOL_FS_WRITE_ENABLED",
+        "edit_file": "TOOL_FS_WRITE_ENABLED",
+        "delete_file": "TOOL_FS_DELETE_ENABLED",
+    }
+    variant = AGENT_VARIANTS["fs-skills"]
+    for task in TASKS:
+        for index, turn in enumerate(task.turns, start=1):
+            for tool in turn.expect_tools:
+                flag = gated.get(tool)
+                if flag is None:
+                    continue
+                # 任务级覆盖优先,其次是变体,最后是 Settings 的默认值
+                enabled = task.settings_overrides.get(
+                    flag, variant.overrides.get(flag, getattr(Settings(), flag))
+                )
+                assert enabled, (
+                    f"{task.id} 第 {index} 轮期望 {tool},但 {flag} 在这个用例下是关的——"
+                    f"要么给它加 settings_overrides,要么别期望这个工具"
+                )
+
+
+def test_review用例在review变体下能拿到submit_review与load_skill():
+    """审核链评估的核心动作（load_skill + submit_review）在 review 变体下必须能注册。
+
+    这条拦的是审核链评估**自身**被静默掏空的那种失效：submit_review 由
+    ``REVIEW_LEDGER_ENABLED`` 门控、load_skill 由 ``SKILL_ENABLED`` 门控。变体漏掉
+    任一个，工具压根不注册，模型当然不调，于是 ``submitReviewCalls`` 恒为 0——
+    而报告会把那个 0 读成"模型审完不记账、结论只写在正文里"（那正是要发现的失效），
+    实际却是"工具没上桌"。两件事处置相反，而在 0 上完全同形。
+
+    工具注册逻辑本身（ledger 开 + 有声明 required_inputs 的 SOP → submit_review 上桌）
+    由 test_review_ledger.test_循环的工具面里真有submit_review 覆盖，用的是真数据库
+    会话；这里是它的静态那一半——只钉"变体有没有把该开的开关开上",不需要模型也
+    不需要库。submit_review 另需工作区有声明 required_inputs 的 SOP,内置
+    expense-review 满足,SKILL_ENABLED 开着即可见。
+    """
+    review_tasks = [task for task in TASKS if task.probe == "review"]
+    assert review_tasks, "没有 review 用例，审核链评估没有样本"
+    # 至少一条真的点名 submit_review，否则下面的循环是空转，守卫形同虚设
+    assert any(
+        "submit_review" in turn.expect_tools
+        for task in review_tasks
+        for turn in task.turns
+    ), "review 用例里没有任何一条期望 submit_review"
+
+    gated = {
+        "load_skill": "SKILL_ENABLED",
+        "read_skill_file": "SKILL_ENABLED",
+        "submit_review": "REVIEW_LEDGER_ENABLED",
+        "read_file": "TOOL_FS_ENABLED",
+    }
+    variant = AGENT_VARIANTS["review"]
+    for task in review_tasks:
+        for index, turn in enumerate(task.turns, start=1):
+            for tool in turn.expect_tools:
+                flag = gated.get(tool)
+                if flag is None:
+                    continue
+                enabled = task.settings_overrides.get(
+                    flag, variant.overrides.get(flag, getattr(Settings(), flag))
+                )
+                assert enabled, (
+                    f"{task.id} 第 {index} 轮期望 {tool}，但 {flag} 在 review 变体下是关的"
+                    f"——submitReviewCalls 会恒为 0，而那个 0 会被读成"
+                    f"“模型不记账”，实际是工具没上桌"
+                )
+
+
+def test_禁止记账的用例在review变体下submit_review确实上桌():
+    """restraint 用例（forbid submit_review）只有在 submit_review 真注册时才有意义。
+
+    正向那条（上一条）钉"该开的开关开着"；这条是它的镜像：被禁的工具必须**确实
+    可调**。否则模型压根调不到 submit_review，forbidden_hits 恒为 0——那不是
+    "模型忍住了没记账"，是"工具没上桌"，而 reviewUnbiddenRecords 会把这个假 0
+    读成"防线完美"。submit_review 上桌要 REVIEW_LEDGER_ENABLED + SKILL_ENABLED
+    （后者让内置 expense-review 可见，它声明了 required_inputs）都开着。
+    """
+    restraint = [
+        task
+        for task in TASKS
+        if task.probe == "review"
+        and any("submit_review" in turn.forbid_tools for turn in task.turns)
+    ]
+    assert restraint, "没有 restraint 用例，未经要求记账那条链没有样本"
+    variant = AGENT_VARIANTS["review"]
+    for task in restraint:
+        for flag in ("REVIEW_LEDGER_ENABLED", "SKILL_ENABLED"):
+            enabled = task.settings_overrides.get(
+                flag, variant.overrides.get(flag, getattr(Settings(), flag))
+            )
+            assert enabled, (
+                f"{task.id} 禁止 submit_review，但 {flag} 在 review 变体下是关的"
+                f"——forbidden_hits 恒为 0，reviewUnbiddenRecords 会把这个假 0 读成防线完美"
+            )
+
+
+def test_任务级覆盖只收布尔与数值且必须是真配置项():
+    """拼错的开关名在运行时是静默不生效,而用例照常给分——量的却不是它声称的东西。"""
+    from eval.agent_runner import _parse_overrides
+
+    assert _parse_overrides(None, "t") == {}
+    assert _parse_overrides({"TOOL_FS_DELETE_ENABLED": True}, "t") == {
+        "TOOL_FS_DELETE_ENABLED": True
+    }
+    # 不存在的配置项
+    with pytest.raises(ValueError, match="不是一个已知配置项"):
+        _parse_overrides({"TOOL_FS_DELETE": True}, "t")
+    # 字符串开关不收:提示词版本会让同一份报告里两个任务跑在不同提示词上
+    with pytest.raises(ValueError, match="只能是布尔或数值"):
+        _parse_overrides({"PROMPT_CHAT_SYSTEM_VERSION": "v8-skills"}, "t")
+    with pytest.raises(ValueError, match="必须是一个对象"):
+        _parse_overrides(["TOOL_FS_DELETE_ENABLED"], "t")
+
+
 # ---- 记忆注入用例 ----
 
 
@@ -245,3 +371,381 @@ def test_delegation_variants_switch_the_prompt_with_the_mode():
             assert variant.overrides["PROMPT_CHAT_SYSTEM_VERSION"] == want, (
                 f"{name} 用 {mode} 模式，提示词该是 {want}"
             )
+
+
+# ========== 澄清指标不能自相矛盾 ==========
+
+
+def _outcome(**kw):
+    """一份最小的 TurnOutcome，只填这几条测试要用的字段。"""
+    from eval.agent_runner import TurnOutcome
+
+    base = dict(
+        question="q",
+        answer="",
+        calls=[],
+        prefetch_calls=0,
+        rounds=1,
+        tool_recall=None,
+        tool_precision=None,
+        forbidden_hits=0,
+        round_efficiency=None,
+        order_ok=None,
+        keyword_coverage=None,
+        avoid_hits=0,
+        repeated_calls=0,
+        repeated_blocked=0,
+        guardrail_hits=0,
+        unavailable_calls=0,
+        invalid_calls=0,
+        errors=[],
+        prompt_tokens=0,
+        completion_tokens=0,
+        cost=None,
+        currency=None,
+        unpriced_models=set(),
+        latency_ms=0,
+    )
+    base.update(kw)
+    return TurnOutcome(**base)
+
+
+def test_never_asking_cannot_count_as_resumed():
+    """没问过澄清，就不可能"接上"——这一列必须是 0。
+
+    2026-08-30 实测踩到的：模型压根没调 ``ask_user``，自己拿一个假设把任务做完了。
+    第一版 ``clarificationResumed`` 只判"答案非空"，于是报了「2 条都接上了」，
+    而同一份报告里 ``clarificationAsked`` 是 0。两个数直接矛盾，而那一列是假的。
+
+    这是这个项目反复出现的一种指标缺陷：**指标在那件事从没发生时也有值**
+    （同 fabricationRate 的 substring 漏判、拒答裁判的 abstained 自相矛盾）。
+    判据必须带上"前提成立"这一半。
+    """
+    from eval import agent_runner
+
+    asked = _outcome(answer="接上之后的正文", clarification_requests=1)
+    never = _outcome(answer="没问就直接答完了", clarification_requests=0)
+
+    assert agent_runner._resumed_count([asked, never]) == 1, (
+        "没问过的那条不能算接上"
+    )
+    assert agent_runner._resumed_count([never]) == 0
+    # 问了但答案是空的也不算：那是接续真的失败了
+    assert agent_runner._resumed_count([_outcome(clarification_requests=1)]) == 0
+
+
+class _FakeVerdict:
+    def __init__(self, success):
+        self.success = success
+        self.grounded = None
+        self.failed = False
+        self.fabricated_tool_output = False
+
+
+class _FakeTask:
+    def __init__(self, turns):
+        self.turns = turns
+        self.probe = "clarification"
+
+
+class _FakeResult:
+    def __init__(self, success, turn_specs, turn_outcomes):
+        self.verdict = _FakeVerdict(success)
+        self.task = _FakeTask(turn_specs)
+        self.turns = turn_outcomes
+
+
+def test_裁判高分配上必需内容缺失算矛盾():
+    """裁判说做到了，而 must_include 一个都没命中——那个分数被确定性判据证伪。
+
+    2026-09-01 实测原话：裁判给 5.0、理由写「问了城市等级后给出唯一数字900
+    （450×2）」，而答案结尾就是那句问话，900 压根不在里面。裁判把"它接下来
+    应该会算出 900"写成了"它算出了 900"。
+    """
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    spec = TurnSpec(question="q", must_include=["900"])
+    contradicting = _FakeResult(5.0, [spec], [_outcome(keyword_coverage=0.0)])
+    assert agent_runner._judge_contradictions([contradicting]) == 1
+
+
+def test_命中了就不算矛盾():
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    spec = TurnSpec(question="q", must_include=["900"])
+    ok = _FakeResult(5.0, [spec], [_outcome(keyword_coverage=1.0)])
+    assert agent_runner._judge_contradictions([ok]) == 0
+
+
+def test_低分不算矛盾():
+    """裁判自己就给了低分，那和确定性判据是一致的，不是矛盾。"""
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    spec = TurnSpec(question="q", must_include=["900"])
+    low = _FakeResult(1.0, [spec], [_outcome(keyword_coverage=0.0)])
+    assert agent_runner._judge_contradictions([low]) == 0
+
+
+def test_没声明必需内容的用例不进这个判据():
+    """抽取类用例判据是确定性的、不叫裁判，没有 must_include 可比。"""
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    spec = TurnSpec(question="q")
+    none = _FakeResult(5.0, [spec], [_outcome(keyword_coverage=None)])
+    assert agent_runner._judge_contradictions([none]) == 0
+
+
+def test_多轮任务不能按摊平下标对齐():
+    """``verdict.success`` 是每任务一个，``must_include`` 是每轮一个。
+
+    第一版写的是 ``zip(graded, pairs)``，而 ``pairs`` 是所有任务的轮次摊平之后的
+    列表——只要有一个任务是多轮的，后面全部错位，于是拿 A 任务的裁判分去配 B 任务
+    的命中率。数据集里 multi_domain 那几条就是多轮的。
+
+    这里用"第一个任务两轮、第二个任务一轮"钉住：摊平对齐的实现会把第二个任务的
+    裁判分配到第一个任务的第二轮上，从而给出不同的答案。
+    """
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    two_turn = _FakeResult(
+        5.0,
+        [TurnSpec(question="a"), TurnSpec(question="b", must_include=["900"])],
+        [_outcome(keyword_coverage=None), _outcome(keyword_coverage=0.0)],
+    )
+    one_turn = _FakeResult(
+        1.0, [TurnSpec(question="c", must_include=["1350"])], [_outcome(keyword_coverage=0.0)]
+    )
+
+    # 第一个任务:高分 + 第二轮必需内容缺失 → 矛盾。第二个:低分 → 不算。
+    assert agent_runner._judge_contradictions([two_turn, one_turn]) == 1
+
+
+def test_一个任务里多轮缺失只记一次():
+    """判的是"这个任务的裁判分不可用",不是"缺了几处"。"""
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    result = _FakeResult(
+        4.0,
+        [TurnSpec(question="a", must_include=["1"]), TurnSpec(question="b", must_include=["2"])],
+        [_outcome(keyword_coverage=0.0), _outcome(keyword_coverage=0.0)],
+    )
+    assert agent_runner._judge_contradictions([result]) == 1
+
+
+def test_非澄清用例上的收编算误判():
+    """判据误伤：正常回答被当成提问，本该 done 的回合挂成了 waiting_input。
+
+    其余三个澄清指标全按 ``spec.clarification_answer`` 过滤（"这条用例准备了
+    答案"），所以误判**天然落在它们的分母外面**——32 条全量跑下来，30 条非澄清
+    用例上的误伤在报告里一个字都看不到，只会以 clarification_unanswered 的形式
+    间接冒出来，而那条错误原因同时也覆盖"模型该问却没问"。
+
+    这一列是 CLARIFY_ADOPT_PROSE_QUESTION 能不能默认打开的唯一判据。
+    """
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    misfire = _FakeResult(
+        5.0, [TurnSpec(question="q")], [_outcome(clarification_adopted=1)]
+    )
+    assert agent_runner._unexpected_adoptions([misfire]) == 1
+
+
+def test_澄清用例上的收编不算误判():
+    """那是这个功能该做的事，不是误伤。"""
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    intended = _FakeResult(
+        5.0,
+        [TurnSpec(question="q", clarification_answer="二线城市")],
+        [_outcome(clarification_adopted=1)],
+    )
+    assert agent_runner._unexpected_adoptions([intended]) == 0
+
+
+def test_裁判失败不该把误收编藏起来():
+    """用 results 而不是 graded：两件事独立。
+
+    一条用例可以既裁判失败、又误收编。按 graded 过滤的话那次误伤就消失了，
+    而"开关能不能默认打开"这个结论恰恰取决于它。
+    """
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    failed = _FakeResult(
+        None, [TurnSpec(question="q")], [_outcome(clarification_adopted=1)]
+    )
+    failed.verdict.failed = True
+    assert agent_runner._unexpected_adoptions([failed]) == 1
+
+
+def test_收编次数不能混进模型主动提问():
+    """``clarificationAsked`` 与 ``clarificationAdopted`` 必须分开。
+
+    合成一个数之后，打开 CLARIFY_ADOPT_PROSE_QUESTION 会让 clarificationAsked
+    从 0 跳到 2，报告读起来像"模型终于学会调 ask_user 了"——而它一次都没调，
+    那 2 次是框架从回答正文里接住的。两者的处置相反：前者说明提示词/工具面对了，
+    后者说明只能靠框架兜。
+    """
+    from eval.agent_runner import TurnOutcome
+
+    adopted = _outcome(clarification_requests=1, clarification_adopted=1)
+    self_asked = _outcome(clarification_requests=1, clarification_adopted=0)
+
+    assert isinstance(adopted, TurnOutcome)
+    # 模型自己调的次数 = asked - adopted
+    assert adopted.clarification_requests - adopted.clarification_adopted == 0
+    assert self_asked.clarification_requests - self_asked.clarification_adopted == 1
+
+
+def test_收编来的也算接上了():
+    """接续判据看的是"问过 + 答案非空",收编来的那次同样满足前一半。
+
+    收编的目的就是让那一轮能接着跑,所以它必须能进 clarificationResumed——
+    否则报告会显示"收编了 2 次、接上 0 条",看起来像回灌那条路断了。
+    """
+    from eval import agent_runner
+
+    adopted = _outcome(
+        answer="接上之后的正文", clarification_requests=1, clarification_adopted=1
+    )
+    assert agent_runner._resumed_count([adopted]) == 1
+
+
+def test_出错原因按次数归类():
+    """``turnErrors`` 只是计数,"出错轮次 2" 读不出该做什么。
+
+    2026-08-31 实测两个变体都是 2,原因全是 clarification_never_asked——功能没被
+    走进去,不是跑崩了。这两种情况在计数上同形而处置相反。
+    """
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    spec = TurnSpec(question="q")
+    pairs = [
+        (spec, _outcome(errors=["clarification_never_asked"])),
+        (spec, _outcome(errors=["clarification_never_asked"])),
+        (spec, _outcome(errors=["model_error"])),
+    ]
+    reasons = agent_runner._error_reasons(pairs)
+    assert reasons == ["clarification_never_asked ×2", "model_error ×1"], (
+        "按次数降序,次数必须带上——只列种类看不出规模"
+    )
+
+
+def test_没出错时返回None而不是空列表():
+    """空列表和 None 在渲染层是两回事：None 才让整段消失。"""
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    assert agent_runner._error_reasons([(TurnSpec(question="q"), _outcome())]) is None
+
+
+def test_冒号后的可变部分归到同一类():
+    """``unknown_approval_verdict:xxx`` 每条用例的后缀都不同,不归类就每条各成一类。"""
+    from eval import agent_runner
+    from eval.agent_runner import TurnSpec
+
+    spec = TurnSpec(question="q")
+    pairs = [
+        (spec, _outcome(errors=["unknown_approval_verdict:maybe"])),
+        (spec, _outcome(errors=["unknown_approval_verdict:later"])),
+    ]
+    assert agent_runner._error_reasons(pairs) == ["unknown_approval_verdict ×2"]
+
+
+# ========== 磁盘状态检查 ==========
+#
+# 2026-09-11 加。其余所有判据看的都是**模型说了什么**——答案文本、工具调用序列、
+# 裁判的印象。写操作是唯一会改变工作区状态的动作，而"它说写好了"和"文件真的变成
+# 了那样"是两件事。差一点的情形不是模型撒谎，是路径拼错、写到了别处、或者 content
+# 被截断——三种都会让答案看起来完全正常。
+
+
+def _task(**kwargs):
+    from eval.agent_runner import AgentTask
+
+    base = dict(id="t", probe="p", rubric="r", turns=[])
+    base.update(kwargs)
+    return AgentTask(**base)
+
+
+def test_内容一致时没有错误(tmp_path):
+    from eval.agent_runner import _check_workspace_after
+
+    (tmp_path / "a.md").write_text("期望内容\n", encoding="utf-8")
+    task = _task(workspace_after={"a.md": "期望内容"})
+
+    assert _check_workspace_after(None, task, str(tmp_path)) == []
+
+
+def test_内容不符时报出来(tmp_path):
+    """这是这一组存在的理由：模型声称写好了，而文件不是那样。"""
+    from eval.agent_runner import _check_workspace_after
+
+    (tmp_path / "a.md").write_text("其实没改", encoding="utf-8")
+    task = _task(workspace_after={"a.md": "期望内容"})
+
+    errors = _check_workspace_after(None, task, str(tmp_path))
+    assert len(errors) == 1 and "内容不符" in errors[0]
+
+
+def test_结尾换行不算差异(tmp_path):
+    """模型给的内容结尾多不多一个换行不是判据。"""
+    from eval.agent_runner import _check_workspace_after
+
+    (tmp_path / "a.md").write_text("内容\n\n", encoding="utf-8")
+    task = _task(workspace_after={"a.md": "内容"})
+
+    assert _check_workspace_after(None, task, str(tmp_path)) == []
+
+
+def test_文件缺失时报出来(tmp_path):
+    from eval.agent_runner import _check_workspace_after
+
+    task = _task(workspace_after={"missing.md": "内容"})
+    errors = _check_workspace_after(None, task, str(tmp_path))
+    assert len(errors) == 1 and "不存在" in errors[0]
+
+
+def test_期望为None表示应当已被删除(tmp_path):
+    from eval.agent_runner import _check_workspace_after
+
+    task = _task(workspace_after={"gone.md": None})
+    # 文件确实不在 → 通过
+    assert _check_workspace_after(None, task, str(tmp_path)) == []
+
+    # 文件还在 → 失败
+    (tmp_path / "gone.md").write_text("还在", encoding="utf-8")
+    errors = _check_workspace_after(None, task, str(tmp_path))
+    assert len(errors) == 1 and "应当已被删除" in errors[0]
+
+
+def test_越界路径被挡掉(tmp_path):
+    """夹具是我们自己写的，但一个手误的 `../` 会让检查去读工作区外面的文件。"""
+    from eval.agent_runner import _check_workspace_after
+
+    task = _task(workspace_after={"../outside.md": "x"})
+    errors = _check_workspace_after(None, task, str(tmp_path))
+    assert len(errors) == 1 and "越界" in errors[0]
+
+
+def test_声明了恢复却没有备份时算失败(tmp_path, monkeypatch):
+    """restore_latest 的前提是那次写真的留下了旧版本。没有就是缺陷本身。"""
+    from config import settings
+    from eval.agent_runner import _check_workspace_after
+    from services import fs_backup
+
+    monkeypatch.setattr(settings, "FS_BACKUP_DIR", str(tmp_path / "_b"))
+    monkeypatch.setattr(fs_backup, "list_for_user", lambda db, uid: [])
+
+    task = _task(restore_latest=True)
+    errors = _check_workspace_after(None, task, str(tmp_path))
+    assert any("没有任何可恢复的备份" in e for e in errors)
