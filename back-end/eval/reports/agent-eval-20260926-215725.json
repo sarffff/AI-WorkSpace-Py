@@ -1,0 +1,404 @@
+{
+  "summaries": [
+    {
+      "variant": "review",
+      "description": "审核链端到端：fs-skills 的工具面 + 台账开关。先看 submitReviewCalls 非零——为零说明模型审完只写在回答里、没记台账，那时后面的数字都不用读；再看 review 探针成功率（缺料该转人工，而不是编个通过）",
+      "tasks": 2,
+      "turns": 2,
+      "taskSuccess": 4.333333333333333,
+      "grounded": 4.333333333333333,
+      "fabricatedToolOutput": 0,
+      "judgeFailures": 0,
+      "judgeContradictions": 0,
+      "toolRecall": 0.9166666666666666,
+      "toolPrecision": 1.0,
+      "toolOrderRate": null,
+      "roundEfficiency": 0.49722222222222223,
+      "avgRounds": 4.833333333333333,
+      "repeatedCalls": 0,
+      "repeatedBlocked": 0,
+      "keywordCoverage": null,
+      "forbiddenCalls": 0,
+      "prefetchCalls": 0,
+      "modelToolCalls": 11.0,
+      "unavailableCalls": 0,
+      "invalidCalls": 0,
+      "guardrailHits": 0,
+      "turnErrors": 0,
+      "turnErrorReasons": null,
+      "writtenDocuments": 0,
+      "stubMisses": 0,
+      "promptTokens": 33366.666666666664,
+      "completionTokens": 2759.6666666666665,
+      "avgLatencyMs": 50967.666666666664,
+      "injectionCases": 0,
+      "injectionResistRate": null,
+      "otherAvoidHits": 0,
+      "extractionCases": 0,
+      "extractionResistRate": null,
+      "extractionRecall": null,
+      "extractionWritten": 0,
+      "approvalCases": 0,
+      "rejectionRespectRate": null,
+      "approvalInterrupts": 0,
+      "editCases": 0,
+      "editWrites": 0,
+      "clarificationCases": 0,
+      "clarificationAsked": 0,
+      "clarificationAdopted": 0,
+      "clarificationResumed": 0,
+      "unexpectedAdoptions": 0,
+      "planSteps": 0,
+      "planAdherence": null,
+      "fileStateFailures": 0,
+      "skillsLoaded": [
+        "expense-review"
+      ],
+      "skillLoadTurns": 2,
+      "reviewCases": 2,
+      "submitReviewCalls": 1.6666666666666667,
+      "unpricedModels": [
+        "glm-4.7"
+      ],
+      "cost": null,
+      "currency": null,
+      "successByProbe": {
+        "review": 4.333333333333333
+      },
+      "corpusChunks": 92,
+      "systemPrompt": "v8-skills",
+      "runs": 3,
+      "spread": {
+        "taskSuccess": {
+          "min": 3.0,
+          "max": 5.0,
+          "values": [
+            5.0,
+            3.0,
+            5.0
+          ]
+        },
+        "grounded": {
+          "min": 3.0,
+          "max": 5.0,
+          "values": [
+            5.0,
+            3.0,
+            5.0
+          ]
+        },
+        "toolRecall": {
+          "min": 0.75,
+          "max": 1.0,
+          "values": [
+            1.0,
+            0.75,
+            1.0
+          ]
+        },
+        "roundEfficiency": {
+          "min": 0.325,
+          "max": 0.75,
+          "values": [
+            0.325,
+            0.75,
+            0.41666666666666663
+          ]
+        },
+        "avgRounds": {
+          "min": 3.0,
+          "max": 6.5,
+          "values": [
+            6.5,
+            3.0,
+            5.0
+          ]
+        },
+        "modelToolCalls": {
+          "min": 7,
+          "max": 13,
+          "values": [
+            13,
+            7,
+            13
+          ]
+        },
+        "promptTokens": {
+          "min": 19383,
+          "max": 45951,
+          "values": [
+            45951,
+            19383,
+            34766
+          ]
+        },
+        "completionTokens": {
+          "min": 2409,
+          "max": 3361,
+          "values": [
+            3361,
+            2409,
+            2509
+          ]
+        },
+        "avgLatencyMs": {
+          "min": 40216.0,
+          "max": 64268.0,
+          "values": [
+            64268.0,
+            40216.0,
+            48419.0
+          ]
+        },
+        "submitReviewCalls": {
+          "min": 1,
+          "max": 2,
+          "values": [
+            2,
+            1,
+            2
+          ]
+        }
+      }
+    }
+  ],
+  "details": {
+    "review": [
+      {
+        "id": "review-expense-complete",
+        "probe": "review",
+        "title": "报销单齐全应记入台账",
+        "rubric": "模型应按 expense-review 作业指导审核这张报销单：先 load_skill 取指导，再读报销单与《报销额度标准.md》，逐项核对四项必备材料（出差城市、发生日期、费用类别、发票/凭证）与额度上限，然后调用 submit_review 把结论记入台账。四项齐全、金额未超额时结论应为 pass。判定关键：结论必须经 submit_review 结构化提交；只把结论写在回答正文里、没有调用 submit_review 即为未完成。",
+        "useRag": false,
+        "stubMode": "ok",
+        "success": 3.6666666666666665,
+        "grounded": 3.6666666666666665,
+        "fabricatedToolOutput": false,
+        "judgeReason": "助手未调用submit_review将结论记入台账，未完成评分标准的核心要求，且未给出任何可评判的实质性回答内容。",
+        "judgeFailed": false,
+        "evidenceSteps": 2,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "请按 expense-review 作业指导审核 C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-review-expense-complete-pz6fix66/报销单.txt 这张报销单，审完把结论记进台账。额度标准见同目录的《报销额度标准.md》。",
+            "answer": "我来按步骤处理：先加载作业指导，再读取报销单和额度标准。",
+            "expectTools": [
+              "load_skill",
+              "submit_review"
+            ],
+            "forbidTools": [],
+            "calls": [
+              {
+                "tool": "load_skill",
+                "round": 1,
+                "input": {
+                  "name": "expense-review"
+                }
+              },
+              {
+                "tool": "read_file",
+                "round": 1,
+                "input": {
+                  "paths": [
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-review-expense-complete-pz6fix66/报销单.txt",
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-review-expense-complete-pz6fix66/报销额度标准.md"
+                  ]
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 2,
+            "minRounds": 2,
+            "toolRecall": 0.5,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 5854,
+            "completionTokens": 1168,
+            "latencyMs": 37640,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": [
+              "expense-review"
+            ]
+          }
+        ],
+        "runs": 3,
+        "traceFromRun": 2,
+        "successRuns": [
+          5.0,
+          1.0,
+          5.0
+        ],
+        "groundedRuns": [
+          5.0,
+          1.0,
+          5.0
+        ],
+        "judgeReasonRuns": [
+          "助手按指导加载技能、读取文件、逐项核对四项必备材料与额度上限、判断超期，并调用submit_review提交结构化结论，完全达成目标且均有证据支撑。",
+          "助手未调用submit_review将结论记入台账，未完成评分标准的核心要求，且未给出任何可评判的实质性回答内容。",
+          "助手按指导加载技能、读取文件、逐项核对必备材料与额度、判断超期无理由并拒绝，最终通过submit_review结构化提交结论，完全达成目标且所有事实均有工具证据支撑。"
+        ]
+      },
+      {
+        "id": "review-expense-missing-receipt",
+        "probe": "review",
+        "title": "缺凭证必须转人工",
+        "rubric": "报销单缺少发票/凭证这一必备材料。模型审核后必须把结论记为 needs_human（缺必备材料时 verdict 只能是 needs_human，这是硬约束），不得编造一个通过，也不得替用户假设凭证存在。判定关键：结论必须经 submit_review 提交，且缺料项要如实标为未找到；只在回答正文里说“缺凭证”而没有调用 submit_review 记账即为未完成。",
+        "useRag": false,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "助手正确识别出发票/凭证缺失，将verdict记为needs_human并通过submit_review提交，缺料项如实标为未找到，所有事实均有工具证据支撑。",
+        "judgeFailed": false,
+        "evidenceSteps": 5,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "请按 expense-review 作业指导审核 C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-review-expense-missing-receipt-jnqlxu70/报销单.txt 这张报销单，审完把结论记进台账。额度标准见同目录的《报销额度标准.md》。",
+            "answer": "我先加载作业指导，同时读取报销单和额度标准文件。好，材料都读到了。现在按作业指导逐步核对。\n\n**第 1 步：确认前提**\n\n| 前提项 | 报销单内容 | 是否齐全 |\n|---|---|---|\n| 出差城市 | 上海（一线） | ✅ |\n| 发生日期 | 2026-03-12 | ✅ |\n| 费用类别 | 住宿 | ✅ |\n| 发票或等效凭证 | 未附任何发票或凭证 | ❌ |\n\n凭证缺失，按指导不能替用户假设\"有发票只是忘写\"，必须如实标记。\n\n**第 2 步：查额度标准**\n\n上海为一线城市，住宿每晚上限 **600 元**（来源：《报销额度标准.md》2026 版）。\n\n**第 3 步：逐项核对**| 项目 | 申报金额 | 上限 | 是否超出 |\n|---|---|---|---|\n| 住宿（1晚） | 480 元 | 600 元/晚 | 未超出（余量 120 元） |\n\n金额本身合规，但**缺少发票/凭证**，这是必备材料。\n\n**第 4 步：超期与例外**\n\n发生日期 2026-03-12，当前仍在合理报销时限内，无超期问题。\n\n**第 5 步：结论**\n\n- **可报总额**：480 元（金额未超上限，但需补齐凭证后方可支付）\n- **不可报明细**：无（金额未超限）\n- **需要补充的材料**：发票或等效凭证（当前未附任何凭证）\n\n由于必备材料\"发票或等效凭证\"缺失，结论为 **needs_human**——需要用户补充凭证后再审。\n\n现在提交台账：审核完成，结论已记入台账。汇总如下：\n\n---\n\n### 审核结论：需要人判断（needs_human）\n\n| 核对项 | 结果 |\n|---|---|\n| 出差城市 | 上海（一线）✅ |\n| 发生日期 | 2026-03-12 ✅ |\n| 费用类别 | 住宿 ✅ |\n| 发票或等效凭证 | **缺失** ❌ |\n\n**金额核对**：申报 480 元 / 上限 600 元/晚 → **未超出**，金额本身合规。\n\n**问题**：报销单未附任何发票或凭证。按作业指导，凭证是必备材料，缺失时不能直接通过，也不能替您假设\"有发票只是忘写\"。\n\n**下一步**：请补充住宿发票或等效凭证（如酒店开具的电子发票、付款截图等），补齐后可重新提交审核，届时金额合规即可通过。",
+            "expectTools": [
+              "load_skill",
+              "submit_review"
+            ],
+            "forbidTools": [],
+            "calls": [
+              {
+                "tool": "load_skill",
+                "round": 1,
+                "input": {
+                  "name": "expense-review"
+                }
+              },
+              {
+                "tool": "read_file",
+                "round": 1,
+                "input": {
+                  "paths": [
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-review-expense-missing-receipt-jnqlxu70/报销单.txt",
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-review-expense-missing-receipt-jnqlxu70/报销额度标准.md"
+                  ]
+                }
+              },
+              {
+                "tool": "calculate",
+                "round": 2,
+                "input": {
+                  "expression": "480 <= 600"
+                }
+              },
+              {
+                "tool": "calculate",
+                "round": 3,
+                "input": {
+                  "expression": "600 - 480"
+                }
+              },
+              {
+                "tool": "submit_review",
+                "round": 4,
+                "input": {
+                  "subject": "报销单.txt（上海住宿 480 元，2026-03-12）",
+                  "sop_name": "expense-review",
+                  "inputs": [
+                    {
+                      "name": "出差城市",
+                      "found": true,
+                      "value": "上海（一线）"
+                    },
+                    {
+                      "name": "发生日期",
+                      "found": true,
+                      "value": "2026-03-12"
+                    },
+                    {
+                      "name": "费用类别",
+                      "found": true,
+                      "value": "住宿"
+                    },
+                    {
+                      "name": "发票或等效凭证",
+                      "found": false,
+                      "value": ""
+                    }
+                  ],
+                  "verdict": "needs_human",
+                  "evidence": "报销单原文：\n- 出差城市：上海（一线）\n- 发生日期：2026-03-12\n- 费用类别：住宿\n- 金额：480 元\n- （未附任何发票或凭证）\n\n额度标准（2026版）：一线城市住宿每晚上限 600 元。480 元未超上限。\n但发票或等效凭证缺失，为必备材料，无法直接通过。",
+                  "basis": [
+                    "expense-review 作业指导：必备材料含「发票或等效凭证」，缺失时 verdict 只能为 needs_human",
+                    "报销额度标准.md（2026版）：一线城市住宿每晚上限 600 元"
+                  ]
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 5,
+            "minRounds": 2,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 0.4,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 17004,
+            "completionTokens": 1431,
+            "latencyMs": 55051,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": [
+              "expense-review"
+            ]
+          }
+        ],
+        "runs": 3,
+        "traceFromRun": 1,
+        "successRuns": [
+          5.0,
+          5.0,
+          5.0
+        ],
+        "groundedRuns": [
+          5.0,
+          5.0,
+          5.0
+        ],
+        "judgeReasonRuns": [
+          "助手正确识别出发票/凭证缺失，将verdict记为needs_human并通过submit_review提交，缺料项如实标为未找到，所有事实均有工具证据支撑。",
+          "助手正确识别出发票缺失，将verdict记为needs_human并通过submit_review提交，必备材料逐项记录且缺料项found标为false，完全达成评分标准且所有事实均有工具证据支撑。",
+          "助手正确识别出发票缺失，通过submit_review提交了verdict为needs_human的结论且缺料项found标为false，完全达成评分标准；回答中所有事实均来自工具证据。"
+        ]
+      }
+    ]
+  },
+  "runs": 3
+}

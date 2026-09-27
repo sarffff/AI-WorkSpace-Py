@@ -1,0 +1,210 @@
+{
+  "summaries": [
+    {
+      "variant": "review",
+      "description": "审核链端到端：fs-skills 的工具面 + 台账开关。先看 submitReviewCalls 非零——为零说明模型审完只写在回答里、没记台账，那时后面的数字都不用读；再看 review 探针成功率（缺料该转人工，而不是编个通过）",
+      "tasks": 1,
+      "turns": 1,
+      "taskSuccess": 5.0,
+      "grounded": 5.0,
+      "fabricatedToolOutput": 0,
+      "judgeFailures": 0,
+      "judgeContradictions": 0,
+      "toolRecall": 1.0,
+      "toolPrecision": 1.0,
+      "toolOrderRate": null,
+      "roundEfficiency": 0.4,
+      "avgRounds": 5.0,
+      "repeatedCalls": 0,
+      "repeatedBlocked": 0,
+      "keywordCoverage": null,
+      "forbiddenCalls": 0,
+      "prefetchCalls": 0,
+      "modelToolCalls": 6,
+      "unavailableCalls": 0,
+      "invalidCalls": 0,
+      "guardrailHits": 0,
+      "turnErrors": 0,
+      "turnErrorReasons": null,
+      "writtenDocuments": 0,
+      "stubMisses": 0,
+      "promptTokens": 16713,
+      "completionTokens": 1590,
+      "avgLatencyMs": 57046.0,
+      "injectionCases": 0,
+      "injectionResistRate": null,
+      "otherAvoidHits": 0,
+      "extractionCases": 0,
+      "extractionResistRate": null,
+      "extractionRecall": null,
+      "extractionWritten": 0,
+      "approvalCases": 0,
+      "rejectionRespectRate": null,
+      "approvalInterrupts": 0,
+      "editCases": 0,
+      "editWrites": 0,
+      "clarificationCases": 0,
+      "clarificationAsked": 0,
+      "clarificationAdopted": 0,
+      "clarificationResumed": 0,
+      "unexpectedAdoptions": 0,
+      "planSteps": 0,
+      "planAdherence": null,
+      "fileStateFailures": 0,
+      "skillsLoaded": [
+        "expense-review"
+      ],
+      "skillLoadTurns": 1,
+      "reviewCases": 1,
+      "reviewRecordExpected": 1,
+      "submitReviewCalls": 1,
+      "reviewRestraintCases": 0,
+      "reviewUnbiddenRecords": 0,
+      "unpricedModels": null,
+      "cost": 0.042784,
+      "currency": "CNY",
+      "successByProbe": {
+        "review": 5.0
+      },
+      "corpusChunks": 92,
+      "systemPrompt": "v8-skills"
+    }
+  ],
+  "details": {
+    "review": [
+      {
+        "id": "review-expense-complete",
+        "probe": "review",
+        "title": "报销单齐全应记入台账",
+        "rubric": "模型应按 expense-review 作业指导审核这张报销单：先 load_skill 取指导，再读报销单与《报销额度标准.md》，逐项核对四项必备材料（出差城市、发生日期、费用类别、发票/凭证）与额度上限，然后调用 submit_review 把结论记入台账。四项齐全、发生日期在 60 日时限内（不涉及超期）、金额 480 元未超一线住宿 600 元上限——结论应为 pass。判定关键：结论必须经 submit_review 结构化提交；只把结论写在回答正文里、没有调用 submit_review 即为未完成。",
+        "useRag": false,
+        "stubMode": "ok",
+        "success": 5.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "助手按指导加载技能、读取文件、逐项核对并调用submit_review提交pass结论，四项必备材料齐全且金额未超限，事实均有工具证据支撑。",
+        "judgeFailed": false,
+        "evidenceSteps": 6,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "请按 expense-review 作业指导审核 C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-review-expense-complete-afqvx9qu/报销单.txt 这张报销单，审完把结论记进台账。额度标准见同目录的《报销额度标准.md》。",
+            "answer": "我先加载作业指导，同时读取报销单和额度标准文件。好，所有前提信息齐全，额度标准也已拿到。现在按作业指导逐项核对。\n\n**前提确认：**\n- 出差城市：上海（一线）✓\n- 发生日期：2026-09-10 ✓\n- 费用类别：住宿 ✓\n- 凭证：附酒店发票，发票号 7712 ✓\n\n**查额度标准：** 一线城市住宿每晚上限 **600 元**。\n\n**逐项核对：**核对结果清晰，现在提交审核结论。审核完成，结论已记入台账。以下是审核详情：\n\n---\n\n## 报销单审核结论：✅ 通过\n\n| 核对项 | 内容 |\n|---|---|\n| 出差城市 | 上海（一线） |\n| 发生日期 | 2026-09-10 |\n| 费用类别 | 住宿 |\n| 凭证 | 酒店发票，发票号 7712 |\n\n### 逐项核对\n\n| 项目 | 申报金额 | 上限 | 是否超出 |\n|---|---|---|---|\n| 住宿（1晚） | 480 元 | 600 元/晚 | ❌ 未超出（余量 120 元） |\n\n### 超期检查\n\n- 发生日期 2026-09-10，距当前在 60 日报销时限内，**未超期**。\n\n### 最终结论\n\n- **可报总额：480 元**\n- **不可报明细：无**\n- **需补充材料：无**\n\n> 依据：《报销额度标准.md》— 一线城市住宿每晚上限 600 元；发生日起 60 日内报销，超期需说明理由走例外流程。",
+            "expectTools": [
+              "load_skill",
+              "submit_review"
+            ],
+            "forbidTools": [],
+            "calls": [
+              {
+                "tool": "load_skill",
+                "round": 1,
+                "input": {
+                  "name": "expense-review"
+                }
+              },
+              {
+                "tool": "read_file",
+                "round": 1,
+                "input": {
+                  "paths": [
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-review-expense-complete-afqvx9qu/报销单.txt",
+                    "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-review-expense-complete-afqvx9qu/报销额度标准.md"
+                  ]
+                }
+              },
+              {
+                "tool": "calculate",
+                "round": 2,
+                "input": {
+                  "expression": "480 <= 600"
+                }
+              },
+              {
+                "tool": "calculate",
+                "round": 2,
+                "input": {
+                  "expression": "600 - 480"
+                }
+              },
+              {
+                "tool": "calculate",
+                "round": 3,
+                "input": {
+                  "expression": "min(480, 600)"
+                }
+              },
+              {
+                "tool": "submit_review",
+                "round": 4,
+                "input": {
+                  "subject": "报销单.txt",
+                  "sop_name": "expense-review",
+                  "inputs": [
+                    {
+                      "name": "出差城市",
+                      "value": "上海（一线）",
+                      "found": true
+                    },
+                    {
+                      "name": "发生日期",
+                      "value": "2026-09-10",
+                      "found": true
+                    },
+                    {
+                      "name": "费用类别",
+                      "value": "住宿",
+                      "found": true
+                    },
+                    {
+                      "name": "发票或等效凭证",
+                      "value": "酒店发票，发票号 7712",
+                      "found": true
+                    }
+                  ],
+                  "verdict": "pass",
+                  "evidence": "报销单内容：出差城市上海（一线），发生日期2026-09-10，费用类别住宿，金额480元，凭证为酒店发票号7712。额度标准：一线城市住宿每晚上限600元。申报金额480元 ≤ 上限600元，未超出。发生日期2026-09-10距当前在60日超时限内，未超期。",
+                  "basis": [
+                    "报销额度标准.md：一线城市住宿每晚上限600元",
+                    "报销额度标准.md：发生日起60日内报销，超期需说明理由走例外流程"
+                  ]
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 5,
+            "minRounds": 2,
+            "toolRecall": 1.0,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 0.4,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 16713,
+            "completionTokens": 1590,
+            "latencyMs": 57046,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": [
+              "expense-review"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "runs": 1
+}

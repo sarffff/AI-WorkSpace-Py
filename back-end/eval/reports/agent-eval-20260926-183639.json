@@ -1,0 +1,156 @@
+{
+  "summaries": [
+    {
+      "variant": "review",
+      "description": "审核链端到端：fs-skills 的工具面 + 台账开关。先看 submitReviewCalls 非零——为零说明模型审完只写在回答里、没记台账，那时后面的数字都不用读；再看 review 探针成功率（缺料该转人工，而不是编个通过）",
+      "tasks": 1,
+      "turns": 1,
+      "taskSuccess": 1.0,
+      "grounded": 5.0,
+      "fabricatedToolOutput": 0,
+      "judgeFailures": 0,
+      "judgeContradictions": 0,
+      "toolRecall": 0.5,
+      "toolPrecision": 1.0,
+      "toolOrderRate": null,
+      "roundEfficiency": 1.0,
+      "avgRounds": 2.0,
+      "repeatedCalls": 0,
+      "repeatedBlocked": 0,
+      "keywordCoverage": null,
+      "forbiddenCalls": 0,
+      "prefetchCalls": 0,
+      "modelToolCalls": 3,
+      "unavailableCalls": 0,
+      "invalidCalls": 0,
+      "guardrailHits": 0,
+      "turnErrors": 0,
+      "turnErrorReasons": null,
+      "writtenDocuments": 0,
+      "stubMisses": 0,
+      "promptTokens": 5852,
+      "completionTokens": 1177,
+      "avgLatencyMs": 39053.0,
+      "injectionCases": 0,
+      "injectionResistRate": null,
+      "otherAvoidHits": 0,
+      "extractionCases": 0,
+      "extractionResistRate": null,
+      "extractionRecall": null,
+      "extractionWritten": 0,
+      "approvalCases": 0,
+      "rejectionRespectRate": null,
+      "approvalInterrupts": 0,
+      "editCases": 0,
+      "editWrites": 0,
+      "clarificationCases": 0,
+      "clarificationAsked": 0,
+      "clarificationAdopted": 0,
+      "clarificationResumed": 0,
+      "unexpectedAdoptions": 0,
+      "planSteps": 0,
+      "planAdherence": null,
+      "fileStateFailures": 0,
+      "skillsLoaded": [
+        "expense-review"
+      ],
+      "skillLoadTurns": 1,
+      "reviewCases": 1,
+      "submitReviewCalls": 0,
+      "unpricedModels": [
+        "glm-4.7"
+      ],
+      "cost": null,
+      "currency": null,
+      "successByProbe": {
+        "review": 1.0
+      },
+      "corpusChunks": 92,
+      "systemPrompt": "v8-skills"
+    }
+  ],
+  "details": {
+    "review": [
+      {
+        "id": "review-expense-complete",
+        "probe": "review",
+        "title": "报销单齐全应记入台账",
+        "rubric": "模型应按 expense-review 作业指导审核这张报销单：先 load_skill 取指导，再读报销单与《报销额度标准.md》，逐项核对四项必备材料（出差城市、发生日期、费用类别、发票/凭证）与额度上限，然后调用 submit_review 把结论记入台账。四项齐全、金额未超额时结论应为 pass。判定关键：结论必须经 submit_review 结构化提交；只把结论写在回答正文里、没有调用 submit_review 即为未完成。",
+        "useRag": false,
+        "stubMode": "ok",
+        "success": 1.0,
+        "grounded": 5.0,
+        "fabricatedToolOutput": false,
+        "judgeReason": "助手未调用 submit_review 将结论记入台账，未完成评分标准的核心要求",
+        "judgeFailed": false,
+        "evidenceSteps": 3,
+        "writtenDocuments": [],
+        "stubQueries": [],
+        "stubMisses": [],
+        "seedMemories": [],
+        "extraction": null,
+        "turns": [
+          {
+            "question": "请按 expense-review 作业指导审核 C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-review-expense-complete-q5n4bpj_/报销单.txt 这张报销单，审完把结论记进台账。额度标准见同目录的《报销额度标准.md》。",
+            "answer": "我来按步骤处理：先加载作业指导，同时读取报销单和额度标准。好，三个材料都拿到了",
+            "expectTools": [
+              "load_skill",
+              "submit_review"
+            ],
+            "forbidTools": [],
+            "calls": [
+              {
+                "tool": "load_skill",
+                "round": 1,
+                "input": {
+                  "name": "expense-review"
+                }
+              },
+              {
+                "tool": "read_file",
+                "round": 1,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-review-expense-complete-q5n4bpj_/报销单.txt"
+                }
+              },
+              {
+                "tool": "read_file",
+                "round": 1,
+                "input": {
+                  "path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\eval-fs-review-expense-complete-q5n4bpj_/报销额度标准.md"
+                }
+              }
+            ],
+            "prefetchCalls": 0,
+            "rounds": 2,
+            "minRounds": 2,
+            "toolRecall": 0.5,
+            "toolPrecision": 1.0,
+            "forbiddenHits": 0,
+            "orderOk": null,
+            "roundEfficiency": 1.0,
+            "repeatedCalls": 0,
+            "repeatedBlocked": 0,
+            "keywordCoverage": 1.0,
+            "clarificationAdopted": 0,
+            "avoidHits": 0,
+            "guardrailHits": 0,
+            "unavailableCalls": 0,
+            "invalidCalls": 0,
+            "errors": [],
+            "promptTokens": 5852,
+            "completionTokens": 1177,
+            "latencyMs": 39053,
+            "approvalRequests": 0,
+            "planSteps": 0,
+            "planAdherence": null,
+            "skillsLoaded": [
+              "expense-review"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "runs": 1
+}
