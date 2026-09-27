@@ -1700,6 +1700,9 @@ class ChatService:
         # 本次进入循环累计退了多少字符。**不进 state**：恢复是新建 trace 的，
         # 埋点本来就按 trace 分段，跨请求累加会把两段执行的数混成一个。
         reclaimed_total = 0
+        # 本次执行是否已催过一次空转(不进 state,同 reclaimed_total):催办只做一次,
+        # 再空转就升级强制收尾。
+        stall_nudged = False
         # 恢复进来时本轮的工具还没跑完:跳过模型调用,直接进工具执行段。
         resuming = bool(state.pending_calls) and state.pending_index < len(
             state.pending_calls
@@ -1810,6 +1813,33 @@ class ChatService:
                     remainder = completion.content[completion.streamed_length :]
                     if remainder.strip():
                         yield {"type": "message_delta", "content": remainder}
+                    # 中途空转:模型这一轮既没作答、也没调工具,但前面已动过工具、本该
+                    # 继续。把这种空补全当 done 收尾,会落一个只有前导语的空回答——审核链
+                    # 上就是"说要记账、台账却空",典型的"看起来成功的失败"。所以先补一轮
+                    # 催办让它继续。判据四条缺一不可:非最后一轮、本轮没吐字、没有补发正文、
+                    # 且已过第一轮(round_index==1 的整回合零产出交给下面 empty_answer 报错,
+                    # 不催)。催过一次仍空转就升级 force_final,由 max_rounds 兜底、不会无限催。
+                    is_stall = (
+                        not is_final_round
+                        and not round_streamed_text
+                        and not remainder.strip()
+                        and round_index > 1
+                    )
+                    if is_stall:
+                        if stall_nudged:
+                            force_final = True
+                            state.force_final = True
+                        else:
+                            stall_nudged = True
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": "[系统提示] 你这一轮既没有给出结论、"
+                                    "也没有调用任何工具。请继续：要么调用你还需要的工具"
+                                    "把任务做完，要么基于已经获得的信息给出最终回答。",
+                                }
+                            )
+                        continue
                     if remainder.strip() or emitted_any:
                         # 正文里问了问题就收编成一次澄清中断,而不是收尾。
                         #

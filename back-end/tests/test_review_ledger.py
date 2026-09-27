@@ -378,9 +378,11 @@ def test_默认不开复审时不发额外调用(sop, db_real):
 def test_台账记的runs是1表示没做一致性检查(sop, db_real):
     """runs=1 且 agreed=True 读作"没检查过"，不是"检查过并且一致"。
 
-    一致性检查（review_consensus）还没接到这条路上——它从一个 prompt 采样 N 次，
-    而这个工具收到的是模型一次调用给的结论。台账上这两者必须分得开，否则一条
-    没检查过的结论会看起来像通过了复审。
+    默认 ``REVIEW_CONSENSUS_RUNS=1``：``verify_submission`` 提前返回、不重采样，
+    于是落库 runs=1。复审本身是**接好的**（submit_review 调 verify_submission，见
+    review_tools），只是默认不开——所以这条 runs=1 的含义是"这次没做一致性检查"，
+    不是"检查过并且一致"。台账上这两者必须分得开，否则一条没检查过的结论会看起来
+    像通过了复审。
     """
     _call(_tool(db_real)["submit_review"], **_ok_args())
     row = db_real.query(ReviewRecord).one()

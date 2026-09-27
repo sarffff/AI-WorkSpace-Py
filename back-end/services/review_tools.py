@@ -19,15 +19,13 @@ validator（缺料就只能 needs_human）于是变成一道**执行不下去**�
 
 需要人接手的是 ``needs_human`` 那一档，入口在台账的待办筛选，不在弹窗。
 
-## 与 review_consensus 的关系：还没接上
+## 与 review_consensus 的关系：已接上，默认不开
 
-``review_consensus.generate`` 从一个 prompt 采样 N 次再比对，这个工具收到的是
-模型**一次**调用给的结论——两者不能直接组合。要接上需要一个"专门的审核步骤"
-持有材料并自己采样，那是下一步。
-
-所以这里落库时 ``runs=1, agreed=True``，而按 ``combine`` 的约定它读作
-**"没做一致性检查"**，不是"检查过并且一致"。台账上这两者必须分得开，
-否则一条没检查过的结论会看起来像通过了复审。
+``submit_review`` 拿到模型**一次**调用的结论后交给 ``review_consensus.verify_submission``
+（见下方落库处）：这份算第一个样本,再独立重采样 ``REVIEW_CONSENSUS_RUNS - 1`` 次逐字段
+比对,不一致就把落库结论换成合成的 needs_human。默认 ``=1`` 时它提前返回、不发额外调用,
+落库 ``runs=1, agreed=True``——按 ``combine`` 的约定读作"没做一致性检查",不是"检查过且
+一致",台账上这两者必须分得开。要真开复审,把它调到 ≥2。
 """
 from __future__ import annotations
 

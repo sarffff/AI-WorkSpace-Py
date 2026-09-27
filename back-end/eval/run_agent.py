@@ -170,6 +170,57 @@ def _render_interrupt_chains(summaries: list[dict[str, Any]]) -> list[str]:
     ]
 
 
+def _render_review_chain(summaries: list[dict[str, Any]]) -> list[str]:
+    """审核链:审 review 用例时,模型有没有在该记账时调 submit_review、又在不该记账时忍住。
+
+    两行各配自己的分母:记账率用 ``reviewRecordExpected``(expect_tools 点了 submit_review
+    的用例),未经要求记账率用 ``reviewRestraintCases``(forbid_tools 点了的)。分子必须配
+    分母——``submitReviewCalls`` 单看为 0 像"功能坏了",写成 ``0 / N 用例`` 才看得出是
+    "这条路没被走进去"。两个分母都为 0 时整节不渲染(``0 / 0`` 会被读成"坏了")。
+    """
+    record_cells: list[str] = []
+    restraint_cells: list[str] = []
+    any_case = False
+    any_restraint = False
+    for summary in summaries:
+        denominator = summary.get("reviewRecordExpected")
+        if not denominator:
+            record_cells.append("-")
+        else:
+            any_case = True
+            record_cells.append(
+                f"{_format(summary.get('submitReviewCalls'))} / {denominator} 用例"
+            )
+        restraint_total = summary.get("reviewRestraintCases")
+        if not restraint_total:
+            restraint_cells.append("-")
+        else:
+            any_restraint = True
+            restraint_cells.append(
+                f"{_format(summary.get('reviewUnbiddenRecords'))} / {restraint_total} 用例"
+            )
+    if not any_case and not any_restraint:
+        return []
+    header = "| 审核链 | " + " | ".join(s["variant"] for s in summaries) + " |"
+    divider = "| " + " | ".join("---" for _ in range(len(summaries) + 1)) + " |"
+    rows = ["", "## 审核链", "", header, divider]
+    if any_case:
+        rows.append("| 记入台账（应记账用例） | " + " | ".join(record_cells) + " |")
+    if any_restraint:
+        rows.append("| 未经要求记账（不应记账用例） | " + " | ".join(restraint_cells) + " |")
+    rows += [
+        "",
+        "记账率分子为 0 = 模型审完没调 submit_review，结论只留在回答正文里、台账是空的"
+        "——那正是这套东西要取代的形状，此时 review 探针的成功率不用再读。"
+        "分子非零但成功率低，才轮到看 verdict 判得对不对（缺料该 needs_human、超额该 reject）。",
+        "",
+        "“未经要求记账”是反向信号：分子非零 = 用户没要求记账、模型却调了 submit_review，"
+        "那是一次未经授权的状态变更（同 write-unbidden 那条“没让保存就不该写”）。"
+        "两行要一起读——一个永远不记的退化实现记账率是 0（坏）、这条却满分（假好）。",
+    ]
+    return rows
+
+
 def _corpus_line(summaries: list[dict[str, Any]]) -> list[str]:
     """语料分块数,作为"这轮测的哪版语料"的指纹。理由见 ``eval/run.py`` 同名函数。
 
@@ -221,6 +272,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.append(f"| {summary['variant']} | " + " | ".join(cells) + " |")
 
     lines += _render_interrupt_chains(summaries)
+    lines += _render_review_chain(summaries)
 
     # 出错轮次的原因。「出错轮次 2」单看读不出是"跑崩了"还是"功能没被走进去",
     # 而两者的处置完全相反。计数在诊断表里,原因必须跟着一起出现。

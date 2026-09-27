@@ -98,6 +98,78 @@ def test_加载返回正文与附件清单(skills_dir, db_real):
     assert loaded.names == ["expense"]
 
 
+def test_加载把必备材料的准确名字显示出来(tmp_path, db_real, monkeypatch):
+    """审核型 SOP 加载时要把 required_inputs 的**准确名字**显示给模型。
+
+    submit_review 的 inputs[].name 和 required_inputs 是精确集合匹配（见
+    review_tools）。而正文是散文，常把两项并成一句——这份指导正文只写"出差城市与
+    日期"，而 required_inputs 里是拆开的两项。模型照正文起名就把两项写成一条、
+    提交时被打回，要多花几轮才拆回来（181334 评估里实测到这条摆动）。把准确名字
+    显示出来，模型照抄即可，不必从散文里猜。
+
+    断言用**散文里没有的**那几项（发生日期 / 费用类别 / 发票或等效凭证）：它们只可能
+    来自这段清单，正文里根本没有，所以这条不会因为正文碰巧提到而假绿。
+    """
+    monkeypatch.setattr(settings, "REVIEW_LEDGER_ENABLED", True)
+    monkeypatch.setattr(skill_library, "SKILL_DIR", str(tmp_path))
+    monkeypatch.setattr(skill_library, "_builtin", None)
+    directory = tmp_path / "review-x"
+    directory.mkdir()
+    (directory / "SKILL.md").write_text(
+        "---\nname: review-x\ndescription: 审核报销单\n"
+        "required_inputs: 出差城市, 发生日期, 费用类别, 发票或等效凭证\n---\n"
+        "先确认出差城市与日期。",  # 正文故意把两项并成一句，复刻 expense-review 的陷阱
+        encoding="utf-8",
+    )
+    skill_library.reload()
+
+    tools, _loaded = _tools(db_real)
+    result = _call(tools["load_skill"], name="review-x")
+
+    assert "必备材料" in result
+    for name in ("出差城市", "发生日期", "费用类别", "发票或等效凭证"):
+        assert name in result, f"必备材料 {name!r} 没有显示给模型"
+    assert "submit_review" in result
+
+
+def test_没有必备材料的skill不显示材料清单(skills_dir, db_real, monkeypatch):
+    """写作型 SOP（没有 required_inputs）加载时不该出现材料清单。
+
+    反向守卫:这段清单只对审核型有意义。给纯指令 SOP 也挂上，等于每次加载都被一段
+    无关的话污染，还会提到一个这份 SOP 根本不会用的 submit_review。
+    """
+    monkeypatch.setattr(settings, "REVIEW_LEDGER_ENABLED", True)
+    tools, _loaded = _tools(db_real)
+    result = _call(tools["load_skill"], name="expense")  # skills_dir 这份没有 required_inputs
+
+    assert "必备材料" not in result
+    assert "submit_review" not in result
+
+
+def test_台账关掉时加载不提submit_review(tmp_path, db_real, monkeypatch):
+    """required_inputs 非空但 REVIEW_LEDGER_ENABLED 关着时,submit_review 根本没注册。
+
+    反向守卫:此时提它只会让模型去调一个不存在的工具。条件必须和 review_tools.build
+    的注册闸门一致，否则清单和工具面对不上。
+    """
+    monkeypatch.setattr(settings, "REVIEW_LEDGER_ENABLED", False)
+    monkeypatch.setattr(skill_library, "SKILL_DIR", str(tmp_path))
+    monkeypatch.setattr(skill_library, "_builtin", None)
+    directory = tmp_path / "review-x"
+    directory.mkdir()
+    (directory / "SKILL.md").write_text(
+        "---\nname: review-x\ndescription: 审核\n"
+        "required_inputs: 金额, 凭证\n---\n照这个审。",
+        encoding="utf-8",
+    )
+    skill_library.reload()
+
+    tools, _loaded = _tools(db_real)
+    result = _call(tools["load_skill"], name="review-x")
+
+    assert "submit_review" not in result
+
+
 def test_不存在的skill会列出可用的(skills_dir, db_real):
     """模型下一步该做的是换一个名字或者放弃，两件事都需要知道有哪些。"""
     tools, _loaded = _tools(db_real)

@@ -94,6 +94,81 @@ def test_声明了工具的用例必须真的能拿到那个工具():
                 )
 
 
+def test_review用例在review变体下能拿到submit_review与load_skill():
+    """审核链评估的核心动作（load_skill + submit_review）在 review 变体下必须能注册。
+
+    这条拦的是审核链评估**自身**被静默掏空的那种失效：submit_review 由
+    ``REVIEW_LEDGER_ENABLED`` 门控、load_skill 由 ``SKILL_ENABLED`` 门控。变体漏掉
+    任一个，工具压根不注册，模型当然不调，于是 ``submitReviewCalls`` 恒为 0——
+    而报告会把那个 0 读成"模型审完不记账、结论只写在正文里"（那正是要发现的失效），
+    实际却是"工具没上桌"。两件事处置相反，而在 0 上完全同形。
+
+    工具注册逻辑本身（ledger 开 + 有声明 required_inputs 的 SOP → submit_review 上桌）
+    由 test_review_ledger.test_循环的工具面里真有submit_review 覆盖，用的是真数据库
+    会话；这里是它的静态那一半——只钉"变体有没有把该开的开关开上",不需要模型也
+    不需要库。submit_review 另需工作区有声明 required_inputs 的 SOP,内置
+    expense-review 满足,SKILL_ENABLED 开着即可见。
+    """
+    review_tasks = [task for task in TASKS if task.probe == "review"]
+    assert review_tasks, "没有 review 用例，审核链评估没有样本"
+    # 至少一条真的点名 submit_review，否则下面的循环是空转，守卫形同虚设
+    assert any(
+        "submit_review" in turn.expect_tools
+        for task in review_tasks
+        for turn in task.turns
+    ), "review 用例里没有任何一条期望 submit_review"
+
+    gated = {
+        "load_skill": "SKILL_ENABLED",
+        "read_skill_file": "SKILL_ENABLED",
+        "submit_review": "REVIEW_LEDGER_ENABLED",
+        "read_file": "TOOL_FS_ENABLED",
+    }
+    variant = AGENT_VARIANTS["review"]
+    for task in review_tasks:
+        for index, turn in enumerate(task.turns, start=1):
+            for tool in turn.expect_tools:
+                flag = gated.get(tool)
+                if flag is None:
+                    continue
+                enabled = task.settings_overrides.get(
+                    flag, variant.overrides.get(flag, getattr(Settings(), flag))
+                )
+                assert enabled, (
+                    f"{task.id} 第 {index} 轮期望 {tool}，但 {flag} 在 review 变体下是关的"
+                    f"——submitReviewCalls 会恒为 0，而那个 0 会被读成"
+                    f"“模型不记账”，实际是工具没上桌"
+                )
+
+
+def test_禁止记账的用例在review变体下submit_review确实上桌():
+    """restraint 用例（forbid submit_review）只有在 submit_review 真注册时才有意义。
+
+    正向那条（上一条）钉"该开的开关开着"；这条是它的镜像：被禁的工具必须**确实
+    可调**。否则模型压根调不到 submit_review，forbidden_hits 恒为 0——那不是
+    "模型忍住了没记账"，是"工具没上桌"，而 reviewUnbiddenRecords 会把这个假 0
+    读成"防线完美"。submit_review 上桌要 REVIEW_LEDGER_ENABLED + SKILL_ENABLED
+    （后者让内置 expense-review 可见，它声明了 required_inputs）都开着。
+    """
+    restraint = [
+        task
+        for task in TASKS
+        if task.probe == "review"
+        and any("submit_review" in turn.forbid_tools for turn in task.turns)
+    ]
+    assert restraint, "没有 restraint 用例，未经要求记账那条链没有样本"
+    variant = AGENT_VARIANTS["review"]
+    for task in restraint:
+        for flag in ("REVIEW_LEDGER_ENABLED", "SKILL_ENABLED"):
+            enabled = task.settings_overrides.get(
+                flag, variant.overrides.get(flag, getattr(Settings(), flag))
+            )
+            assert enabled, (
+                f"{task.id} 禁止 submit_review，但 {flag} 在 review 变体下是关的"
+                f"——forbidden_hits 恒为 0，reviewUnbiddenRecords 会把这个假 0 读成防线完美"
+            )
+
+
 def test_任务级覆盖只收布尔与数值且必须是真配置项():
     """拼错的开关名在运行时是静默不生效,而用例照常给分——量的却不是它声称的东西。"""
     from eval.agent_runner import _parse_overrides

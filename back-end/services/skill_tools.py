@@ -89,15 +89,29 @@ def _build_load_tool(
         # 它和知识库分块、网页、文件内容不是一类东西：那些是检索来的素材，
         # 这个是组织自己下发的规程。用 shield 包起来反而会让模型把它当素材看待，
         # 而它本来就该被当成指令执行。
-        return (
-            f"[作业指导《{skill.name}》]\n{skill.instructions}\n"
-            + (
+        parts = [f"[作业指导《{skill.name}》]\n{skill.instructions}"]
+
+        # 审核型 SOP:把必备材料的准确名字显示到模型要用它的地方。submit_review 的
+        # inputs[].name 与 required_inputs 是精确集合匹配(那道逐项核对的门,见 review_tools),
+        # 而正文是散文、常把两项并成一句(expense-review 就把"出差城市"和"发生日期"并成
+        # "出差城市与日期"),模型照抄就对不上、被打回、多花几轮甚至耗光轮次没记成账。这不是
+        # 再劝一遍"记得对齐"——名字本就在结构里,这里只把它显示出来让模型照抄;约束仍由
+        # review_tools 的精确匹配强制。只在 submit_review 真注册时才给(开关开着且这份 SOP
+        # 声明了必备材料),否则等于让模型去调一个不存在的工具。
+        if skill.required_inputs and settings.REVIEW_LEDGER_ENABLED:
+            listed = "\n".join(f"- {item}" for item in skill.required_inputs)
+            parts.append(
+                "\n[必备材料——提交 submit_review 时 inputs 的 name 要逐字用下面这些，"
+                "一项一条、不要把两项并成一条，拿不准就把 found 填 false：\n"
+                f"{listed}]"
+            )
+
+        if skill.attachments:
+            parts.append(
                 f"\n[本指导附带以下文件，需要时用 read_skill_file 读取："
                 f"{'、'.join(skill.attachments)}]"
-                if skill.attachments
-                else ""
             )
-        )
+        return "\n".join(parts)
 
     return ToolDefinition(
         name="load_skill",

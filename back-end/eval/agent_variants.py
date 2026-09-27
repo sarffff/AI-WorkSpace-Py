@@ -370,7 +370,53 @@ AGENT_VARIANTS: dict[str, AgentVariant] = {
             "AGENT_MAX_TOOL_ROUNDS": 10,
         },
     ),
+    # 2026-09-26 加。审核链(submit_review + 复审 + 台账)此前零评估覆盖,先回答最基本
+    # 的问题:模型到底会不会调 submit_review,还是审完只把结论写进正文——后者台账永远
+    # 是空的,而那正是这套东西要取代的形状。配置沿用 fs-skills(读 SOP + 读材料)再加台账
+    # 开关;刻意不改提示词去"提醒记账"——那是措辞路子、本仓库 0/6,先量再决定上不上机制。
+    # 读数顺序:先看 submitReviewCalls 非零(为 0 = 没记账,后面不用看),再看 review 探针
+    # 成功率(缺料该 needs_human,而不是编个通过)。
+    "review": AgentVariant(
+        name="review",
+        description=(
+            "审核链端到端：fs-skills 的工具面 + 台账开关。先看 submitReviewCalls "
+            "非零——为零说明模型审完只写在回答里、没记台账，那时后面的数字都不用读；"
+            "再看 review 探针成功率（缺料该转人工，而不是编个通过）"
+        ),
+        overrides={
+            **_BASE,
+            # —— 跟 fs-skills 一致（审核要读 SOP + 读材料）——
+            "TOOL_FS_ENABLED": True,
+            "TOOL_FS_WRITE_ENABLED": True,
+            "TOOL_FS_DELETE_ENABLED": False,
+            "SKILL_ENABLED": True,
+            "SKILL_PREEMPTS_PREFETCH": True,
+            "SKILL_PREEMPT_SIMILARITY": 0.58,
+            "PROMPT_CHAT_SYSTEM_VERSION": "v8-skills",
+            "AGENT_MAX_TOOL_ROUNDS": 10,
+            # —— 审核链本身 ——
+            "REVIEW_LEDGER_ENABLED": True,
+            "REVIEW_CONSENSUS_RUNS": 1,
+        },
+    ),
 }
+
+
+# 复审 A/B:和 review 唯一的差别是 REVIEW_CONSENSUS_RUNS=2。单独一个变体好让两行并排
+# 对照——review 审一次,这行审两次、逐字段比对、不一致就把落库结论换成合成 needs_human。
+# 量的是值不值:每条 submit_review 多发 N-1=1 次模型调用(成本),换来抓住"第一次判得不稳"
+# 的那些。派生自 review.overrides 而非重抄:review 工具面若改,这里自动跟上。读法:两变体
+# submitReviewCalls 应一样(复审不改记不记账,只改记哪个结论),差异落在 review 成功率与
+# needs_human 占比、连 cost 一起判这笔加固值不值。
+AGENT_VARIANTS["review-consensus"] = AgentVariant(
+    name="review-consensus",
+    description=(
+        "审核链 + 自洽复审（REVIEW_CONSENSUS_RUNS=2）。和 review 变体唯一的差别是复审"
+        "开着——对照 review 读：审两次、逐字段比对、不一致就转人工，量的是这笔多一次"
+        "模型调用的交易值不值（抓住模型第一次判得不稳的那些）"
+    ),
+    overrides={**AGENT_VARIANTS["review"].overrides, "REVIEW_CONSENSUS_RUNS": 2},
+)
 
 
 def resolve(names: list[str] | None) -> list[AgentVariant]:

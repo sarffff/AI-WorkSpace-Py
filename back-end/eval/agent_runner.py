@@ -494,20 +494,34 @@ def preflight_for(tasks: list[AgentTask]) -> list[str]:
     ``approval_requests`` 是 0、``rejectionRespectRate`` 变成 None,报告上看不出
     任何异常——只是那一列静静地空着。和这个仓库里已经踩过的几次一模一样。
     """
-    if not any(turn.approval for task in tasks for turn in task.turns):
+    needs_approval = any(turn.approval for task in tasks for turn in task.turns)
+    # review 用例落库到 review_verdicts。缺表时记账会失败,submitReviewCalls 量到的就不是
+    # "模型肯不肯记账"而是"表在不在"——静默的环境缺陷冒充成模型行为,同 approval 缺快照表。
+    needs_review = any(task.probe == "review" for task in tasks)
+    if not needs_approval and not needs_review:
         return []
     try:
         tables = set(inspect(engine).get_table_names())
     except Exception as exc:
         return [f"无法连接数据库：{type(exc).__name__}"]
-    missing = [name for name in ("agent_runs", "agent_checkpoints") if name not in tables]
-    if not missing:
-        return []
-    return [
-        f"选中的 approval 用例需要快照表，但缺少 {', '.join(missing)}"
-        "——先执行 alembic upgrade head。缺表时审批门会退化成不拦，"
-        "写操作照常执行，而拒绝遵从率只会显示为 '-'。"
-    ]
+    problems: list[str] = []
+    if needs_approval:
+        missing = [
+            name for name in ("agent_runs", "agent_checkpoints") if name not in tables
+        ]
+        if missing:
+            problems.append(
+                f"选中的 approval 用例需要快照表，但缺少 {', '.join(missing)}"
+                "——先执行 alembic upgrade head。缺表时审批门会退化成不拦，"
+                "写操作照常执行，而拒绝遵从率只会显示为 '-'。"
+            )
+    if needs_review and "review_verdicts" not in tables:
+        problems.append(
+            "选中的 review 用例需要 review_verdicts 表，但它不存在"
+            "——先执行 alembic upgrade head。缺表时 submit_review 记账失败，"
+            "submitReviewCalls 量到的会是「表在不在」而不是「模型肯不肯记账」。"
+        )
+    return problems
 
 
 def _span_totals(
@@ -1091,7 +1105,11 @@ async def _drive_turn(
         message_id=user_message_id,
         # 温度 0：见模块说明第 4 条
         temperature=0.0,
-        max_tokens=1024,
+        # 和产品默认(settings_service.DEFAULT_PREFERENCES["maxTokens"]=2048)对齐,不再
+        # 写死 1024。1024 是测量假象:glm-4.7 先花预算思考,review-expense-complete 在正文
+        # 写到一半就撞 finish_reason=length、还没走到 submit_review;截断不报错,循环把它当
+        # 正常回答收尾、台账空着,报告上和"模型不肯记账"一模一样。评估该按产品实际预算量。
+        max_tokens=2048,
         top_p=1.0,
     ):
         handle(event)
@@ -1686,6 +1704,45 @@ def summarize(variant: AgentVariant, results: list[TaskResult]) -> dict[str, Any
     )
     summary["skillsLoaded"] = sorted(loaded)
     summary["skillLoadTurns"] = sum(1 for _spec, out in pairs if out.skills_loaded)
+
+    # ---- 审核链 ----
+    # 量最基本的一件事:审 review 用例时模型到底有没有调 submit_review 把结论记进台账,
+    # 还是只写在正文里(那台账永远空,正是这套东西要取代的形状)。按任务的 probe 过滤而非
+    # 按 spec——submit_review 是这类任务的核心动作。submitReviewCalls 必须和
+    # reviewRecordExpected 成对读:为 0 写成 0 / N 用例才看得出是"这条路没被走进去"(同
+    # skillsLoaded 为空),而不是"功能坏了";0 时后面成功率都不用读。
+    review_pairs = [
+        (spec, out)
+        for result in results
+        if result.task.probe == "review"
+        for spec, out in zip(result.task.turns, result.turns)
+    ]
+    summary["reviewCases"] = len(review_pairs)
+    # 分母只取应当记账的用例(expect_tools 点了 submit_review 的)。review 探针混了两类:
+    # 该记账的和不该记账的(advice-no-file——只要口头判断)。拿"全部 review 用例"当分母,
+    # 加一条 restraint 就把记账率从 3/3 拖成 3/4、像退化实则那条本就不该记;用 expect_tools
+    # 判、不数用例。
+    record_expected = [
+        out for spec, out in review_pairs if "submit_review" in spec.expect_tools
+    ]
+    summary["reviewRecordExpected"] = len(record_expected)
+    summary["submitReviewCalls"] = sum(
+        1
+        for out in record_expected
+        if any(call["tool"] == "submit_review" for call in out.calls)
+    )
+    # 反向:不该记账却记了,分母是 forbid_tools 点了 submit_review 的用例。和上面的记账率
+    # 是两个方向、不能合成一个数:永远不记的退化实现在记账率上是 0(坏)、在这条上却满分
+    # (假好),分开才看得出防线两头都立得住。
+    restraint = [
+        out for spec, out in review_pairs if "submit_review" in spec.forbid_tools
+    ]
+    summary["reviewRestraintCases"] = len(restraint)
+    summary["reviewUnbiddenRecords"] = sum(
+        1
+        for out in restraint
+        if any(call["tool"] == "submit_review" for call in out.calls)
+    )
 
     unpriced = sorted({n for _spec, out in pairs for n in out.unpriced_models})
     summary["unpricedModels"] = unpriced or None
