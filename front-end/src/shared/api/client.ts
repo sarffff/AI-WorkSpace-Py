@@ -37,6 +37,8 @@ import type {
   FsRootsResponse,
   SkillsResponse,
   WorkspaceSkill,
+  ReviewLedgerItem,
+  ReviewListResponse,
   PendingApproval,
   ResumableRun,
   AgentRunDetail,
@@ -1471,6 +1473,62 @@ export class ApiClient {
     if (!response.ok) {
       throw new Error(`Failed to delete skill: ${response.statusText}`);
     }
+  }
+
+  // ========== 审核台账 API ==========
+
+  /**
+   * 审核台账，按时间倒序。
+   * GET /reviews
+   *
+   * `pendingOnly` 取的是"还等着人看"——needs_human 且没人处置过。这个筛选不是
+   * 便利功能：转人工如果没有"待办在哪"的入口，就等于把结论扔进一个没人看的队列。
+   */
+  async getReviews(
+    pendingOnly = false,
+    limit = 50,
+  ): Promise<ReviewListResponse> {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (pendingOnly) params.set("pending_only", "true");
+    const response = await this.authedFetch(
+      `${this.baseUrl}/reviews?${params.toString()}`,
+      { method: "GET" },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch reviews: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 记下人复核之后的处置。
+   * POST /reviews/{id}/resolve
+   *
+   * 处置不限 admin：定规矩（改 SOP）是管理行为，按规矩复核一张单子是日常工作，
+   * 锁给 admin 会让待办堵在一个人身上，而那正好是转人工要避免的形状。
+   * 已处置过的再改会被后端 400 挡回（台账要能作依据，可反复改写就作不了依据）。
+   */
+  async resolveReview(
+    verdictId: string,
+    resolution: string,
+    note = "",
+  ): Promise<ReviewLedgerItem> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/reviews/${verdictId}/resolve`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ resolution, note }),
+      },
+    );
+    if (!response.ok) {
+      const detail = await response
+        .json()
+        .then((body) => body?.detail)
+        .catch(() => null);
+      throw new Error(detail || `处置失败：${response.statusText}`);
+    }
+    return response.json();
   }
 }
 

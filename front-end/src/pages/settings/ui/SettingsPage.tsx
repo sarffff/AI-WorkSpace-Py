@@ -13,7 +13,6 @@ import { StatusCard } from "../components/StatusCard";
 import { MemoryPanel } from "../components/MemoryPanel";
 import { FileHistoryPanel } from "../components/FileHistoryPanel";
 import { WorkspaceFolderPanel } from "../components/WorkspaceFolderPanel";
-import { SkillPanel } from "../components/SkillPanel";
 import { MemberPanel } from "../components/MemberPanel";
 
 export const SettingsPage: React.FC = () => {
@@ -294,9 +293,6 @@ export const SettingsPage: React.FC = () => {
             <WorkspaceFolderPanel className="anim-fade-up stagger-2" />
             {/* 紧跟在文件夹授权后面：它讲的是那些目录里发生过什么写操作 */}
             <FileHistoryPanel className="anim-fade-up stagger-2" />
-
-            {/* 作业指导：AI 处理任务前先看清单，命中就按对应的指导执行 */}
-            <SkillPanel className="anim-fade-up stagger-3" />
 
             {/* 工作区成员：调整角色、把离职的人移出去。此前邀请码是单向阀，
                 进得来出不去，而离开的人仍然能检索全部共享文档 */}

@@ -1067,3 +1067,58 @@ export interface SkillsResponse {
   enabled: boolean;
   canEdit: boolean;
 }
+
+/** 审核结论的一档：通过 / 不通过 / 需要人判断。 */
+export type ReviewVerdict = "pass" | "reject" | "needs_human";
+
+/** submit_review 逐项核对的一条必备材料。 */
+export interface ReviewInputCheck {
+  name: string;
+  /** 找到的原值；没找到时为空 */
+  value?: string | null;
+  found: boolean;
+}
+
+/** 台账里的一条审核结论（GET /reviews 的 items[]）。 */
+export interface ReviewLedgerItem {
+  id: string;
+  /** 审的是什么（文件名 / 单号 / 一句话描述） */
+  subject: string;
+  /** 按哪份作业指导审的 */
+  sopName: string;
+  /** 当时那份 SOP 的版本号。内置 SOP 是 0（版本跟 git 走，不由这张表决定） */
+  sopVersion: number;
+  verdict: ReviewVerdict;
+  /** 逐项核对的必备材料 */
+  inputs: ReviewInputCheck[];
+  /** 依据：引用的规程条目 + 材料出处 */
+  basis: string[];
+  /**
+   * 复审跑了几次。1 表示**没做一致性检查**（不是"检查过且一致"）——要和 agreed
+   * 一起读，界面上分开显示，否则一条没复审过的结论会看起来像通过了复审。
+   */
+  runs: number;
+  /** 复审是否一致。runs=1 时它恒为 true，那时读作"没检查过" */
+  agreed: boolean;
+  /** 据以判断的材料原文。null 表示这条是加这一列之前记的 */
+  evidence: string | null;
+  createdAt: string | null;
+  /** 触发这次审核的那段对话，用来回溯"当时怎么审的" */
+  chatId: string | null;
+  resolvedBy: string | null;
+  resolvedAt: string | null;
+  /** 人复核后的处置：approved / rejected / amended。null = 还没人处置 */
+  resolution: string | null;
+  resolutionNote: string | null;
+}
+
+/**
+ * GET /reviews 的返回。
+ *
+ * `enabled` 一起返回：关着开关时台账是空的，而"没开这个功能"和"还没审过任何东西"
+ * 在界面上长得一样——不说清用户会以为审核记录丢了。
+ */
+export interface ReviewListResponse {
+  items: ReviewLedgerItem[];
+  enabled: boolean;
+}
