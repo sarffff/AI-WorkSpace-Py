@@ -11,7 +11,7 @@ import pytest
 
 from config import settings
 from conftest import run
-from services.model_adapter import OpenAICompatibleAdapter
+from services.model_adapter import OpenAICompatibleAdapter, _Candidate, _failover_worthy
 
 
 def _chunk(content=None, tool_calls=None, finish_reason=None):
@@ -446,3 +446,245 @@ def test_non_bad_request_errors_are_not_swallowed():
             )
         )
     assert OpenAICompatibleAdapter._thinking_opt_out_supported is True
+
+
+# ========== 主回答的模型故障切换 ==========
+#
+# 补的缺口：辅助调用全都有降级路径，唯独主回答没有——提供商对某个模型限流/
+# 临时 5xx/模型名下线时，用户直接看到报错。配上 LLM_FALLBACK_MODELS 后，开流之前
+# 那一次失败会自动换下一个模型。默认没配时链只有一个模型，行为与改动前逐位相同。
+
+
+def _status_error(code: int) -> Exception:
+    """一个带 status_code 的普通异常。SDK 的真异常类型不需要拉起来。"""
+    error = RuntimeError(f"http {code}")
+    error.status_code = code
+    return error
+
+
+def test_model_chain_dedupes_and_keeps_order(monkeypatch):
+    """备用链去掉空项与与主模型重名的，保留配置顺序。"""
+    monkeypatch.setattr(settings, "LLM_FALLBACK_MODELS", "b, a ,b, ,c")
+    assert OpenAICompatibleAdapter._model_chain("a") == ["a", "b", "c"]
+
+
+def test_model_chain_single_when_unconfigured(monkeypatch):
+    """默认（未配）时链只有主模型——这是"与改动前逐位相同"的前提。"""
+    monkeypatch.setattr(settings, "LLM_FALLBACK_MODELS", "")
+    assert OpenAICompatibleAdapter._model_chain("a") == ["a"]
+
+
+@pytest.mark.parametrize(
+    ("code", "worthy"),
+    [(429, True), (500, True), (503, True), (404, True), (400, False), (401, False), (403, False)],
+)
+def test_failover_worthy_by_status(code, worthy):
+    """只对 429/5xx/404 降级；400/401/403 是请求本身的错，换模型修不好。"""
+    assert _failover_worthy(_status_error(code)) is worthy
+
+
+def test_failover_worthy_connection_and_timeout():
+    """连接/超时类异常不带 status_code，按类名认；认不出的保守不降级。"""
+    conn = type("APIConnectionError", (Exception,), {})()
+    timeout = type("APITimeoutError", (Exception,), {})()
+    assert _failover_worthy(conn) is True
+    assert _failover_worthy(timeout) is True
+    assert _failover_worthy(RuntimeError("weird")) is False
+
+
+def test_complete_falls_back_to_backup_model_on_429(monkeypatch):
+    """主模型 429，自动换备用模型重试，并把请求里的 model 换成备用名。"""
+    monkeypatch.setattr(settings, "LLM_FALLBACK_MODELS", "backup-model")
+    _reset_thinking_flag()
+    client = _RecordingClient(errors=[_status_error(429)])
+    adapter = _adapter_with(client)
+
+    completion = run(
+        adapter.complete(
+            messages=[{"role": "user", "content": "q"}],
+            tools=[],
+            model="primary",
+            purpose="chat",
+        )
+    )
+
+    assert completion.content == "[1, 2]"
+    assert [call["model"] for call in client.completions.calls] == [
+        "primary",
+        "backup-model",
+    ]
+
+
+def test_complete_does_not_failover_on_400(monkeypatch):
+    """400 是请求本身的错，不该拿备用模型白白多试一次。"""
+    monkeypatch.setattr(settings, "LLM_FALLBACK_MODELS", "backup-model")
+    _reset_thinking_flag()
+    client = _RecordingClient(errors=[_status_error(400)])
+    adapter = _adapter_with(client)
+
+    with pytest.raises(RuntimeError):
+        run(
+            adapter.complete(
+                messages=[{"role": "user", "content": "q"}],
+                tools=[],
+                model="primary",
+                purpose="chat",
+            )
+        )
+    assert [call["model"] for call in client.completions.calls] == ["primary"]
+
+
+def test_complete_no_fallback_configured_raises_through(monkeypatch):
+    """未配备用链时，主模型失败就是失败（与改动前一致）。"""
+    monkeypatch.setattr(settings, "LLM_FALLBACK_MODELS", "")
+    _reset_thinking_flag()
+    client = _RecordingClient(errors=[_status_error(429)])
+    adapter = _adapter_with(client)
+
+    with pytest.raises(RuntimeError):
+        run(
+            adapter.complete(
+                messages=[{"role": "user", "content": "q"}],
+                tools=[],
+                model="primary",
+                purpose="chat",
+            )
+        )
+    assert [call["model"] for call in client.completions.calls] == ["primary"]
+
+
+def test_open_stream_failover_switches_model(monkeypatch):
+    """流式路径：开流失败时换模型，并在 span 上留下 fallback 痕迹。"""
+    monkeypatch.setattr(settings, "LLM_FALLBACK_MODELS", "backup-model")
+    adapter = _adapter_with(_RecordingClient())
+    attempted: list[str] = []
+
+    async def fake_open_stream(request, client=None):
+        attempted.append(request["model"])
+        if request["model"] == "primary":
+            raise _status_error(503)
+        return "STREAM"
+
+    monkeypatch.setattr(adapter, "_open_stream", fake_open_stream)
+
+    class _Span:
+        def __init__(self):
+            self.attrs: dict = {}
+
+        def set(self, **kwargs):
+            self.attrs.update(kwargs)
+
+    span = _Span()
+    stream, used = run(
+        adapter._open_stream_with_failover({"model": "primary"}, span, "chat")
+    )
+
+    assert used == "backup-model"
+    assert stream == "STREAM"
+    assert attempted == ["primary", "backup-model"]
+    assert span.attrs.get("fallback_model") == "backup-model"
+    assert span.attrs.get("fallback_attempts") == 1
+
+
+# ========== 跨提供商故障切换（GAPS A2） ==========
+#
+# LLM_FALLBACK_MODELS 换的是同一个 endpoint 上的模型名，挡不住"整个提供商连不上"。
+# 跨提供商在候选链尾部追加别家的 (client, model)；只在主端点所有模型都失败后才轮到它。
+
+
+class _SpanRec:
+    def __init__(self):
+        self.attrs: dict = {}
+
+    def set(self, **kwargs):
+        self.attrs.update(kwargs)
+
+
+def test_candidate_chain_appends_cross_provider(monkeypatch):
+    """候选链 = 主端点模型链 + 跨提供商项；主端点那几项都用主 client。"""
+    monkeypatch.setattr(settings, "LLM_FALLBACK_MODELS", "b")
+    adapter = _adapter_with(_RecordingClient())
+    prov = _RecordingClient()
+    adapter._provider_clients = [_Candidate(prov, "prov-model", "prov.example")]
+
+    chain = adapter._candidate_chain("a")
+    assert [(c.model, c.label) for c in chain] == [
+        ("a", "primary"),
+        ("b", "primary"),
+        ("prov-model", "prov.example"),
+    ]
+    assert chain[0].client is adapter._client and chain[2].client is prov
+
+
+def test_complete_fails_over_to_other_provider(monkeypatch):
+    """主提供商整个 503，切到备用提供商的 client（用它那边的模型名）。"""
+    monkeypatch.setattr(settings, "LLM_FALLBACK_MODELS", "")
+    _reset_thinking_flag()
+    primary = _RecordingClient(errors=[_status_error(503)])
+    provider = _RecordingClient()
+    adapter = _adapter_with(primary)
+    adapter._provider_clients = [_Candidate(provider, "prov-model", "prov.example")]
+
+    completion = run(
+        adapter.complete(
+            messages=[{"role": "user", "content": "q"}], tools=[], model="primary"
+        )
+    )
+    assert completion.content == "[1, 2]"
+    assert [c["model"] for c in primary.completions.calls] == ["primary"]
+    assert [c["model"] for c in provider.completions.calls] == ["prov-model"]
+
+def test_open_stream_fails_over_to_other_provider(monkeypatch):
+    """流式路径：主 client 开流失败 → 换备用提供商 client，span 留下 fallback_provider。"""
+    monkeypatch.setattr(settings, "LLM_FALLBACK_MODELS", "")
+    adapter = _adapter_with(_RecordingClient())
+    provider = object()  # 只需身份可比
+    adapter._provider_clients = [_Candidate(provider, "prov-model", "prov.example")]
+    seen: list = []
+
+    async def fake_open_stream(request, client=None):
+        seen.append((request["model"], client))
+        if client is adapter._client:
+            raise _status_error(503)
+        return "STREAM"
+
+    monkeypatch.setattr(adapter, "_open_stream", fake_open_stream)
+    span = _SpanRec()
+    stream, used = run(
+        adapter._open_stream_with_failover({"model": "primary"}, span, "chat")
+    )
+    assert used == "prov-model" and stream == "STREAM"
+    assert seen == [("primary", adapter._client), ("prov-model", provider)]
+    assert span.attrs.get("fallback_provider") == "prov.example"
+    assert span.attrs.get("fallback_model") == "prov-model"
+
+
+def test_fallback_providers_bad_json_degrades(monkeypatch, caplog):
+    """JSON 配坏了只告警并退回"没有跨提供商"，不拖垮主回答。"""
+    import logging
+
+    monkeypatch.setattr(settings, "LLM_FALLBACK_PROVIDERS", "{not json")
+    adapter = _adapter_with(_RecordingClient())
+    adapter._provider_clients = None  # 强制重新解析
+    with caplog.at_level(logging.WARNING, logger="model_adapter"):
+        assert adapter._fallback_provider_clients() == []
+    assert any("LLM_FALLBACK_PROVIDERS" in r.message for r in caplog.records)
+
+
+def test_fallback_providers_parsed_and_built(monkeypatch):
+    """合法 JSON：按序建候选；base_url 省略项沿用 LLM_BASE_URL，label 取 host。"""
+    monkeypatch.setattr(
+        settings,
+        "LLM_FALLBACK_PROVIDERS",
+        '[{"base_url":"https://api.siliconflow.cn/v1","api_key":"sk-x","model":"deepseek-ai/DeepSeek-V3"},'
+        '{"model":"only-model"}]',
+    )
+    adapter = _adapter_with(_RecordingClient())
+    adapter._provider_clients = None
+    cands = adapter._fallback_provider_clients()
+    assert [c.model for c in cands] == ["deepseek-ai/DeepSeek-V3", "only-model"]
+    assert cands[0].label == "api.siliconflow.cn"
+    # 缓存：第二次返回同一个列表对象，不重建 client
+    assert adapter._fallback_provider_clients() is cands
+
+

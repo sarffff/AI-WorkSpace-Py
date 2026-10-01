@@ -716,6 +716,21 @@ export const ChatPage: React.FC = () => {
   }, []);
 
   const handleStop = useCallback(() => {
+    // 先告诉服务端"别跑了"，再 abort 掉本地的流。
+    //
+    // 顺序重要：cancel 走的是独立的 fetch，必须在 abort 关掉 SSE 之前发出去，
+    // 服务端才能把它作为一次显式停止落成 cancelled（终态）。只 abort 的话，
+    // 服务端看到的是"连接断了"，会标成 interrupted、归入可接续——用户明明点了
+    // 停止，却会在"接着跑吗"里看到它。fire-and-forget：不 await，不给停止按钮加延迟，
+    // 失败也不影响本地收尾（abort 本身已经能停下当前这一步）。
+    const activeRunId = activeRunRef.current?.runId;
+    if (activeRunId) {
+      apiClient.cancelRun(activeRunId).catch(() => {
+        // 取消请求失败不阻碍本地停止：abort 仍会关掉流。服务端那边即使没收到，
+        // 断线也会把它收成 interrupted（可接续），不会永远卡在 running。
+      });
+    }
+    activeRunRef.current = null;
     abortRef.current?.abort();
     abortRef.current = null;
     const partial = bufferRef.current;
@@ -1034,6 +1049,30 @@ export const ChatPage: React.FC = () => {
                 // 补不到就保留实时那份，它已经能看出调了哪些工具
               });
             assistantMsgId = "";
+            break;
+          }
+
+          if (chunk.type === "cancelled") {
+            // 服务端确认已停止（用户主动取消的终态）。保留已生成的部分正文，
+            // 像 handleStop 那样收尾，但不落 server id——这不是一个完整回答。
+            // 多数情况下 handleStop 已经 abort 、读不到这个事件；这里是跨标签
+            // 取消或 abort 竞态时的防御性收尾。
+            stopFlushTimer();
+            flushBuffer();
+            setShowThinking(false);
+            setToolStatus(null);
+            dispatch(setIsGenerating(false));
+            if (assistantMsgId && citationsRef.current.length) {
+              dispatch(
+                setMessageCitations({
+                  sessionId,
+                  messageId: assistantMsgId,
+                  citations: dedupeCitations(citationsRef.current),
+                }),
+              );
+            }
+            bufferRef.current = { id: "", content: "", sessionId: "" };
+            activeRunRef.current = null;
             break;
           }
 

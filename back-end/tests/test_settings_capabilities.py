@@ -134,3 +134,56 @@ def test_不泄露本机绝对路径(client, tmp_path, monkeypatch):
 
     body = client.get("/settings", headers=headers).text
     assert str(tmp_path) not in body
+
+
+# ========== 完整能力档案（agent 块） ==========
+
+
+def _agent(client, headers):
+    return client.get("/settings", headers=headers).json()["capabilities"]["agent"]
+
+
+def test_agent能力档案反映当前配置(client, monkeypatch):
+    """规划/护栏/记忆/视觉/向量库/备用模型都报的是生效值，运营方一眼看得到。"""
+    monkeypatch.setattr(settings, "AGENT_PLAN_MODE", "plan_execute")
+    monkeypatch.setattr(settings, "GUARDRAIL_ENABLED", True)
+    monkeypatch.setattr(settings, "MEMORY_ENABLED", False)
+    monkeypatch.setattr(settings, "TOOL_WEB_FETCH_ENABLED", True)
+    monkeypatch.setattr(settings, "VISION_MODELS", "glm-4v, gpt-4o")
+    monkeypatch.setattr(settings, "VECTOR_STORE", "qdrant")
+    monkeypatch.setattr(settings, "LLM_FALLBACK_MODELS", "glm-4-flash,glm-4.5-air")
+
+    body = _agent(client, _auth_headers(client))
+
+    assert body["planMode"] == "plan_execute"
+    assert body["guardrails"] is True
+    assert body["memory"] is False
+    assert body["webFetch"] is True
+    assert body["vectorStore"] == "qdrant"
+    # 逗号分隔的配置拆成去空列表，而不是把原串丢给前端自己拆
+    assert body["visionModels"] == ["glm-4v", "gpt-4o"]
+    assert body["fallbackModels"] == ["glm-4-flash", "glm-4.5-air"]
+
+
+def test_agent备用链未配时为空列表(client, monkeypatch):
+    """空 = 没有降级路径。报空列表而不是 null，前端不必做两种空值判断。"""
+    monkeypatch.setattr(settings, "LLM_FALLBACK_MODELS", "")
+    monkeypatch.setattr(settings, "VISION_MODELS", "")
+
+    body = _agent(client, _auth_headers(client))
+
+    assert body["fallbackModels"] == []
+    assert body["visionModels"] == []
+
+
+def test_agent报的是resolve后的提示词版本(client):
+    """promptVersion 是生效版本，不是配置项的字面空串。
+
+    留空时配置项是空串，而 resolve_version 会落到契约默认版——报空串会让
+    运营方以为"没提示词"，而实际有一个生效的版本。
+    """
+    from services import prompt_library
+
+    body = _agent(client, _auth_headers(client))
+    assert body["promptVersion"] == prompt_library.resolve_version("chat_system_rag")
+    assert body["promptVersion"]  # 非空

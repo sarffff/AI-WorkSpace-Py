@@ -40,6 +40,40 @@ class Settings(BaseSettings):
     # 存在系统性的自我偏好(self-preference bias),变体对比的结论会被污染。
     # 留空依次回退 LLM_UTILITY_MODEL / LLM_MODEL。
     JUDGE_MODEL: str = ""
+    # 主回答的备用模型链(逗号分隔,按顺序试)。留空 = 没有降级路径,与改动前逐位相同。
+    #
+    # 补的是这个缺口:辅助调用(重排/HyDE/摘要)全都有降级路径,唯独**主回答**没有
+    # ——提供商对某个模型限流(429)、那个模型临时 5xx、或模型名被下线(404)时,
+    # 用户直接看到报错。配上备用模型后,开流之前那一次失败会自动换下一个模型重试。
+    #
+    # 边界(刻意的):
+    # - **只在开流之前切换。** 一旦有字节流给了用户就不再切,否则备用模型会把主模型
+    #   已经说过的话再说一遍。这与 LLM_CHAT_MAX_RETRIES 的重试窗口是同一个。
+    # - **同一个 endpoint(共用 LLM_BASE_URL / LLM_API_KEY)。** 换的是模型名,不是提供商。
+    #   它挡的是单模型级的限流与故障;整个提供商宕机需要跨提供商凭证,那是另一件事。
+    # - **只对可切换的错误降级**(429 / 5xx / 超时 / 连接失败 / 404)。400 / 401 / 403
+    #   这类请求本身的错,换个同端点的模型也修不好,直接抛,不白白多等一次。
+    LLM_FALLBACK_MODELS: str = ""
+
+    # 跨提供商故障切换：整个提供商宕机（base_url / key 级，而非单模型 429/404）时的
+    # 备用。上面的 LLM_FALLBACK_MODELS 换的是**同一个 endpoint 上的模型名**，挡不住
+    # "整个 open.bigmodel.cn 连不上"——那需要另一组凭证指向另一家。
+    #
+    # 值是一个 JSON 数组，按顺序尝试；每项 {base_url?, api_key?, model}：
+    #   model    必填——那家提供商上要用的模型名
+    #   base_url 省略则沿用 LLM_BASE_URL；api_key 省略则沿用 LLM_API_KEY
+    # 例（换到 SiliconFlow 兜底）：
+    #   LLM_FALLBACK_PROVIDERS=[{"base_url":"https://api.siliconflow.cn/v1","api_key":"sk-xxx","model":"deepseek-ai/DeepSeek-V3"}]
+    #
+    # 顺序：主模型 → LLM_FALLBACK_MODELS（同端点换名）→ 这里的跨提供商项。只在开流
+    # 之前、且只对可切换的错（429 / 5xx / 超时 / 连接失败 / 404）降级，与
+    # LLM_FALLBACK_MODELS 同一套判据。JSON 解析失败只告警并忽略（退回不配跨提供商），
+    # 不拖垮启动。
+    #
+    # ⚠ 成本归因：trace / 定价按**模型名**查价目表、无 provider 维度。两家用同一个
+    # 模型名但价格不同的话，成本列分不开它们（span 会带 fallback_provider 标出切换，
+    # 便于排查）。
+    LLM_FALLBACK_PROVIDERS: str = ""
 
     # ========== Redis 配置 (可选) ==========
     REDIS_URL: Optional[str] = None
@@ -487,6 +521,31 @@ class Settings(BaseSettings):
     # 这是把"索引成功"的判据从"没抛异常"换成"真的检索得到"——静默失败的那几种
     # (空文本、乱码、维度不匹配)全都不抛异常。代价是每篇文档多一次 embedding 调用。
     INGEST_SELF_CHECK: bool = True
+
+    # ---- 扫描件 OCR 兜底 ----
+    # 上面那道 no_chunks 自检只能把"扫描件抽不到字"从静默失败变成一条 failed,
+    # 它兜不住的是"让这篇文档真的进库"。扫描件 PDF(只有图像层、没有文本层)在
+    # extract_pdf 里落 no_text_layer、正文为空,而企业知识库里合同、证照、历史
+    # 存档恰恰大量是扫描件——RAG 的价值上限卡在这里。
+    #
+    # 打开后:create_document 解析出 no_text_layer / no_extractable_text 时,把每页
+    # 渲染成图片交给视觉模型转写,转写结果当作正文走后续正常的分块/自检链路。
+    # 默认关闭,理由与 VISION_MODELS / 工具开关一致——打开一个入口就是把它的失败
+    # 模式和成本一起打开:每页一次模型调用,成本随页数线性涨(所以有下面的页数上限)。
+    INGEST_OCR_ENABLED: bool = False
+    # OCR 用的视觉模型名。必须显式配,且必须在 VISION_MODELS 白名单里——给非视觉
+    # 模型发图只换来一个 400。留空 = 即便 INGEST_OCR_ENABLED=true 也不生效(启动告警),
+    # 这是刻意的:静默退回"没 OCR"会让"为什么扫描件还是没进库"变成查不出的问题。
+    INGEST_OCR_MODEL: str = ""
+    # 单篇最多 OCR 几页。扫描件动辄上百页,不封顶一次上传就能打爆配额。超出的页
+    # 不转写,落一条 ocr_page_limit 告警(入库的是前 N 页,不是整篇失败)。
+    INGEST_OCR_MAX_PAGES: int = 20
+    # 页面渲染分辨率(DPI)。太低字糊、OCR 质量掉;太高请求体和 token 都涨。
+    # 150 是实测够清楚又不至于让 base64 过大的折中。
+    INGEST_OCR_DPI: int = 150
+    # 单页转写结果低于这么多字符就当这页没抽到东西(空白页/插图页),跳过并计数。
+    # 不设的话模型对空白页返回的"这页没有文字"之类说明会被当成正文混进库。
+    INGEST_OCR_MIN_CHARS: int = 8
     # 评估语料的降级方式:none | pdf_like | gbk_bytes | scanned(见 eval/corpus_degrade.py)。
     # 只影响离线评估,线上永远是 none。
     #
@@ -764,6 +823,20 @@ class Settings(BaseSettings):
     # 先在 trace 里看一段时间命中情况再决定收紧到多少。
     GUARDRAIL_BLOCK_SCORE: int = 0
 
+    # ========== 出站出口控制（SSRF + 白名单，见 services/egress.py） ==========
+    # 模型可控的出站只有 fetch_web_page(URL 由模型给),它天然是 SSRF / 数据外泄入口。
+    #
+    # 拦私网/环回/链路本地/保留段(含云元数据 169.254.169.254)。默认开:正当的公网
+    # 抓取不会指向这些地址,几乎无误报,而它挡的是"把抓网页变成探内网/读云凭证"这条
+    # 经典手法。运营方自己配的 endpoint(LLM/embedding/rerank/web_search/Qdrant 的
+    # host)不受此限——那是运营方选的、非模型可控,自建内网网关是常态。
+    EGRESS_BLOCK_PRIVATE_IPS: bool = True
+    # 额外放行的出站 host(逗号分隔,支持 *.example.com 通配)。
+    # 空 = 只做上面的 SSRF 拦截、放行任意公网 host(fetch 对公网照常可用);
+    # 非空 = 把 fetch_web_page 收紧到"运营方 endpoint + 这里列的 host",其余一律拒。
+    # 想让联网抓取只能碰几个可信域时设它。
+    EGRESS_ALLOWLIST: str = ""
+
     # ========== 跨会话长期记忆 ==========
     # 每轮回答结束后用辅助模型从对话里抽取"值得跨会话记住"的用户事实与偏好,
     # 存进 user_memories 表,并在之后的每一轮作为系统上下文注入。
@@ -916,6 +989,40 @@ class Settings(BaseSettings):
     # 塞进去的材料更多,单回合会更贵,所以这是个**起点**而不是定论:
     # 私有化部署按自己的 trace_spans 调。
     USAGE_QUOTA_MAX_TOKENS: int = 2_000_000
+
+    # ---- 线上健康监控与主动告警 ----
+    # usage_guard 防的是**单个用户**跑飞,它答不了另一个问题:整条线**作为一个
+    # 整体**是不是在变坏——错误率爬升、人工介入变多、单次回答变贵。离线金标
+    # (eval + 门禁)量的是"模型在固定题上的质量",但它跑在温度 0、固定语料上,
+    # 和线上(温度 0.7、真实流量)是两套分布。这里补的是"线上这半环":从
+    # trace_spans + agent_runs 聚合真实指标,越阈值就经 B1 通知出口推给管理员。
+    #
+    # 默认关(与其它运营开关一致)。打开后由 production_monitor 评估;没有内置
+    # 定时器——评估**顺带挂在通知未读数轮询上**(前端的徽标心跳),也可以让外部
+    # cron 打 GET /metrics/health。多 worker 下每个 worker 各评估一次,靠"每个管理员
+    # 同时只留一条未读健康告警"去重吸收重复(同 VECTOR_STORE=memory 那类诚实边界)。
+    MONITOR_ENABLED: bool = False
+    # 聚合窗口(小时)。滑动窗口,与 usage 的自然日对齐无关。
+    MONITOR_WINDOW_HOURS: float = 24.0
+    # 样本不足时不告警:窗口内主代理 run 数低于此值直接跳过。
+    # 三五个 run 里挂一个就是 20%+ 错误率,那是噪声不是信号(同 calibration 的 MIN_N)。
+    MONITOR_MIN_RUNS: int = 20
+    # 两次真正评估之间的最小间隔(分钟)。评估挂在高频读路径上,靠它节流:
+    # 间隔内的调用是一次时间戳比较就返回,只有跨过间隔的那一次付聚合查询的钱。
+    MONITOR_INTERVAL_MINUTES: float = 15.0
+    # 四条阈值,各自独立,0 = 关掉这一条(同 usage_guard 的约定)。
+    # 错误率 / 人工介入率是比例(0–1);成本是"单次回答"的币值;延迟是毫秒。
+    #
+    # 错误率 = 失败的主代理 run / 全部主代理 run。
+    MONITOR_MAX_ERROR_RATE: float = 0.0
+    # 人工介入率 = (被审批打断过 或 无人裁决而废弃)的 run / 全部 run。
+    # 它爬升意味着"自动闭环"在变成"事事要人"——HITL 是卖点,但全靠人就不是自动化了。
+    MONITOR_MAX_INTERVENTION_RATE: float = 0.0
+    # 单次回答平均成本上限。混币种时按相加算(有汇率问题),所以默认 0:
+    # 生产模型未进价目表时成本是 NULL,配非零只会得到永不触发的假闸门(同 USAGE_QUOTA_MAX_COST)。
+    MONITOR_MAX_COST_PER_RUN: float = 0.0
+    # 端到端延迟的 p95(毫秒)。0 = 不看。按 agent_runs 的 finished-started 算。
+    MONITOR_MAX_P95_LATENCY_MS: float = 0.0
 
     @property
     def embedding_api_key(self) -> str:

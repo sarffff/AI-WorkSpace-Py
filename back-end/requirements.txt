@@ -1,3 +1,7 @@
+# 直接依赖的版本下限（人读、可编辑的依赖清单）。可复现、收紧供应链的安装请用锁文件：
+#     pip install -r requirements.lock
+# 锁文件把这些依赖钉到确切版本；完整的带 hash 传递锁在 CI 按目标平台生成
+#（见 requirements.lock 头部说明）。
 fastapi>=0.115.0
 uvicorn>=0.32.0
 sqlalchemy>=2.0.36
@@ -33,6 +37,10 @@ python-docx>=1.1.2
 # read_only + data_only 两个模式都要:前者让几万行的表不至于把整个工作簿读进内存,
 # 后者取公式的**缓存值**而不是 "=SUM(B2:B9)" 这个字符串。
 openpyxl>=3.1.5
+# .pptx 解析。补齐 OOXML 三件套的最后一个：培训材料、方案汇报这类知识常常
+# 只存在于幻灯片里。要点、表格、以及**讲稿备注**都抽（演讲者往往把真正的解释
+# 写在备注里）。同 docx 选 python-pptx 而不是 unstructured/pandoc：只读 OOXML 就够。
+python-pptx>=0.6.23
 numpy>=1.26.0
 faiss-cpu>=1.7.4
 # 向量库。只在 VECTOR_STORE=qdrant 时用到(见 docker-compose.qdrant.yml);

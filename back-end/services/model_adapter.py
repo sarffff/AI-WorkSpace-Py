@@ -25,6 +25,42 @@ def _is_bad_request(exc: Exception) -> bool:
     )
 
 
+def _failover_worthy(exc: Exception) -> bool:
+    """这个异常值不值得换备用模型再试一次。
+
+    只对「换个模型可能就好了」的错降级：限流(429)、服务端故障(5xx)、超时与
+    连接失败、以及模型名不存在(404——换一个存在的名就对了)。SDK 的连接/超时
+    类异常不一定带 status_code，所以先按类名认。
+
+    400 / 401 / 403 不降级：那是请求本身的错(参数/鉴权)，同一个 endpoint 上换
+    个模型修不好，再试一次只是白白多花一次往返延迟，还会把真正的错因掩在
+    一堆重试后面。认不出的异常保守起见也不降级(当请求错处理)，避免在一个本
+    就会失败的请求上把备用模型的额度也烧掉。
+    """
+    name = type(exc).__name__
+    if name in (
+        "APIConnectionError",
+        "APITimeoutError",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "Timeout",
+    ):
+        return True
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status == 429 or status == 404 or status >= 500
+    return False
+
+
+@dataclass(frozen=True, slots=True)
+class _Candidate:
+    """故障切换链上的一个候选：用哪个 client、哪个模型、给日志/telemetry 的标签。"""
+
+    client: Any
+    model: str
+    label: str  # "primary"（主 endpoint）或备用提供商的 host
+
+
 def _estimate_usage(
     messages: list[dict[str, Any]], output_text: str
 ) -> tuple[int, int]:
@@ -194,6 +230,8 @@ class OpenAICompatibleAdapter(ModelAdapter):
             timeout=settings.LLM_CHAT_TIMEOUT_SECONDS,
             max_retries=settings.LLM_CHAT_MAX_RETRIES,
         )
+        # 跨提供商兜底客户端，惰性建一次并缓存（见 _fallback_provider_clients）
+        self._provider_clients: list[_Candidate] | None = None
 
     @classmethod
     def _may_be_text_tool_call(cls, buffer: str) -> bool:
@@ -269,28 +307,58 @@ class OpenAICompatibleAdapter(ModelAdapter):
             streaming=False,
             tools=len(tools) or None,
         ) as span:
-            client = self._client
-            # 辅助调用（重排 / HyDE / 改写 / 摘要）单独设更短的超时与更少的重试。
-            #
-            # 判据是 ``purpose != "chat"``：辅助调用**全都有降级路径**，为一个
-            # 可以放弃的增强等 SDK 默认的 600s×3 是纯亏。实测 rerank 变体 p90
-            # 延迟 255 秒、最大 336 秒（baseline 37 秒），那个 336 就是重试链，
-            # 而 eval 里 10/54 的降级正是耗尽重试的那些。
-            #
-            # ``with_options`` 返回一个浅拷贝，共用底层连接池，所以这里不会因为
-            # 每次调用都造新客户端而丢掉 keep-alive。
-            if purpose != "chat":
-                client = client.with_options(
-                    timeout=settings.LLM_AUXILIARY_TIMEOUT_SECONDS,
-                    max_retries=settings.LLM_AUXILIARY_MAX_RETRIES,
-                )
+            aux = purpose != "chat"
+            if aux:
+                # 辅助调用（重排 / HyDE / 改写 / 摘要）全都有降级路径，为一个可放弃的
+                # 增强等 SDK 默认的 600s×3 是纯亏，所以单独收紧超时与重试。with_options
+                # 是浅拷贝、共用连接池，不会每次调用都丢 keep-alive；按候选逐个套用。
                 span.set(auxiliary_timeout=settings.LLM_AUXILIARY_TIMEOUT_SECONDS)
             request = self._build_request(
                 messages, tools, model, temperature, max_tokens, top_p
             )
-            response = await self._create_completion(
-                client, request, auxiliary=purpose != "chat", span=span
-            )
+            # 与流式同一套故障切换：按候选链试（主端点模型链 + 跨提供商），只对可切换
+            # 的错降级。非流式没有"字节已给用户"的顾虑，但保持同一套链与判据更好推。
+            chain = self._candidate_chain(model)
+            response = None
+            used_model = model
+            for idx, cand in enumerate(chain):
+                eff_client = (
+                    cand.client.with_options(
+                        timeout=settings.LLM_AUXILIARY_TIMEOUT_SECONDS,
+                        max_retries=settings.LLM_AUXILIARY_MAX_RETRIES,
+                    )
+                    if aux
+                    else cand.client
+                )
+                attempt = {**request, "model": cand.model}
+                try:
+                    response = await self._create_completion(
+                        eff_client, attempt, auxiliary=aux, span=span
+                    )
+                    used_model = cand.model
+                    if idx > 0:
+                        span.set(fallback_model=cand.model, fallback_attempts=idx)
+                        if cand.label != "primary":
+                            span.set(fallback_provider=cand.label)
+                        logger.warning(
+                            "llm.%s: using fallback %s@%s (after %s failure(s))",
+                            purpose,
+                            cand.model,
+                            cand.label,
+                            idx,
+                        )
+                    break
+                except Exception as exc:
+                    if idx == len(chain) - 1 or not _failover_worthy(exc):
+                        raise
+                    logger.warning(
+                        "llm.%s: candidate %s@%s failed (%s), falling back",
+                        purpose,
+                        cand.model,
+                        cand.label,
+                        type(exc).__name__,
+                    )
+                    continue
             if not response.choices:
                 span.set(empty_response=True)
                 return ModelCompletion(
@@ -309,7 +377,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 for call in (message.tool_calls or [])
             ]
             self._record_usage(
-                span, getattr(response, "usage", None), messages, content, model
+                span, getattr(response, "usage", None), messages, content, used_model
             )
             span.set(tool_calls=len(standard_calls) or None)
             self._record_truncation(span, finish_reason, content, max_tokens, purpose)
@@ -509,7 +577,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 )
         return await client.chat.completions.create(**request)
 
-    async def _open_stream(self, request: dict[str, Any]) -> Any:
+    async def _open_stream(self, request: dict[str, Any], client: Any = None) -> Any:
         """开流。尽量带上 include_usage，被提供商拒绝则降级为本地估算。
 
         超时与重试来自构造函数里配的客户端(``LLM_CHAT_*``)。对流式来说这两件事
@@ -521,9 +589,10 @@ class OpenAICompatibleAdapter(ModelAdapter):
           调用方开始迭代,失败就直接抛给调用方,不会重放已经发给用户的内容。
           这是「主回答可以重试 2 次」在流式下依然安全的全部理由。
         """
+        active = client or self._client
         if self._stream_usage_supported and settings.LLM_STREAM_USAGE:
             try:
-                return await self._client.chat.completions.create(
+                return await active.chat.completions.create(
                     **request, stream_options={"include_usage": True}
                 )
             except Exception as exc:
@@ -533,7 +602,123 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 logger.info(
                     "Provider rejected stream_options; token usage will be estimated."
                 )
-        return await self._client.chat.completions.create(**request)
+        return await active.chat.completions.create(**request)
+
+    @staticmethod
+    def _model_chain(model: str) -> list[str]:
+        """主模型 + 配置的备用模型，去重、去空、去掉与主模型重名的。
+
+        默认没配 ``LLM_FALLBACK_MODELS`` 时返回 ``[model]`` 单元素——于是下面
+        那两处循环各只跑一次、异常直接抛，与加这个功能之前逐位相同。
+        """
+        chain = [model]
+        raw = (settings.LLM_FALLBACK_MODELS or "").strip()
+        if raw:
+            for name in raw.split(","):
+                name = name.strip()
+                if name and name not in chain:
+                    chain.append(name)
+        return chain
+
+    def _fallback_provider_clients(self) -> list[_Candidate]:
+        """解析 LLM_FALLBACK_PROVIDERS，建好跨提供商候选（client + model），缓存。
+
+        客户端只建一次（连接池可复用）。JSON 坏了、或某项不合法，只告警并跳过——
+        配错不该让主回答跟着挂，退回"没有跨提供商兜底"即可（同项目一贯的 fail-safe）。
+        """
+        # getattr 而非直接取属性：有测试用 __new__ 造实例、不走 __init__，
+        # 那时这个属性还不存在
+        cached = getattr(self, "_provider_clients", None)
+        if cached is not None:
+            return cached
+        from openai import AsyncOpenAI
+        from urllib.parse import urlparse
+
+        candidates: list[_Candidate] = []
+        raw = (settings.LLM_FALLBACK_PROVIDERS or "").strip()
+        if raw:
+            try:
+                entries = json.loads(raw)
+                if not isinstance(entries, list):
+                    raise ValueError("应是 JSON 数组")
+            except Exception as exc:
+                logger.warning(
+                    "LLM_FALLBACK_PROVIDERS 解析失败，忽略跨提供商兜底: %s",
+                    type(exc).__name__,
+                )
+                entries = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                model = str(entry.get("model") or "").strip()
+                if not model:
+                    logger.warning("LLM_FALLBACK_PROVIDERS 某项缺 model，跳过")
+                    continue
+                base_url = str(entry.get("base_url") or settings.LLM_BASE_URL)
+                client = AsyncOpenAI(
+                    api_key=str(entry.get("api_key") or settings.LLM_API_KEY),
+                    base_url=base_url,
+                    timeout=settings.LLM_CHAT_TIMEOUT_SECONDS,
+                    max_retries=settings.LLM_CHAT_MAX_RETRIES,
+                )
+                label = (urlparse(base_url).hostname or base_url)[:60]
+                candidates.append(_Candidate(client, model, label))
+        self._provider_clients = candidates
+        return candidates
+
+    def _candidate_chain(self, model: str) -> list[_Candidate]:
+        """完整故障切换链：主 endpoint 的模型链 + 跨提供商候选。
+
+        默认两者都没配时就是 ``[(主 client, model, "primary")]`` 单元素——下面两处
+        循环各只跑一次、异常直接抛，与加这些功能之前逐位相同。
+        """
+        chain = [
+            _Candidate(self._client, name, "primary")
+            for name in self._model_chain(model)
+        ]
+        chain.extend(self._fallback_provider_clients())
+        return chain
+
+    async def _open_stream_with_failover(
+        self, request: dict[str, Any], span: Any, purpose: str
+    ) -> tuple[Any, str]:
+        """按候选链开流（主端点模型链 + 跨提供商），返回（stream, 实际用的模型名）。
+
+        只在**开流之前**切换：``_open_stream`` 里那次 ``create`` 报错时尚未有任何
+        字节流给用户，换候选是安全的；一旦返回了 stream 对象、调用方开始迭代，
+        失败就直接抛（同 ``_open_stream`` 的文档串）。默认单候选链时这与改动前一致。
+        """
+        chain = self._candidate_chain(request["model"])
+        for idx, cand in enumerate(chain):
+            attempt = {**request, "model": cand.model}
+            try:
+                stream = await self._open_stream(attempt, cand.client)
+            except Exception as exc:
+                # 最后一个候选也失败、或这个错不值得换 → 抛，交给上层。
+                if idx == len(chain) - 1 or not _failover_worthy(exc):
+                    raise
+                logger.warning(
+                    "llm.%s: candidate %s@%s failed to open stream (%s), falling back",
+                    purpose,
+                    cand.model,
+                    cand.label,
+                    type(exc).__name__,
+                )
+                continue
+            if idx > 0:
+                span.set(fallback_model=cand.model, fallback_attempts=idx)
+                if cand.label != "primary":
+                    span.set(fallback_provider=cand.label)
+                logger.warning(
+                    "llm.%s: using fallback %s@%s (after %s failure(s))",
+                    purpose,
+                    cand.model,
+                    cand.label,
+                    idx,
+                )
+            return stream, cand.model
+        # 到不了这里：循环要么 return 要么 raise。留着只为类型检查器。
+        raise RuntimeError("candidate chain exhausted")
 
     async def stream_completion(
         self,
@@ -559,10 +744,12 @@ class OpenAICompatibleAdapter(ModelAdapter):
             streaming=True,
             tools=len(tools) or None,
         ) as span:
-            stream = await self._open_stream(
+            stream, used_model = await self._open_stream_with_failover(
                 self._build_request(
                     messages, tools, model, temperature, max_tokens, top_p, stream=True
-                )
+                ),
+                span,
+                purpose,
             )
 
             content_parts: list[str] = []
@@ -641,7 +828,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 if slot["name"]
             ]
             content = "".join(content_parts)
-            self._record_usage(span, usage, messages, content, model)
+            self._record_usage(span, usage, messages, content, used_model)
             # 首 token 延迟是流式体验的关键指标,和总耗时分开记
             span.set(
                 first_token_ms=first_token_ms,

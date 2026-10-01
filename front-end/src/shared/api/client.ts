@@ -605,6 +605,29 @@ export class ApiClient {
   }
 
   /**
+   * 停止一个正在跑的执行。
+   * POST /chats/runs/{runId}/cancel
+   *
+   * 与 `continueRun` 相反：那个是"连接断了、接着跑"，这个是"用户说了别跑了"。
+   * 服务端把执行标成终态 `cancelled`，不会出现在可接续列表里。
+   *
+   * 不是 SSE，普通 JSON 响应。调用方通常在 abort 掉流之前 fire-and-forget 地调它
+   * ——它走的是独立的 fetch，abort 那条 SSE 连接不会影响这个请求送达。
+   */
+  async cancelRun(
+    runId: string,
+  ): Promise<{ runId: string; cancelled: boolean; live: boolean }> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/chats/runs/${runId}/cancel`,
+      { method: "POST" },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to cancel run: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
    * 断线留下、可以接着跑的执行。
    * GET /chats/runs/resumable
    *
@@ -785,6 +808,35 @@ export class ApiClient {
       );
     }
 
+    return response.json();
+  }
+
+  /**
+   * 从 URL 抓取网页并加入知识库。
+   * POST /knowledge/documents/from-url
+   *
+   * 后端把网页抓成结构化正文（标题→Markdown、段落分行），以 .md 落库，走与
+   * uploadDocument 相同的后台索引路径。出站请求由 egress 防护（拦私网/云元数据）。
+   */
+  async addDocumentFromUrl(
+    url: string,
+    visibility: DocumentVisibility = "workspace",
+  ): Promise<UploadDocumentResponse & { sourceUrl?: string }> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/knowledge/documents/from-url`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url, visibility }),
+      },
+    );
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(
+        error.detail ||
+          `Failed to add document from URL: ${response.statusText}`,
+      );
+    }
     return response.json();
   }
 

@@ -637,3 +637,234 @@ def test_超时的审批不允许恢复(client, db_session, monkeypatch):
     # 就地标成 abandoned，不是留在 waiting_approval 里等下一次再拒
     db_session.expire_all()
     assert db_session.get(AgentRun, "run-stale").status == "abandoned"
+
+
+# ========== 取消执行（用户主动“停止生成”） ==========
+
+
+def test_取消自己的running执行标成cancelled(client, db_session, monkeypatch):
+    """POST /runs/{id}/cancel 把一个还在跑的执行落成终态 cancelled。
+
+    这里没有活着的循环（测试直接造的库行），所以走的是端点的兜底路径：
+    signal 找不到活循环 -> mark_cancelled 直接改库。live=False、cancelled=True。
+    """
+    from models import AgentRun, User
+    from services.clock import naive_now
+
+    _register(client)
+    token = _login(client)
+    user = db_session.query(User).filter_by(username="alice").one()
+    monkeypatch.setattr(settings, "AGENT_CHECKPOINT_ENABLED", True)
+
+    db_session.add(
+        AgentRun(
+            id="run-cancel",
+            chat_id="chat-c",
+            user_id=user.id,
+            status="running",
+            rounds=1,
+            started_at=naive_now(),
+            updated_at=naive_now(),
+        )
+    )
+    db_session.commit()
+
+    response = client.post("/chats/runs/run-cancel/cancel", headers=_auth(token))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["cancelled"] is True
+    assert body["live"] is False
+    db_session.expire_all()
+    row = db_session.get(AgentRun, "run-cancel")
+    assert row.status == "cancelled"
+    assert row.error_type == "user_cancelled"
+
+
+def test_取消别人的执行返回404(client, db_session):
+    """归属校验先于一切：不该让别人的 run 存不存在这件事被探测出来。"""
+    from models import AgentRun, User
+    from services.clock import naive_now
+
+    _register(client)
+    _register(client, email="bob@example.com", username="bob")
+    token = _login(client)
+    bob = db_session.query(User).filter_by(username="bob").one()
+
+    db_session.add(
+        AgentRun(
+            id="run-bob-cancel",
+            chat_id="chat-b",
+            user_id=bob.id,
+            status="running",
+            rounds=1,
+            started_at=naive_now(),
+            updated_at=naive_now(),
+        )
+    )
+    db_session.commit()
+
+    response = client.post("/chats/runs/run-bob-cancel/cancel", headers=_auth(token))
+    assert response.status_code == 404
+
+
+def test_取消已完成的执行不改动状态(client, db_session, monkeypatch):
+    """done/failed 的执行没什么可取消的：cancelled=False，状态原样不动。"""
+    from models import AgentRun, User
+    from services.clock import naive_now
+
+    _register(client)
+    token = _login(client)
+    user = db_session.query(User).filter_by(username="alice").one()
+    monkeypatch.setattr(settings, "AGENT_CHECKPOINT_ENABLED", True)
+
+    db_session.add(
+        AgentRun(
+            id="run-done",
+            chat_id="chat-d",
+            user_id=user.id,
+            status="done",
+            rounds=2,
+            started_at=naive_now(),
+            updated_at=naive_now(),
+        )
+    )
+    db_session.commit()
+
+    response = client.post("/chats/runs/run-done/cancel", headers=_auth(token))
+    assert response.status_code == 200, response.text
+    assert response.json()["cancelled"] is False
+    db_session.expire_all()
+    assert db_session.get(AgentRun, "run-done").status == "done"
+
+
+# ========== URL 入库 ==========
+
+
+_HTML = (
+    "<html><head><title>报销制度</title></head>"
+    "<body><h1>总则</h1><p>适用于全体员工。</p></body></html>"
+)
+
+
+def _stub_fetch(monkeypatch, html=_HTML):
+    from services import workspace_tools
+
+    async def fake_fetch(url: str) -> str:
+        return html
+
+    monkeypatch.setattr(workspace_tools, "fetch_page_html", fake_fetch)
+
+
+def _stub_index(monkeypatch):
+    """后台索引会打真实 embedding，换成 no-op。"""
+    from routers import knowledge_router
+
+    async def noop(document_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(knowledge_router, "_index_document_task", noop)
+
+
+def test_从URL入库生成md文档(client, db_session, monkeypatch):
+    """抓一个网页 -> 以 .md 落库，文档名取自 <title>，并回传 sourceUrl。"""
+    _stub_fetch(monkeypatch)
+    _stub_index(monkeypatch)
+    _register(client)
+    token = _login(client)
+
+    response = client.post(
+        "/knowledge/documents/from-url",
+        json={"url": "https://example.com/policy"},
+        headers=_auth(token),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["name"].endswith(".md")
+    assert "报销制度" in body["name"]
+    assert body["sourceUrl"] == "https://example.com/policy"
+
+    from models import Document
+
+    doc = db_session.query(Document).filter_by(id=body["id"]).one()
+    assert doc.name == body["name"]
+
+
+def test_从URL入库把结构化正文交给create_document(client, db_session, monkeypatch):
+    """端点交给落库的正文是结构化的（标题渲染成 #、段落分行），而不是剥成一块扁平文本。"""
+    _stub_fetch(monkeypatch)
+    _stub_index(monkeypatch)
+    _register(client)
+    token = _login(client)
+
+    from routers import knowledge_router
+
+    captured: dict[str, str] = {}
+    original = knowledge_router.knowledge_service.create_document
+
+    async def spy(db, name, content, **kwargs):
+        captured["name"] = name
+        captured["text"] = content.decode("utf-8")
+        return await original(db, name, content, **kwargs)
+
+    monkeypatch.setattr(knowledge_router.knowledge_service, "create_document", spy)
+
+    response = client.post(
+        "/knowledge/documents/from-url",
+        json={"url": "https://example.com/policy"},
+        headers=_auth(token),
+    )
+    assert response.status_code == 200, response.text
+    assert captured["name"].endswith(".md")
+    assert "# 总则" in captured["text"]
+    assert "适用于全体员工。" in captured["text"]
+
+
+def test_从URL入库拒绝非http协议(client, monkeypatch):
+    _stub_index(monkeypatch)
+    _register(client)
+    token = _login(client)
+
+    response = client.post(
+        "/knowledge/documents/from-url",
+        json={"url": "ftp://example.com/x"},
+        headers=_auth(token),
+    )
+    assert response.status_code == 400
+    assert "http/https" in response.json()["detail"]
+
+
+def test_从URL入库抓取失败归400(client, monkeypatch):
+    """超时/连接拒绝这类大多是 URL 本身的问题，归 400 而不是 500。"""
+    from services import workspace_tools
+
+    async def boom(url: str) -> str:
+        raise RuntimeError("connect timeout")
+
+    monkeypatch.setattr(workspace_tools, "fetch_page_html", boom)
+    _stub_index(monkeypatch)
+    _register(client)
+    token = _login(client)
+
+    response = client.post(
+        "/knowledge/documents/from-url",
+        json={"url": "https://example.com/x"},
+        headers=_auth(token),
+    )
+    assert response.status_code == 400
+    assert "抓取失败" in response.json()["detail"]
+
+
+def test_从URL入库空正文归400(client, monkeypatch):
+    """全是脚本的页面抽不出正文，不该入一篇空文档。"""
+    _stub_fetch(monkeypatch, html="<html><body><script>var x=1;</script></body></html>")
+    _stub_index(monkeypatch)
+    _register(client)
+    token = _login(client)
+
+    response = client.post(
+        "/knowledge/documents/from-url",
+        json={"url": "https://example.com/empty"},
+        headers=_auth(token),
+    )
+    assert response.status_code == 400
+    assert "没有可入库的正文" in response.json()["detail"]

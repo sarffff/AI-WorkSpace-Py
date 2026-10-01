@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import httpx
 
 from config import settings
+from services import egress
 from services.telemetry import SpanKind, tracer
 
 logger = logging.getLogger("web_search")
@@ -141,6 +142,13 @@ class WebSearchClient:
     async def search(self, query: str, limit: int | None = None) -> list[SearchResult]:
         if not self.configured:
             raise WebSearchError("web 搜索未配置")
+
+        # 出口策略：endpoint 是运营方配置(provider 默认或 WEB_SEARCH_BASE_URL),
+        # 正常命中 egress 的运营方白名单;配错(指向内网等)在这里早失败,不发出去。
+        try:
+            await egress.check_url(self.endpoint)
+        except egress.EgressBlocked as exc:
+            raise WebSearchError(str(exc)) from exc
 
         count = max(1, min(int(limit or settings.WEB_SEARCH_RESULTS), 20))
         headers, body = self._request(query, count)

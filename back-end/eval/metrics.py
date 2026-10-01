@@ -129,6 +129,51 @@ def mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def percentile(values: list[float], p: float) -> float | None:
+    """线性插值分位数。空列表返回 None（与 mean 同约定：报告里显示"未知"而非 0）。
+
+    均值会被一两条极端样本带偏，而"一半样本多快 / 最慢的 5% 多慢"才是延迟的实际
+    形状——standard.md 的分维度指标明确点名 P95。
+
+    与 services/chunking._percentile 同一套插值，但那边空列表返 inf（拿去比阈值），
+    这里返 None（进报告聚合，和 mean 的 None 对齐）。不跨层 import，两处各留一份。
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = max(0.0, min(100.0, p)) / 100.0 * (len(ordered) - 1)
+    low = int(rank)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (rank - low)
+
+
+def dispersion(values: list[float]) -> dict[str, float | int | None] | None:
+    """同一指标多次重跑的离散度。空列表给 None（同 percentile/mean 的"未知"约定）。
+
+    为什么要它：eval 跑在温度 0 上，重跑结果几乎逐位相同；而线上是温度 0.7，
+    "真实表现会更抖"（standard.md）。拿同一套题在温度 >0 上重跑 K 次、看这里的
+    stdev / cv，才量得出那个抖动有多大——一个均值 0.80 但 cv 0.3 的变体，上线后
+    任意一次回答都可能明显更差，这是单跑一次的点估计永远看不到的。
+
+    cv（变异系数 = stdev/mean）是跨指标可比的那个数：忠实度和延迟量纲不同，
+    stdev 不能直接比大小，cv 归一化之后能。mean 为 0 时 cv 无意义，给 None。
+    """
+    if not values:
+        return None
+    mean = sum(values) / len(values)
+    spread = stdev(values) if len(values) > 1 else 0.0
+    return {
+        "mean": mean,
+        "stdev": spread,
+        "min": min(values),
+        "max": max(values),
+        "cv": (spread / mean) if mean else None,
+        "n": len(values),
+    }
+
+
 def paired_bootstrap(
     baseline: list[float],
     variant: list[float],
@@ -323,3 +368,98 @@ def verdict_stability(
         if stats and stats["significant"]:
             hits += 1
     return hits / seeds
+
+
+# ---- 裁判校准用的一致性统计 ----
+# 拿裁判分与人工标注比对的纯函数（编排见 eval/calibration.py）。放这儿而不是
+# calibration.py：它们和上面的 paired_bootstrap 一样是可单测的纯统计，
+# 而"跑裁判、组织报告"那部分才留在 calibration.py。
+
+
+def agreement_rate(a: list[float], b: list[float]) -> float | None:
+    """两组标注逐条完全相等的比例。配不上对（空或长度不等）返回 None。"""
+    if not a or len(a) != len(b):
+        return None
+    return sum(1 for x, y in zip(a, b) if x == y) / len(a)
+
+
+def mean_absolute_error(a: list[float], b: list[float]) -> float | None:
+    """逐条绝对差的均值。序数分数（1-5）上比"完全相等"更细：差 1 分和差 4 分不是
+    一回事，而 agreement_rate 把它们都算成"不一致"。"""
+    if not a or len(a) != len(b):
+        return None
+    return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+
+def cohens_kappa(a: list[int], b: list[int], *, weighted: bool = True) -> float | None:
+    """Cohen's kappa：扣掉"瞎猜也能撞上"的一致性后，还剩多少真一致。
+
+    为什么不看纯一致率：两个都爱打 4 分的标注者光靠打分分布就能撞上一大片，
+    一致率虚高。kappa 拿边际分布估出"偶然一致"并扣掉——这才是 standard.md 说
+    "judge 要用人工标注校准"该给的数，而非被基线率灌水的百分比。
+
+    ``weighted`` 用二次加权（序数分数适用）：差 1 分算轻微、差 4 分算严重，
+    而不是无权版那样"只要不完全相等就一律算错"。所有标注落在同一档时 kappa
+    无定义，返回 None（"没有分歧"不等于"高度一致"）。
+    """
+    if not a or len(a) != len(b):
+        return None
+    labels = sorted(set(a) | set(b))
+    k = len(labels)
+    if k < 2:
+        return None
+    index = {label: i for i, label in enumerate(labels)}
+    n = len(a)
+
+    def weight(i: int, j: int) -> float:
+        if not weighted:
+            return 0.0 if i == j else 1.0
+        return ((i - j) / (k - 1)) ** 2
+
+    matrix = [[0.0] * k for _ in range(k)]
+    for x, y in zip(a, b):
+        matrix[index[x]][index[y]] += 1
+    row = [sum(matrix[i]) for i in range(k)]
+    col = [sum(matrix[i][j] for i in range(k)) for j in range(k)]
+
+    observed = expected = 0.0
+    for i in range(k):
+        for j in range(k):
+            w = weight(i, j)
+            observed += w * matrix[i][j] / n
+            expected += w * (row[i] / n) * (col[j] / n)
+    if expected == 0:
+        return None
+    return 1.0 - observed / expected
+
+def spearman(a: list[float], b: list[float]) -> float | None:
+    """Spearman 秩相关：两组打分的**排序**有多一致（对单调变换不敏感）。
+
+    kappa 看"逐条对不对得上"，spearman 看"排序趋势一致不一致"——裁判整体偏高但
+    排序与人工一致时，kappa 会难看而 spearman 仍高。两个都看才不会误判。
+    """
+    if not a or len(a) != len(b) or len(a) < 2:
+        return None
+
+    def ranks(values: list[float]) -> list[float]:
+        order = sorted(range(len(values)), key=lambda i: values[i])
+        result = [0.0] * len(values)
+        i = 0
+        while i < len(order):
+            j = i
+            while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+                j += 1
+            avg = (i + j) / 2 + 1  # 并列取平均秩，否则并列值会人为拉低相关
+            for m in range(i, j + 1):
+                result[order[m]] = avg
+            i = j + 1
+        return result
+
+    ra, rb = ranks(a), ranks(b)
+    mean_a = sum(ra) / len(ra)
+    mean_b = sum(rb) / len(rb)
+    cov = sum((x - mean_a) * (y - mean_b) for x, y in zip(ra, rb))
+    var_a = sum((x - mean_a) ** 2 for x in ra)
+    var_b = sum((y - mean_b) ** 2 for y in rb)
+    if var_a == 0 or var_b == 0:
+        return None
+    return cov / (var_a * var_b) ** 0.5

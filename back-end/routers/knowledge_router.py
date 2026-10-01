@@ -1,4 +1,5 @@
 import logging
+from urllib.parse import urlparse
 
 from fastapi import (
     APIRouter,
@@ -15,7 +16,7 @@ from sqlalchemy.orm import Session
 from auth import get_current_user
 from database import SessionLocal, get_db
 from models import User
-from services import file_types, workspace_service
+from services import egress, file_types, ingest_clean, workspace_service, workspace_tools
 from services.knowledge_service import KnowledgeService
 from services.workspace_service import WorkspaceError
 
@@ -133,6 +134,100 @@ async def upload_document(
         "status": doc.status,
         "visibility": doc.visibility,
         "duplicate": duplicate,
+    }
+
+
+class UrlIngestRequest(BaseModel):
+    """把一个网页加入知识库。``visibility`` 与 upload 同义（默认工作区共享）。"""
+
+    url: str = Field(min_length=1, max_length=2000)
+    visibility: str = "workspace"
+
+
+@router.post("/documents/from-url")
+async def add_document_from_url(
+    request: UrlIngestRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """把一个网页抓成结构化正文，作为一篇 ``.md`` 文档入库。
+
+    与 upload 走同一条落库/索引路径（``create_document`` + 后台索引），区别只在
+    正文来源是 URL 而不是上传的文件字节。
+
+    出站请求是这个端点唯一的额外攻击面，而它由 egress 兜住：``fetch_page_html``
+    走的 ``_http_get_text`` 每一跳（含重定向）都先过 ``egress.check_url``，默认拦
+    私网/环回/云元数据。所以这里不需要新开关——它是已鉴权用户主动发起的知识
+    管理动作，和上传文件同级，SSRF 由 egress 统一防。
+
+    正文以 ``.md`` 落库：``html_to_text_structured`` 把 ``<h1..6>`` 渲染成 ``#`` 标题、
+    块级标签换成换行，于是 chunking 的标题路径与章节边界优先对网页同样生效
+    （flatten 成一段就全失效了，症状同 PDF 没恢复结构）。
+    """
+    url = request.url.strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"只支持 http/https 链接，收到 {parsed.scheme or '（无协议）'!r}。",
+        )
+
+    try:
+        raw_html = await workspace_tools.fetch_page_html(url)
+    except egress.EgressBlocked as exc:
+        raise HTTPException(status_code=400, detail=f"抓取被拒：{exc}")
+    except Exception as exc:
+        # 超时/连接拒绝/404/SSL/编码不可识别——大多是 URL 本身的问题，归 400
+        # 而不是 500：这不是服务故障，换一个 URL 通常就好了。
+        raise HTTPException(status_code=400, detail=f"抓取失败：{type(exc).__name__}")
+
+    text = ingest_clean.html_to_text_structured(raw_html)
+    if not text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="该网页没有可入库的正文（可能全是脚本、图片或需要登录）。",
+        )
+
+    title = ingest_clean.html_title(raw_html) or parsed.netloc or "web"
+    name = workspace_tools.safe_document_name(title) + ".md"
+
+    workspace = workspace_service.resolve_for_user(db, current_user)
+    try:
+        # 同 upload：只有传共享文档才要 admin，这一句同时挡掉"user 手改请求把
+        # visibility 填成 workspace"。
+        resolved_visibility = workspace_service.resolve_upload_visibility(
+            current_user, request.visibility
+        )
+    except WorkspaceError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    try:
+        doc, duplicate = await knowledge_service.create_document(
+            db,
+            name,
+            text.encode("utf-8"),
+            workspace_id=workspace.id,
+            uploader_id=current_user.id,
+            visibility=resolved_visibility,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("URL 文档入库失败")
+        raise HTTPException(status_code=500, detail="文档入库失败，请稍后重试") from e
+
+    if not duplicate:
+        background_tasks.add_task(_index_document_task, doc.id)
+
+    return {
+        "id": doc.id,
+        "name": doc.name,
+        "size": doc.size,
+        "chunks": doc.chunks,
+        "status": doc.status,
+        "visibility": doc.visibility,
+        "duplicate": duplicate,
+        "sourceUrl": url,
     }
 
 

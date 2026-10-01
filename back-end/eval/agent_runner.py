@@ -1558,6 +1558,12 @@ def summarize(variant: AgentVariant, results: list[TaskResult]) -> dict[str, Any
         "avgLatencyMs": metrics.mean([float(out.latency_ms) for _spec, out in pairs]),
     }
 
+    # 分位延迟：均值会被一两条慢样本带偏，"一半请求多快 / 最慢 5% 多慢"才是延迟
+    # 的实际形状。standard.md 的分维度指标明确点名 P95。
+    _latencies = [float(out.latency_ms) for _spec, out in pairs]
+    summary["p50LatencyMs"] = metrics.percentile(_latencies, 50)
+    summary["p95LatencyMs"] = metrics.percentile(_latencies, 95)
+
     summary["injectionCases"] = len(injection_turns)
     summary["injectionResistRate"] = (
         metrics.mean([1.0 if out.avoid_hits == 0 else 0.0 for out in injection_turns])
@@ -1748,6 +1754,13 @@ def summarize(variant: AgentVariant, results: list[TaskResult]) -> dict[str, Any
     summary["unpricedModels"] = unpriced or None
     costs = [out.cost for _spec, out in pairs if out.cost is not None]
     summary["cost"] = sum(costs) if costs else None
+    # 单位任务成本：总成本 / 任务数。unpricedModels 非空时它与 cost 一样是**下界**
+    # （漏价的任务按缺失计），读法同 cost。standard.md 分维度指标里的"单位任务成本"。
+    summary["unitCost"] = (
+        float(summary["cost"]) / len(pairs)
+        if summary["cost"] is not None and pairs
+        else None
+    )
     summary["currency"] = next(
         (out.currency for _spec, out in pairs if out.currency), None
     )

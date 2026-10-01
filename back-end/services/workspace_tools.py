@@ -42,6 +42,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from config import settings
+from services import egress
 from services import file_types
 from services import knowledge_service as knowledge_module
 from services.guardrails import guard
@@ -612,28 +613,44 @@ class _FetchError(Exception):
     """抓取失败（超限、状态码、解码等），消息可直接展示给模型。"""
 
 
+_MAX_REDIRECTS = 5
+
+
 async def _http_get_text(url: str, max_bytes: int, timeout: float) -> str:
-    """抓取一个 URL 的正文并解码。独立成函数，测试可替换传输层。"""
+    """抓取一个 URL 的正文并解码。手动跟随重定向：每一跳都先过 egress.check_url，
+    否则白名单内页面 302 到内网/元数据就绕过了 SSRF 防护。测试可替换传输层。"""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (compatible; AI-Workspace/1.0; "
             "+https://github.com/anomalyco/opencode)"
         )
     }
+    current = url
     async with httpx.AsyncClient(
-        follow_redirects=True, timeout=timeout, headers=headers
+        follow_redirects=False, timeout=timeout, headers=headers
     ) as client:
-        async with client.stream("GET", url) as response:
-            response.raise_for_status()
-            chunks: list[bytes] = []
-            size = 0
-            async for chunk in response.aiter_bytes():
-                size += len(chunk)
-                if size > max_bytes:
-                    raise _FetchError(
-                        f"页面超过 {max_bytes} 字节上限，未完整读取。"
-                    )
-                chunks.append(chunk)
+        for _ in range(_MAX_REDIRECTS + 1):
+            await egress.check_url(current)
+            async with client.stream("GET", current) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise _FetchError("重定向响应缺少 Location 头。")
+                    current = str(response.url.join(location))
+                    continue
+                response.raise_for_status()
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise _FetchError(
+                            f"页面超过 {max_bytes} 字节上限，未完整读取。"
+                        )
+                    chunks.append(chunk)
+                break
+        else:
+            raise _FetchError(f"重定向超过 {_MAX_REDIRECTS} 次上限。")
     try:
         return b"".join(chunks).decode("utf-8")
     except UnicodeDecodeError:
@@ -677,6 +694,8 @@ async def _fetch_web_page(arguments: dict[str, Any]) -> str:
             settings.WEB_FETCH_MAX_BYTES,
             settings.WEB_FETCH_TIMEOUT_SECONDS,
         )
+    except egress.EgressBlocked as exc:
+        return f"抓取失败：{exc}"
     except _FetchError as exc:
         return f"抓取失败：{exc}"
     except Exception as exc:
@@ -695,6 +714,23 @@ async def _fetch_web_page(arguments: dict[str, Any]) -> str:
         f"【{url.strip()}】\n{body}", label="网页内容", kind="fetch_web_page"
     )
     return shielded
+
+
+async def fetch_page_html(url: str) -> str:
+    """抓取一个 URL 的**原始 HTML**（egress 防护 + 大小/超时上限）。
+
+    给 URL 入库（``knowledge_router`` 的 from-url）用。与工具 ``_fetch_web_page`` 的区别：
+    那个返回已剥标签、已过护栏、已截断的**正文**（给模型当工具结果）；这个返回
+    原始 HTML，不剥标签、不过护栏——入库那条路自己决定怎么解析（保留块结构，
+    见 ``ingest_clean.html_to_text_structured``）与清洗。
+
+    两者共用同一个 ``_http_get_text``，所以 SSRF 防护（逐跳过 ``egress.check_url``）
+    与重定向/编码处理是同一套。失败抛 ``egress.EgressBlocked`` 或 ``_FetchError``，
+    由调用方转成可读提示。
+    """
+    return await _http_get_text(
+        url, settings.WEB_FETCH_MAX_BYTES, settings.WEB_FETCH_TIMEOUT_SECONDS
+    )
 
 
 _WEB_FETCH = ToolDefinition(
@@ -781,6 +817,7 @@ __all__ = [
     "detect_delete_intent",
     "enabled_names",
     "evaluate_expression",
+    "fetch_page_html",
     "file_extension",
     "html_to_text",
     "resolve_upload_path",

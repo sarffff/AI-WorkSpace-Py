@@ -20,10 +20,16 @@ from services import (
     file_types,
     fs_roots,
     fs_tools,
+    prompt_library,
     subagent,
 )
 
 router = APIRouter(prefix="/settings", tags=["设置"])
+
+
+def _split_csv(value: str | None) -> list[str]:
+    """把逗号分隔的配置拆成去空的列表。VISION_MODELS / LLM_FALLBACK_MODELS 用。"""
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
 
 class PreferencesUpdate(BaseModel):
     defaultModel: str | None = None
@@ -96,6 +102,33 @@ async def get_settings(
                 "hasRoots": fs_roots.has_roots(db, current_user.id),
                 "writeEnabled": app_settings.TOOL_FS_WRITE_ENABLED,
                 "deleteEnabled": app_settings.TOOL_FS_DELETE_ENABLED,
+            },
+            # 完整能力档案：把散在 .env 里、决定"这个 Agent 到底能做什么"的开关
+            # 集中报出来。上面几项只盖了工具/审批/委派/fs，运营方看不到规划、
+            # 护栏、记忆、视觉、向量库、备用模型与生效的提示词版本——而这些恰恰是
+            # "部署完得到一个纯 RAG 聊天框"还是"一个可用的 Agent"的分界。全部只读：
+            # 改这些要改 .env 重启（进程级配置），所以这里报的是"当前生效值"。
+            "agent": {
+                "planMode": app_settings.AGENT_PLAN_MODE,
+                "guardrails": app_settings.GUARDRAIL_ENABLED,
+                "memory": app_settings.MEMORY_ENABLED,
+                "webFetch": app_settings.TOOL_WEB_FETCH_ENABLED,
+                "askUser": app_settings.TOOL_ASK_USER_ENABLED,
+                "deleteKnowledge": app_settings.TOOL_DELETE_KNOWLEDGE_ENABLED,
+                "visionModels": _split_csv(app_settings.VISION_MODELS),
+                # 扫描件 OCR 兜底开着吗。开了但没配视觉模型 / 模型不在白名单时,
+                # 这里仍报 true,而"实际能不能跑"由启动日志的 _check_ocr_config 兜——
+                # 和 visionModels 只列白名单、不验证端点真的收这些模型是同一种取舍。
+                "ocrScanned": app_settings.INGEST_OCR_ENABLED,
+                # 向量库后端。memory 是多 worker 不能用的那个（每个 worker 各建一份
+                # 索引），报出来让运营方知道当前形态能不能水平扩。
+                "vectorStore": app_settings.VECTOR_STORE,
+                # 主模型的备用链。空 = 没有降级路径（提供商抽风时主回答直接报错）。
+                "fallbackModels": _split_csv(app_settings.LLM_FALLBACK_MODELS),
+                # 生效的提示词版本（resolve 后的，不是配置项的字面空串）。
+                # 与上面“开了哪些工具”放在一起，运营方才能看出“工具开了但提示词
+                # 没讲它们”这类错配（启动日志也会警告，但那只在日志里）。
+                "promptVersion": prompt_library.resolve_version("chat_system_rag"),
             },
         },
     }

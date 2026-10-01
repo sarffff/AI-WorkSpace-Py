@@ -1,6 +1,8 @@
 import logging
 import os
 
+import asyncio
+
 import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,8 +32,11 @@ from routers import (
     fs_router,
     skill_router,
     review_router,
+    audit_router,
+    notification_router,
 )
 from services import approval
+from services import security_preflight
 from services import prompt_library
 from services import skill_library
 from services import ingest_clean
@@ -93,6 +98,8 @@ app.include_router(workspace_router.router)
 app.include_router(fs_router.router)
 app.include_router(skill_router.router)
 app.include_router(review_router.router)
+app.include_router(audit_router.router)
+app.include_router(notification_router.router)
 
 # 静态文件服务：附件上传后的访问入口
 os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
@@ -291,6 +298,7 @@ def _check_ingest_backend() -> None:
     这正是把它定成必需依赖而不是可选降级的理由；只做成一条警告等于把那个决定
     又变回可选。
     """
+    _check_ocr_config()
     if not settings.INGEST_PDF_STRUCTURE:
         return
     if not ingest_clean.structure_backend_available():
@@ -300,6 +308,31 @@ def _check_ingest_backend() -> None:
             "而文档状态仍是 indexed——这种失败查不出来。"
             "请 pip install -r requirements.txt，或把 INGEST_PDF_STRUCTURE 设为 false。"
         )
+
+
+def _check_ocr_config() -> None:
+    """OCR 是默认关的可选项，所以这里**只警告不拒绝启动**（与 pdfplumber 不同）。
+
+    但半配置必须吼出来：开了 OCR 却没配模型 / 模型不在视觉白名单 / 渲染后端缺，
+    三种情况下扫描件都仍然进不了库，而界面上只表现为"传了没反应"。启动日志是
+    排查这类静默失效的第一现场——和审批开着但快照关着那条警告同一个道理。
+    """
+    if not settings.INGEST_OCR_ENABLED:
+        return
+    from services import ocr, vision
+
+    model = settings.INGEST_OCR_MODEL
+    if not model:
+        print("  ⚠ INGEST_OCR_ENABLED=true 但 INGEST_OCR_MODEL 未配置 —— 扫描件不会被 OCR。")
+    elif not vision.supports_vision(model):
+        print(
+            f"  ⚠ INGEST_OCR_MODEL={model} 不在 VISION_MODELS 白名单里 —— "
+            "给非视觉模型发图会换来 400，OCR 不会生效。"
+        )
+    elif not ocr.render_backend_available():
+        print("  ⚠ OCR 渲染后端（pdfplumber / Pillow）缺失 —— 扫描件无法渲染成图片。")
+    else:
+        print(f"OCR: 扫描件兜底已启用（模型 {model}，≤{settings.INGEST_OCR_MAX_PAGES} 页/篇）")
 
 
 def _adopt_orphaned_documents() -> None:
@@ -333,9 +366,59 @@ def _adopt_orphaned_documents() -> None:
         db.close()
 
 
+def _recover_stalled_documents() -> None:
+    """重启后把卡在 ``processing`` 的文档重新索引。
+
+    上传走 ``BackgroundTasks``（进程内 fire-and-forget，不落磁盘），进程在索引
+    中途重启的话，那些文档会永远停在 ``processing``——既没 ``indexed``（检索不到）
+    也没 ``failed``（看不出出了问题）。这里在启动时把它们捞出来重新驱动。
+
+    ``index_document`` 是幂等的（先删旧分块再写新的，见它里那段注释），所以重跑
+    安全；它自己吞异常并落 ``failed``，所以重跑失败也不会把文档留在 ``processing``。
+
+    只在 startup 扫一次：项目里没有 worker 进程，而 ``processing`` 是"正在这个进程
+    里跑"的状态，重启后没有别的进程会接它们，所以启动是唯一能兜住的位置
+    （同 ``_adopt_orphaned_documents`` 的取舍）。
+
+    每篇一个独立的后台任务、各自建 session：``index_document`` 会跑 embedding（慢、
+    可能失败），串在启动里会拖慢冷启动，且一篇失败不该连累其它篇。任务数封顶，
+    避免一次异常重启（比如 embedding 端点挂了）后启动瞬间涌出无限制的并发任务。
+    """
+    from models import Document
+
+    db = SessionLocal()
+    try:
+        stalled = (
+            db.query(Document.id)
+            .filter(Document.status == "processing")
+            .limit(500)
+            .all()
+        )
+        ids = [row[0] for row in stalled]
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠ 扫描中断文档失败（不影响启动）：{type(exc).__name__}: {exc}")
+        return
+    finally:
+        db.close()
+
+    if not ids:
+        return
+
+    for doc_id in ids:
+        # 复用路由那个后台任务包装：它已经做了"自建 session + 用完关掉"。
+        asyncio.create_task(knowledge_router._index_document_task(doc_id))
+    print(
+        f"  ↻ 重新索引 {len(ids)} 篇上次中断在 processing 的文档"
+        "（进程内后台任务不落磁盘，重启会丢，这里补跑）。"
+    )
+
+
 @app.on_event("startup")
 async def startup():
     """应用启动时执行"""
+    # 交付前最该拦的事故：拿示例配置（占位密钥 / 示例库口令 / 无鉴权向量库）上生产。
+    # 生产有问题即拒绝启动，dev 只告警。放在最前——不安全就别再往下做任何事。
+    security_preflight.enforce(settings, logger=logger)
     init_db()
     _seed_prompts()
     # 提示词模板有问题（占位符对不上、条件段没闭合、默认版本已归档）就在这里
@@ -347,6 +430,7 @@ async def startup():
     skill_library.validate()
     _check_ingest_backend()
     _adopt_orphaned_documents()
+    _recover_stalled_documents()
     # 工具是按开关注册的，而"开关开了但没配 key 的 web_search 根本不注册"这类
     # 静默行为在界面上只表现为"模型不用那个工具"——分不清是没注册还是模型不想用。
     # 所以启动时把实际注册了哪些打出来，这是排查工具类问题的第一现场。

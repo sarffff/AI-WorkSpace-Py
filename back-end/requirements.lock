@@ -1,0 +1,54 @@
+# ============================================================================
+# requirements.lock —— 直接依赖的锁定版本（供应链硬化，配合 requirements.txt）
+# ============================================================================
+# requirements.txt 全是 `>=` 下限，下一次 `pip install` 就可能把某个依赖升到新的大
+# 版本——这正是供应链风险的入口（上游被投毒，或一次破坏性升级）。这份文件把**直接
+# 依赖**钉到已验证可用的确切版本，安装时用它取代范围解析：
+#
+#     pip install -r requirements.lock
+#
+# ── 诚实边界（不藏着）───────────────────────────────────────────────────────
+# 1. 这里只钉**直接依赖**，不含传递依赖的完整图、也不带 hash。完整的、带 --hash 的
+#    传递锁需要 pip-tools / uv，且必须在**目标平台 + 目标 Python** 上生成（faiss-cpu、
+#    numpy 这类带 wheel 的包按平台解析不同）：
+#        pip install pip-tools && pip-compile --generate-hashes -o requirements.lock requirements.txt
+#        # 或： uv pip compile requirements.txt -o requirements.lock --generate-hashes
+#    建议把这一步放进 CI，在部署镜像的同一环境里跑。
+# 2. 下面的版本是在 Python 3.14 / Windows(win_amd64) 上解析出来的。换平台或换 Python
+#    应重新生成，别照抄——这就是第 1 条要在 CI 里做的原因。
+# 3. 前端已用 pnpm-lock.yaml 锁定；这份把后端补齐到同一姿态的第一步。
+# ============================================================================
+
+# ---- 运行时 ----
+fastapi==0.139.2
+uvicorn==0.51.0
+sqlalchemy==2.0.51
+alembic==1.19.1
+pymysql==1.2.0
+redis==8.1.0
+python-dotenv==1.2.2
+sse-starlette==3.4.6
+pydantic==2.13.4
+pydantic-settings==2.14.2
+python-jose==3.5.0
+bcrypt==5.0.0
+python-multipart==0.0.32
+openai==2.51.0
+httpx==0.28.1
+email-validator==2.3.0
+PyPDF2==3.0.1
+pdfplumber==0.11.10
+charset-normalizer==3.4.9
+python-docx==1.2.0
+openpyxl==3.1.5
+python-pptx==1.0.2
+numpy==2.5.1
+faiss-cpu==1.15.0
+qdrant-client==1.19.0
+slowapi==0.1.10
+
+# ---- 测试 ----
+pytest==9.1.1
+# pytest-asyncio: requirements.txt 里声明了，但本环境未安装、且测试刻意不依赖它
+#   （conftest 用 asyncio.run 驱动协程，见其模块文档）。需要时按目标环境补钉版本。
+langsmith==0.10.15
