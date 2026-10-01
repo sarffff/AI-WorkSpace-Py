@@ -65,7 +65,7 @@ IMAGE: frozenset[str] = frozenset({"png", "jpg", "jpeg", "gif", "webp"})
 # ``test_file_types_single_source.test_document_category_has_a_signature_constant``
 # 会在忘记时立刻红——这条闸门就是为了这一刻加的。
 #
-DOCUMENT: frozenset[str] = frozenset({"pdf", "docx", "xlsx"})
+DOCUMENT: frozenset[str] = frozenset({"pdf", "docx", "xlsx", "pptx"})
 
 
 # ========== 按界面派生 ==========
@@ -120,8 +120,8 @@ _EXTRA_BINARY: frozenset[str] = frozenset({
     # 本地数据库
     "sqlite", "sqlite3", "mdb",
     # 上传链路不收、但同族的办公格式（doc/xls/ppt 是旧二进制格式，
-    # docx/xlsx 已在 DOCUMENT 里）
-    "doc", "xls", "ppt", "pptx",
+    # 需先另存为 OOXML 的 docx/xlsx/pptx；后者已在 DOCUMENT 里）
+    "doc", "xls", "ppt",
 })
 
 # ``exe``/``bat``/``ps1``/``vbs`` 从 DELIBERATELY_EXCLUDED 里来——它们在那儿是

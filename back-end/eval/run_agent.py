@@ -63,6 +63,7 @@ _COLUMNS = [
     ("completionTokens", "输出 token"),
     ("cost", "成本"),
     ("avgLatencyMs", "平均耗时 ms"),
+    ("p95LatencyMs", "P95 耗时 ms"),
 ]
 
 _DIAGNOSTICS = [

@@ -21,6 +21,7 @@ from database import get_db
 from models import AgentRun, TraceSpan, User
 from services.clock import naive_now
 from services.pricing import price_table
+from services import production_monitor
 from services.semantic_cache import semantic_cache
 
 router = APIRouter(prefix="/metrics", tags=["用量与追踪"])
@@ -171,6 +172,29 @@ async def get_usage(
         "byKind": _grouped(db, current_user.id, since, TraceSpan.kind),
         # 缓存统计存在进程内，重启归零，也不受 days 窗口约束——面板上要说清楚
         "cache": semantic_cache.stats(),
+    }
+
+
+@router.get("/health")
+async def get_health(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """全局线上健康快照 + 顺带触发一次告警评估。**管理员专属**。
+
+    与本路由其它接口不同，这个是**跨用户的全局聚合**：错误率/人工介入率/成本/延迟
+    是整条线的健康，不是某个人的用量。所以按 role 收口到管理员——没有细粒度 RBAC，
+    就用现成的 admin/user 这一档。
+    force=True：管理员主动看健康页时就该即时评估，不受未读数心跳的节流影响。
+    """
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可查看线上健康指标")
+    report = production_monitor.health_report(db)
+    alerted = production_monitor.evaluate_and_alert(db, force=True)
+    return {
+        "enabled": settings.MONITOR_ENABLED,
+        "report": report,
+        "alertsCreated": len(alerted),
     }
 
 

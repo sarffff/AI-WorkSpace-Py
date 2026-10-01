@@ -50,6 +50,7 @@
 - ✅ **文档管理** - 上传、索引、管理知识库文档
 - ✅ **向量检索** - 基于语义的智能检索
 - ✅ **分块管理** - 文档自动分块和嵌入
+- ✅ **扫描件 OCR** - 没有文本层的 PDF 用视觉模型逐页转写再入库（默认关，需配视觉模型、页数封顶）
 - ✅ **状态追踪** - 实时查看文档处理状态
 
 ### 💡 提示词工程
@@ -86,6 +87,7 @@
 - ✅ **调用链追踪** - 父子 span 树，按轮次归因；token 来源（实测/估算）与成本分列
 - ✅ **成本估算** - 可覆盖的价目表；命中不了返回"未知"而不是编一个数字
 - ✅ **用量闸门** - 按用户的频率、成本、token 三道上界
+- ✅ **线上健康告警** - 错误率 / 人工介入率 / 单次成本 / p95 延迟超阈值，经通知出口自动推给管理员（默认关，补"离线金标↔线上分布"那半环）
 - ✅ **RAG 评估** - 54 题金标 / 13 篇语料 / 26 个配置变体，
   precision@k、nDCG、拒答率、抗注入率、编造率
 - ✅ **Agent 评估** - 29 个任务，工具召回、轮次效率、委派开销
@@ -332,13 +334,13 @@ curl -X POST http://localhost:3000/chats/completions/stream \
 ### 测试与门禁
 
 ```bash
-# 后端(1041 条)
+# 后端(1668 条)
 cd back-end && python -m pytest
 
 # 提示词契约:模板缺失或占位符漂移直接失败
 python -c "from services import prompt_library; prompt_library.validate()"
 
-# 前端(47 条)
+# 前端(140 条)
 cd front-end && pnpm test && pnpm tsc --noEmit
 ```
 
@@ -354,6 +356,14 @@ cd back-end && python -m eval.run --variants baseline,rerank-api
 
 # 判门禁(阈值在 eval/gate_thresholds.json)
 python -m eval.gate
+
+# 多次运行看方差：同一套题在生产温度下重跑 N 次，报告出 cv/stdev
+# （离线默认温度 0 几乎不抖，温度 >0 才量得出线上那种波动）
+python -m eval.run --repeat 5 --temperature 0.7
+
+# 线上抽样送评：把真实问答回流进裁判打分，低分导成回归候选
+# （补"离线金标 ↔ 线上分布"那半环；重检索用当前库，relevance 准、faithfulness 会漂）
+python -m eval.online_sample --limit 50 --export
 ```
 
 门禁退出码分开是刻意的：`1` 质量或安全回归、`2` **运行本身不可信**、

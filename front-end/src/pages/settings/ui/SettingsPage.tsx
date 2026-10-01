@@ -5,7 +5,7 @@ import type { AppSettings, UserPreferences } from "@/shared/types/api.types";
 import { PageHeader } from "@/shared/ui/PageHeader";
 import { setSelectedModel } from "@/entities/chat/model/chatSlice";
 import { useNavigate } from "react-router-dom";
-import { Server, Cpu, X, Loader2, Save, Check, Database, ArrowRight, Wrench, Paperclip, Globe, BookPlus, History, Users, ShieldCheck } from "lucide-react";
+import { Server, Cpu, X, Loader2, Save, Check, Database, ArrowRight, Wrench, Paperclip, Globe, BookPlus, History, Users, ShieldCheck, ListChecks, Brain, Link2, HelpCircle, Trash2, Eye } from "lucide-react";
 import { CapCell } from "../components/CapCell";
 import { ModeCell } from "../components/ModeCell";
 import { ConfigRow } from "../components/ConfigRow";
@@ -167,7 +167,87 @@ export const SettingsPage: React.FC = () => {
                                 }
                             />
                         )}
+                        {settings.capabilities.agent && (
+                            <>
+                                <ModeCell
+                                    icon={<ListChecks className="w-3.5 h-3.5" />}
+                                    label="事前规划"
+                                    active={settings.capabilities.agent.planMode !== "off"}
+                                    mode={
+                                        settings.capabilities.agent.planMode === "plan_execute"
+                                            ? "计划-执行"
+                                            : "关闭（纯 ReAct）"
+                                    }
+                                />
+                                <CapCell
+                                    icon={<ShieldCheck className="w-3.5 h-3.5" />}
+                                    label="注入护栏"
+                                    on={settings.capabilities.agent.guardrails}
+                                />
+                                <CapCell
+                                    icon={<Brain className="w-3.5 h-3.5" />}
+                                    label="长期记忆"
+                                    on={settings.capabilities.agent.memory}
+                                />
+                                <CapCell
+                                    icon={<Link2 className="w-3.5 h-3.5" />}
+                                    label="网页抓取"
+                                    on={settings.capabilities.agent.webFetch}
+                                />
+                                <CapCell
+                                    icon={<HelpCircle className="w-3.5 h-3.5" />}
+                                    label="澄清提问"
+                                    on={settings.capabilities.agent.askUser}
+                                />
+                                <CapCell
+                                    icon={<Trash2 className="w-3.5 h-3.5" />}
+                                    label="删除知识库文档"
+                                    on={settings.capabilities.agent.deleteKnowledge}
+                                />
+                                <CapCell
+                                    icon={<Eye className="w-3.5 h-3.5" />}
+                                    label="视觉（读图）"
+                                    on={settings.capabilities.agent.visionModels.length > 0}
+                                />
+                            </>
+                        )}
                     </div>
+                    {/* 运行形态：不是开关，而是“当前这套配置到底是什么形态”。
+                        向量库=memory 时多 worker 不能用；备用链为空时提供商故障
+                        会直接报错——这两件事在工具矩阵里看不出来，单独说。 */}
+                    {settings.capabilities.agent && (
+                        <div className="pt-3 mt-1 border-t border-[#e6e2d8] dark:border-[#282724] grid grid-cols-1 md:grid-cols-3 gap-3 text-[11px]">
+                            <div>
+                                <span className="block text-[#918d83] mb-0.5">生效提示词版本</span>
+                                <span className="font-mono text-[#1f1e1d] dark:text-[#edece8]">
+                                    chat_system_rag/
+                                    {settings.capabilities.agent.promptVersion}
+                                </span>
+                            </div>
+                            <div>
+                                <span className="block text-[#918d83] mb-0.5">向量库</span>
+                                <span className="font-mono text-[#1f1e1d] dark:text-[#edece8]">
+                                    {settings.capabilities.agent.vectorStore}
+                                    {settings.capabilities.agent.vectorStore ===
+                                        "memory" && (
+                                        <span className="ml-1 font-sans text-amber-600 dark:text-amber-500">
+                                            （多 worker 不可用）
+                                        </span>
+                                    )}
+                                </span>
+                            </div>
+                            <div>
+                                <span className="block text-[#918d83] mb-0.5">主模型备用链</span>
+                                <span className="font-mono text-[#1f1e1d] dark:text-[#edece8]">
+                                    {settings.capabilities.agent.fallbackModels.length
+                                        ? settings.capabilities.agent.fallbackModels.join(
+                                              " → ",
+                                          )
+                                        : "无（提供商故障时直接报错）"}
+                                </span>
+                            </div>
+                        </div>
+                    )}
                 </div>
             )}
 

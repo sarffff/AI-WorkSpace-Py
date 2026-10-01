@@ -273,6 +273,31 @@ export interface ServerCapabilities {
   fileTypes?: FileTypesCapability;
   /** 旧版后端不返回这一块 */
   fs?: FsCapability;
+  /** 完整 Agent 能力档案。旧版后端不返回这一块 */
+  agent?: AgentCapability;
+}
+
+/**
+ * 完整 Agent 能力档案：把散在 .env 里、决定"这个 Agent 到底能做什么"的开关
+ * 集中报出来。全部只读——改这些要改 .env 重启（进程级配置），所以这里报的是
+ * "当前生效值"，给运营方一个"到底开了什么"的单一视图。
+ */
+export interface AgentCapability {
+  /** off | plan_execute */
+  planMode: string;
+  guardrails: boolean;
+  memory: boolean;
+  webFetch: boolean;
+  askUser: boolean;
+  deleteKnowledge: boolean;
+  /** 能收图的视觉模型白名单。空 = 视觉关闭（图片只以链接形式留在提示词里） */
+  visionModels: string[];
+  /** memory | qdrant。memory 是多 worker 不能用的那个 */
+  vectorStore: string;
+  /** 主模型备用链。空 = 没有降级路径 */
+  fallbackModels: string[];
+  /** 生效的提示词版本（resolve 后的，不是配置项的字面空串） */
+  promptVersion: string;
 }
 
 /**
@@ -439,6 +464,12 @@ export interface StreamChunk {
     | "approval_resolved"
     | "clarification"
     | "clarification_answered"
+    /**
+     * 用户主动停止（POST /chats/runs/{runId}/cancel）后，循环在安全点收尾时发出。
+     * 与断线不同：这是终态，不会出现在可接续列表里。前端通常在 abort 后读不到它，
+     * 这个分支是跨标签取消 / abort 竞态时的防御性收尾。
+     */
+    | "cancelled"
     | "done"
     | "error";
   content?: string;
@@ -713,7 +744,21 @@ export interface AgentRunDetail {
   chatId: string;
   messageId?: string | null;
   agentRole?: string | null;
-  status: "running" | "waiting_approval" | "done" | "failed" | "abandoned";
+  /**
+   * 后端真实会返回的执行状态全集。之前只列了 5 个，漏了 waiting_input /
+   * interrupted / cancelled：这三个都会真实出现在 GET /chats/runs/{id} 的响应里
+   * （cancelled 是用户主动“停止生成”的终态，见 POST /chats/runs/{id}/cancel）。
+   * 缺一个就会让按状态分支的渲染漏掉那一档。
+   */
+  status:
+    | "running"
+    | "waiting_approval"
+    | "waiting_input"
+    | "interrupted"
+    | "done"
+    | "failed"
+    | "abandoned"
+    | "cancelled";
   rounds: number;
   delegations: number;
   interrupts: number;

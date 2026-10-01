@@ -52,13 +52,18 @@ Phase = Literal[
 # 用户写的那句话，它要以 ``role=tool`` 的身份接在模型那次 ask_user 调用后面。
 # 走 role=user 的话模型看到的是"有人插了句话"，而不是"我问的问题有答案了"，
 # 它会倾向于重新组织整个回答，而不是拿着答案接着做原来那件事。
+# ``cancelled`` 是用户主动点了"停止生成"：与 ``interrupted``（连接断了、状态完好、
+# 可以接着跑）刻意分开——前者是终态、不进"可接续"列表，后者会被列出来问"接着跑吗"。
+# 把主动停止记成 interrupted 会让系统反问一个刚说了"别跑了"的人要不要继续。
 RunStatus = Literal[
     "running",
     "waiting_approval",
     "waiting_input",
+    "interrupted",
     "done",
     "failed",
     "abandoned",
+    "cancelled",
 ]
 
 

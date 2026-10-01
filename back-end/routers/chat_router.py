@@ -17,6 +17,7 @@ from models import Message, User
 from services.chat_service import ChatService
 from services.memory_service import memory_service
 from services import approval
+from services import cancellation
 from services import checkpoint_store
 from services import approval_audit
 from services import fs_tools
@@ -416,6 +417,9 @@ async def stream_completions(
         # 被审批打断了。这一回合还没有最终回答，所以既不落 assistant 消息，
         # 也不能报"模型未返回最终回答"——它没失败，它在等人。
         interrupted = False
+        # 被用户主动停止了。与 interrupted 同样不落库（半截回答不是回答），
+        # 但语义相反：它是终态，不该出现在"接着跑吗"的列表里。
+        cancelled = False
         # 这一回合的 run id 与"有没有走到自然结束"。两者一起决定断线时怎么收尾。
         #
         # run_id 只能从事件流里拿:它是在 chat_service 内部生成的,路由这边
@@ -471,6 +475,8 @@ async def stream_completions(
                     # 带上 message_id：恢复那一侧要用同一个 id 落最终回答，
                     # 否则一次问答会在库里留下两条 assistant 消息。
                     payload["message_id"] = assistant_message_id
+                if event["type"] == "cancelled":
+                    cancelled = True
                 yield {"data": json.dumps(payload, ensure_ascii=False)}
                 if failed:
                     break
@@ -481,6 +487,11 @@ async def stream_completions(
             if interrupted:
                 # 状态在 agent_checkpoints 里，恢复走 /runs/{run_id}/resume。
                 # 这里什么都不落：半截回答不是回答。
+                settled = True
+                return
+            if cancelled:
+                # 用户主动停止。状态已由循环落成 cancelled（终态），半截正文同样
+                # 不落库——它不是回答。前端会保留已生成的部分供当前会话查看。
                 settled = True
                 return
             if not failed and full_response.strip():
@@ -655,6 +666,8 @@ def _continuation_sse(
         full_response = ""
         failed = False
         interrupted = False
+        # 恢复流也会被用户主动停止（恢复到一半又点了“停止生成”）。
+        cancelled = False
         # 走到了任何一条收尾路径。区分"正常结束"与"客户端断线导致生成器被回收"
         # ——同 stream_completions,理由见那边 finally 里的注释。
         settled = False
@@ -670,6 +683,8 @@ def _continuation_sse(
                 ):
                     interrupted = True
                     payload["message_id"] = assistant_message_id
+                if event["type"] == "cancelled":
+                    cancelled = True
                 yield {"data": json.dumps(payload, ensure_ascii=False)}
                 if failed:
                     break
@@ -677,6 +692,10 @@ def _continuation_sse(
             if interrupted:
                 # 又停了一次(第二个写操作要审批,或者模型拿到答案后又问一句)。
                 # 状态已经是 waiting_* 了,不是断线。
+                settled = True
+                return
+            if cancelled:
+                # 恢复到一半被用户停止。状态已落 cancelled，半截正文不落库。
                 settled = True
                 return
             answer = prefix + full_response
@@ -782,6 +801,50 @@ async def answer_clarification(
         state_before=state_before,
         what="回答",
     )
+
+
+@router.post("/runs/{run_id}/cancel")
+async def cancel_run(
+    run_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """停止一个正在跑的执行。
+
+    与断线（abort）分开：断线是"连接没了"，服务端标 ``interrupted``、归入可接续；
+    这里是"用户说了别跑了"，标 ``cancelled``、是终态。两者混为一谈的话，用户点了
+    停止却会在"接着跑吗"的列表里看到它。
+
+    两条路径，按有没有活着的循环分：
+
+    - **同进程、循环活着**（当前部署的常态）：``signal`` 置事件，循环会在下一个
+      安全点（轮首 / 每个工具执行前）自己收尾成 ``cancelled``。
+    - **没有活着的循环**（已结束、已断线、或在别的 worker 上）：直接把库里
+      的 ``running`` / ``interrupted`` 标成 ``cancelled``。
+
+    两条都走：即使 signal 命中了活循环，也再调一次 ``mark_cancelled`` 兜底——
+    前端"先发取消、再 abort"时，abort 可能赶在循环到达安全点之前就把生成器回收了，
+    那一刻断线的 ``mark_interrupted`` 会把它标成 interrupted；``mark_cancelled`` 接受
+    interrupted 并把它推回 cancelled，于是两种到达顺序都收敛到同一个终态。
+
+    已经 ``done`` / ``failed`` / ``waiting_*`` 的不改：等审批的执行有自己的裁决路径，
+    不该被"停止生成"顺手取消。
+    """
+    run = checkpoint_store.get_run(db, run_id)
+    if run is None or run.user_id != current_user.id:
+        # 归属校验先于一切：不该让别人的 run 存不存在这件事被探测出来。
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+
+    live = cancellation.signal(run_id)
+    marked = checkpoint_store.mark_cancelled(run_id, db=db)
+    # live=True 时循环会自己落 cancelled；marked=True 时这里已经落好。两者都否
+    # 意味着它早就结束了（done/failed/abandoned），没什么可取消的。
+    return {
+        "runId": run_id,
+        "cancelled": bool(live or marked),
+        # live 区分"叫停了活循环"与"只改了库里的状态"，供前端与调试用。
+        "live": live,
+    }
 
 
 @router.get("/runs/resumable")

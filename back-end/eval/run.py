@@ -50,6 +50,7 @@ _COLUMNS = [
     ("completionTokens", "输出 token"),
     ("cost", "成本"),
     ("avgLatencyMs", "平均耗时 ms"),
+    ("p95LatencyMs", "P95 耗时 ms"),
 ]
 
 
@@ -550,6 +551,67 @@ def render_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# 跟温度一起抖的质量/成本指标。recall 在当前语料恒 1.0（不抖），不列。
+_VARIANCE_METRICS = [
+    ("faithfulness", "忠实度"),
+    ("relevance", "相关性"),
+    ("abstentionRate", "拒答率"),
+    ("fabricationRate", "编造率"),
+    ("precision", "precision@k"),
+    ("ndcg", "nDCG@k"),
+    ("cost", "成本"),
+    ("completionTokens", "输出 token"),
+]
+
+
+def aggregate_repeats(reports: list[dict[str, Any]]) -> dict[str, dict[str, dict]]:
+    """把 N 次重跑按 (变体, 指标) 聚成离散度。各变体逐指标 metrics.dispersion。"""
+    names = [s["variant"] for s in reports[0].get("summaries", [])]
+    by_variant: dict[str, dict[str, dict]] = {}
+    for name in names:
+        per_metric: dict[str, dict] = {}
+        for key, _label in _VARIANCE_METRICS:
+            values: list[float] = []
+            for report in reports:
+                summary = next(
+                    (s for s in report.get("summaries", []) if s["variant"] == name), None
+                )
+                value = _pick(summary, key) if summary else None
+                if value is not None:
+                    values.append(float(value))
+            disp = metrics.dispersion(values)
+            if disp is not None:
+                per_metric[key] = disp
+        by_variant[name] = per_metric
+    return by_variant
+
+
+def render_variance(variance: dict[str, Any]) -> list[str]:
+    """多次重跑的方差小节。只在 repeat>1 时拼进报告。"""
+    repeat, temp = variance["repeat"], variance["temperature"]
+    label = {key: lbl for key, lbl in _VARIANCE_METRICS}
+    lines = [
+        "",
+        f"## 多次运行方差（repeat={repeat}，temperature={temp}）",
+        "",
+        "同一套题重跑 N 次看抖动。eval 默认温度 0 几乎不抖；温度 >0 才量得出线上那种波动。",
+        "**cv（变异系数 = stdev/mean）跨指标可比**：cv 大 = 这个变体单次回答最不可预测，",
+        "均值再好看，上线后任意一次都可能明显更差——这是单跑一次的点估计看不到的。",
+    ]
+    for name, per_metric in variance["byVariant"].items():
+        if not per_metric:
+            continue
+        lines += ["", f"### {name}", "", "| 指标 | 均值 | stdev | cv | 最小–最大 |",
+                  "| --- | --- | --- | --- | --- |"]
+        for key, disp in per_metric.items():
+            cv = f"{disp['cv']:.3f}" if disp["cv"] is not None else "-"
+            lines.append(
+                f"| {label.get(key, key)} | {disp['mean']:.3f} | {disp['stdev']:.3f} | "
+                f"{cv} | {disp['min']:.3f}–{disp['max']:.3f} |"
+            )
+    return lines
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="RAG 配置变体评估")
     parser.add_argument(
@@ -558,6 +620,14 @@ async def main() -> None:
         help=f"逗号分隔，或 all。可用：{', '.join(VARIANTS)}",
     )
     parser.add_argument("--limit", type=int, default=None, help="只跑前 N 个问题")
+    parser.add_argument(
+        "--repeat", type=int, default=1,
+        help="同一套题重跑几次看方差（默认 1）。>1 时报告追加「多次运行方差」小节",
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=0.0,
+        help="答案生成温度（默认 0.0 保持可复现；量方差时设 >0，如 0.7 贴近线上）",
+    )
     parser.add_argument(
         "--dataset",
         default=None,
@@ -594,6 +664,8 @@ async def main() -> None:
         with open(args.render, encoding="utf-8") as handle:
             report = json.load(handle)
         markdown = render_markdown(report)
+        if report.get("variance"):
+            markdown += "\n" + "\n".join(render_variance(report["variance"]))
         print(markdown)
         if args.write:
             md_path = os.path.splitext(args.render)[0] + ".md"
@@ -607,8 +679,23 @@ async def main() -> None:
     if not cases:
         raise SystemExit("金标准集为空")
 
-    report = await runner.run(variants, cases)
+    repeat = max(1, args.repeat)
+    reports: list[dict[str, Any]] = []
+    for index in range(repeat):
+        reports.append(await runner.run(variants, cases, answer_temperature=args.temperature))
+        if repeat > 1 and not args.quiet:
+            logging.info("[repeat %d/%d] 完成", index + 1, repeat)
+
+    report = reports[-1]
     markdown = render_markdown(report)
+    if repeat > 1:
+        # 方差是跨 N 次重跑算的，所以挂在最后一份报告上一并落盘，供 --render 重看
+        report["variance"] = {
+            "repeat": repeat,
+            "temperature": args.temperature,
+            "byVariant": aggregate_repeats(reports),
+        }
+        markdown += "\n" + "\n".join(render_variance(report["variance"]))
 
     os.makedirs(args.out, exist_ok=True)
     stamp = app_now().strftime("%Y%m%d-%H%M%S")

@@ -23,6 +23,7 @@ import {
     EyeOff,
     UserMinus,
     Users,
+    Link,
 } from "lucide-react";
 import { StatCard } from "../components/StatCard";
 import { WorkspacePanel } from "../components/WorkspacePanel";
@@ -50,6 +51,9 @@ export const KnowledgePage: React.FC = () => {
     const [deletingId, setDeletingId] = useState<string | null>(null);
     const [errorMsg, setErrorMsg] = useState<string | null>(null);
     const [dragOver, setDragOver] = useState(false);
+    // 从 URL 添加：输入框内容与提交中状态。与文件上传共用 effectiveVisibility。
+    const [urlInput, setUrlInput] = useState("");
+    const [addingUrl, setAddingUrl] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const toast = useToast();
     const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
@@ -165,6 +169,27 @@ export const KnowledgePage: React.FC = () => {
         if (!file) return;
         e.target.value = "";
         await uploadFile(file);
+    };
+
+    const handleAddUrl = async () => {
+        const url = urlInput.trim();
+        if (!url) return;
+        setAddingUrl(true);
+        setErrorMsg(null);
+        try {
+            const res = await apiClient.addDocumentFromUrl(url, effectiveVisibility);
+            if (res.duplicate) {
+                toast.info("该网页内容已在知识库中，未重复索引");
+            } else if (effectiveVisibility === "private") {
+                toast.info("已存为个人文档，只有你能检索到");
+            }
+            setUrlInput("");
+            refreshDocuments();
+        } catch (err) {
+            setErrorMsg(err instanceof Error ? err.message : "添加失败");
+        } finally {
+            setAddingUrl(false);
+        }
     };
 
     const handleDrop = async (e: React.DragEvent) => {
@@ -369,7 +394,7 @@ export const KnowledgePage: React.FC = () => {
                                 拖入文档，或点击选择
                             </div>
                             <div className="text-[11px] text-[#918d83] mt-1">
-                                txt / md / pdf / docx / xlsx / 代码文件 · 上传后后台切块并向量化
+                                txt / md / pdf / docx / xlsx / pptx / 代码文件 · 上传后后台切块并向量化
                             </div>
                             <div className="text-[11px] mt-1.5 flex items-center justify-center gap-1.5 text-[#6e6b63] dark:text-[#a19f96]">
                                 {effectiveVisibility === "workspace" ? (
@@ -384,6 +409,37 @@ export const KnowledgePage: React.FC = () => {
                                     </>
                                 )}
                             </div>
+                        </div>
+
+                        {/* 从 URL 添加：抓网页正文入库。出站请求由后端 egress 防护
+                            （拦私网/环回/云元数据），前端只管收一个链接。落点与
+                            文件上传共用同一个 effectiveVisibility（共享/个人）。 */}
+                        <div className="flex items-center gap-2 anim-fade-up">
+                            <div className="flex items-center gap-2 flex-1 bg-[#f3f0e6] dark:bg-[#201f1c] px-3.5 py-2.5 rounded-xl border border-[#e3dfd5] dark:border-[#2e2d2a]">
+                                <Link className="w-4 h-4 text-[#918d83] shrink-0" />
+                                <input
+                                    type="url"
+                                    value={urlInput}
+                                    onChange={(e) => setUrlInput(e.target.value)}
+                                    onKeyDown={(e) => {
+                                        if (e.key === "Enter") handleAddUrl();
+                                    }}
+                                    placeholder="粘贴网页链接（http/https），抓取正文存入知识库..."
+                                    className="bg-transparent border-none text-xs text-[#1f1e1d] dark:text-[#edece8] placeholder-[#918d83] focus:outline-none w-full"
+                                />
+                            </div>
+                            <button
+                                onClick={handleAddUrl}
+                                disabled={addingUrl || !urlInput.trim()}
+                                className="btn-accent px-4 py-2.5 text-white text-xs font-medium rounded-xl flex items-center gap-2 disabled:opacity-60 shrink-0"
+                            >
+                                {addingUrl ? (
+                                    <Loader2 className="w-4 h-4 animate-spin" />
+                                ) : (
+                                    <Link className="w-4 h-4" />
+                                )}
+                                {addingUrl ? "抓取中..." : "从 URL 添加"}
+                            </button>
                         </div>
 
                         <div className="grid grid-cols-3 gap-4 anim-fade-up stagger-1">

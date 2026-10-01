@@ -23,6 +23,7 @@
 """
 from __future__ import annotations
 
+import html
 import io
 import logging
 import re
@@ -880,3 +881,194 @@ def extract_xlsx(content: bytes) -> PdfExtraction:
         backend="openpyxl",
         warnings=warnings,
     )
+
+
+# ========== .pptx ==========
+# 幻灯片是"要点 + 讲稿"的载体：正文在形状的文字框里，而真正的上下文常常在
+# **备注**（notes）里——演讲者把解释写在那儿。两者都要抽，否则一份"幻灯片上只有
+# 标题、内容全在备注里"的 deck 会几乎抽不到东西（症状同 PDF 的 no_text_layer）。
+#
+# 每张幻灯片渲染成一个二级标题 + 要点列表，与 docx/xlsx 一样交给 chunking 的
+# Markdown 路径：heading_path 会把"第 N 页：标题"带进每一块，于是一个孤立的要点
+# 不会脱离它所属的那一页。表格沿用 docx 那套 Markdown 渲染（幻灯片里的表一般很小，
+# 不像 xlsx 动辄几百行，所以不需要每行自带列名）。
+
+# 一份 deck 最多读多少页。同 xlsx 的行上限，是信噪比而非性能：超长 deck 进知识库
+# 会用大量近乎相同的"议程页/过渡页"淹掉其它文档。超出就截断并留 warning。
+_PPTX_MAX_SLIDES = 500
+
+
+def _pptx_shape_lines(shape: Any) -> list[str]:
+    """从一个形状里抽出文字行。文字框逐段抽，表格渲染成 Markdown 表格。"""
+    lines: list[str] = []
+    if getattr(shape, "has_text_frame", False):
+        for paragraph in shape.text_frame.paragraphs:
+            # paragraph.text 已经把各个 run 拼好，不必自己遍历 run
+            text = (paragraph.text or "").strip()
+            if text:
+                lines.append(text)
+    if getattr(shape, "has_table", False):
+        rows: list[list[str]] = []
+        for row in shape.table.rows:
+            cells = [" ".join(cell.text.split()) for cell in row.cells]
+            if any(cells):
+                rows.append(cells)
+        if rows:
+            width = max(len(row) for row in rows)
+            rows = [row + [""] * (width - len(row)) for row in rows]
+            lines.append("| " + " | ".join(rows[0]) + " |")
+            lines.append("| " + " | ".join("---" for _ in range(width)) + " |")
+            for row in rows[1:]:
+                lines.append("| " + " | ".join(row) + " |")
+    return lines
+
+
+def extract_pptx(content: bytes) -> PdfExtraction:
+    """抽取 .pptx：每页一个二级标题 + 要点 + 表格 + 讲稿备注。
+
+    复用 ``PdfExtraction``（理由同 ``extract_docx``），``pages`` 借来记幻灯片数。
+    ``warnings`` 沿用同一套词汇，入库自检与界面不必分格式各写一套。
+    """
+    try:
+        from pptx import Presentation
+    except ImportError:
+        raise ValueError("PowerPoint 文档解析需要安装 python-pptx 库")
+
+    try:
+        presentation = Presentation(io.BytesIO(content))
+    except Exception as exc:
+        # 同 extract_docx：抛 ValueError 让路由转 400。典型输入是把 .ppt（老二进制
+        # 格式）改名成 .pptx，或把一个其实是 docx 的 ZIP 传上来——python-pptx 读不了。
+        logger.warning("pptx extraction failed: %s", type(exc).__name__)
+        raise ValueError(
+            "无法解析该 PowerPoint 文档。请确认它是 .pptx（PowerPoint 2007 以后的格式）；"
+            "老的 .ppt 需要先另存为 .pptx"
+        ) from exc
+
+    blocks: list[str] = []
+    slides = 0
+    has_content = False
+    truncated = False
+
+    for index, slide in enumerate(presentation.slides):
+        if index >= _PPTX_MAX_SLIDES:
+            truncated = True
+            break
+        slides += 1
+
+        title_shape = slide.shapes.title
+        title_id = getattr(title_shape, "shape_id", None)
+        title = (title_shape.text or "").strip() if title_shape is not None else ""
+        # 分隔用**半角**冒号：``clean_text`` 会把全角 ASCII（包括 ：）折成半角，
+        # 用全角的话输出会随 INGEST_CLEAN 开关而变（开=半角、关=全角）。同 xlsx
+        # 渲染 ``列名: 值`` 用半角是同一个理由。
+        heading = f"## 第 {index + 1} 页" + (f": {title}" if title else "")
+
+        body: list[str] = []
+        for shape in slide.shapes:
+            # 标题已经进 heading 了，正文里按 shape_id 跳过它，避免同一句话出现两遍。
+            # 用 shape_id 而不是对象相等：python-pptx 每次访问可能给不同的包装对象。
+            if title_id is not None and getattr(shape, "shape_id", None) == title_id:
+                continue
+            for line in _pptx_shape_lines(shape):
+                body.append(f"- {line}")
+
+        notes = ""
+        if getattr(slide, "has_notes_slide", False):
+            try:
+                notes = (slide.notes_slide.notes_text_frame.text or "").strip()
+            except Exception:
+                # 备注读不出来不该让整份 deck 失败：它只是附加上下文。
+                notes = ""
+
+        if title or body or notes:
+            has_content = True
+        page_lines = [heading, *body]
+        if notes:
+            page_lines.append(f"讲稿备注: {notes}")
+        blocks.append("\n".join(page_lines))
+
+    warnings: list[str] = []
+    if slides:
+        warnings.append(f"slides_extracted:{slides}")
+    if truncated:
+        # 截断必须可见。静默丢掉后半份 deck 的症状是"后面几页怎么都检索不到"，
+        # 而文档状态是 indexed、chunks 也非零。
+        warnings.append(f"slides_truncated:{_PPTX_MAX_SLIDES}")
+    if not has_content:
+        # 有幻灯片、但一页文字都没抽到：几乎一定是整份 deck 都是图片/截图。
+        # 不抛异常——它是一份合法的 pptx，只是对检索没有价值，靠 warning + 入库自检兜住。
+        warnings.append("no_extractable_text")
+
+    text = "\n\n".join(blocks)
+    return PdfExtraction(
+        text=clean_text(text) if settings.INGEST_CLEAN else text,
+        pages=slides,
+        backend="python-pptx",
+        warnings=warnings,
+    )
+
+
+# ========== HTML（URL 入库用） ==========
+# 网页入库与"抓网页当工具结果"是两件事：后者要一段扁平纯文本塞进上下文
+# （``workspace_tools.html_to_text`` 就是干这个的，它把空白全折成单空格），前者要
+# **保留块结构**——标题、段落、列表项之间的边界是分块的依据。flatten 成一段的话，
+# chunking 只能按 max_tokens 硬切，标题路径与"章节边界优先"全都不生效（症状同
+# PDF 没恢复结构）。所以这里单独写一个保留换行的转换器，而不复用那个扁平版。
+#
+# 用正则而不是引入 BeautifulSoup：这与本模块 PDF/docx 之外的既有取舍一致
+# （html_to_text 也是正则），而 URL 入库要的是"够用的结构"，不是 DOM 保真。
+
+# 整段剔除的块：它们的内容不是正文。``head`` 也在内——里面是 meta/title/script，
+# 剔掉后正文从 body 开始。title 另由 html_title() 单独取。
+_HTML_SKIP_RE = re.compile(
+    r"<(script|style|noscript|iframe|svg|template|head)\b[^>]*>.*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_HEADING_RE = re.compile(r"<h([1-6])\b[^>]*>(.*?)</h\1>", re.IGNORECASE | re.DOTALL)
+# 块级标签：它们的位置换成换行，于是段落/列表项/表格行各自成行。
+_HTML_BLOCK_RE = re.compile(
+    r"</?(?:p|div|section|article|li|ul|ol|table|thead|tbody|tr|blockquote|br|hr|"
+    r"header|footer|nav|aside|pre|figure|figcaption|main|dd|dt|dl)\b[^>]*>",
+    re.IGNORECASE,
+)
+# 单元格分隔：用空格而不是换行，让一行的列留在同一行（不追求 Markdown 表格，
+# 只要"同一行的值不跨行散开"）。
+_HTML_CELL_RE = re.compile(r"</t[dh]>", re.IGNORECASE)
+_HTML_ANY_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_TITLE_RE = re.compile(r"<title\b[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+
+def html_title(raw: str) -> str:
+    """取 ``<title>``。没有就返回空串，由调用方退回用 URL 域名当文档名。"""
+    match = _HTML_TITLE_RE.search(raw or "")
+    if not match:
+        return ""
+    inner = _HTML_ANY_TAG_RE.sub(" ", match.group(1))
+    return " ".join(html.unescape(inner).split())
+
+
+def html_to_text_structured(raw: str) -> str:
+    """把网页 HTML 转成保留块结构的纯文本：标题→Markdown、块级标签→换行。
+
+    返回的文本已经过 ``clean_text``（折全角、去不可见字符、折叠多余空行），
+    但**保留单个换行**——那是分块赖以工作的段落边界。建议以 ``.md`` 入库，
+    这样 ``parse_document`` 走文本分支、``chunking`` 能吃那些 ``#`` 标题。
+    """
+    text = _HTML_SKIP_RE.sub("\n", raw or "")
+
+    def _heading(match: re.Match[str]) -> str:
+        level = int(match.group(1))
+        inner = _HTML_ANY_TAG_RE.sub(" ", match.group(2))
+        inner = " ".join(html.unescape(inner).split())
+        # 空标题不生成一行光秃秃的 ``##``，那会变成一个无意义的 heading_path
+        return f"\n\n{'#' * level} {inner}\n\n" if inner else "\n"
+
+    text = _HTML_HEADING_RE.sub(_heading, text)
+    text = _HTML_CELL_RE.sub(" ", text)
+    text = _HTML_BLOCK_RE.sub("\n", text)
+    text = _HTML_ANY_TAG_RE.sub(" ", text)
+    text = html.unescape(text)
+    # 逐行 strip：去掉标签留下的行首尾空白，保留行与行之间的边界。
+    lines = [line.strip() for line in text.split("\n")]
+    return clean_text("\n".join(lines))

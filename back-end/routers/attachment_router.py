@@ -50,8 +50,14 @@ _DOCX_SIGNATURE = b"PK\x03\x04"
 # .xlsx 也是 OOXML/ZIP，签名与 docx 完全相同。
 # 单独定义而不是共用一个 _OOXML_SIGNATURE：命名约定 _<EXT>_SIGNATURE 是
 # test_document_category_has_a_signature_constant 的判据，而"两种格式恰好共享
-# 同一个魔数"是实现细节,不该让下一个加格式的人去猜该复用哪个名字。
+# 同一个魔数"是实现细节，不该让下一个加格式的人去猜该复用哪个名字。
 _XLSX_SIGNATURE = b"PK\x03\x04"
+
+# .pptx 同样是 OOXML/ZIP，签名与 docx/xlsx 相同。命名约定的理由同上。
+# 注意：这个魔数只证明"它是个 ZIP 容器"，区分不了 docx/xlsx/pptx——真正的
+# 格式校验在解析器里（python-pptx 读不了一个其实是 docx 的 ZIP，会抛异常，
+# 路由转成 400）。签名这一层挡的是"改个扩展名就把非 ZIP 内容塞进解析器"。
+_PPTX_SIGNATURE = b"PK\x03\x04"
 
 # 按扩展名查签名。文档类新增格式时改这一处，
 # 而 test_document_category_has_a_signature_constant 盯着"有没有漏"。
@@ -59,6 +65,7 @@ _DOCUMENT_SIGNATURES = {
     "pdf": _PDF_SIGNATURE,
     "docx": _DOCX_SIGNATURE,
     "xlsx": _XLSX_SIGNATURE,
+    "pptx": _PPTX_SIGNATURE,
 }
 
 

@@ -727,3 +727,105 @@ class ReviewRecord(Base):
     # NULL 读作"这条结论是加这一列之前记的"，与空串（材料是空的，那是 bug）
     # 分得开。
     evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class AuditLog(Base):
+    """防篡改审计链：谁、什么时候、做了哪一个改变状态的动作。
+
+    与已有两张"留痕"表互补，不替代：``AgentApproval`` 记审批这件事的详细状态
+    （改没改参数、谁批的）；``TraceSpan`` 是可观测性埋点，刻意不存正文、按窗口聚合。
+    这张表回答合规要问的另一个问题——"这串动作有没有被事后改过"。
+
+    手段是**哈希链**：每条存上一条的 ``entry_hash`` 作 ``prev_hash``，自己的
+    ``entry_hash`` 覆盖 (prev_hash + 关键字段)。改动或删除中间任意一条，它之后每一条
+    的链接都对不上，``audit_log.verify`` 一走就能定位到断点。
+
+    **链按 actor 分段，不做全局单链。** 全项目没有 admin/role，所有读接口都按
+    ``user_id`` 自作用域。按用户分段的链正好落进这个模型：用户能 verify 自己那条、
+    看不到别人的；全局单链在没有管理员时既没法自洽地读、又要扛并发追加的分叉。
+
+    ``seq`` 是**该 actor 内**的序号（record 时取其当前最大值 +1），不是数据库自增
+    主键——避开 BIGINT 自增在 SQLite/MySQL 间的可移植坑，也让"这是第几条"与其他
+    用户的写入无关。
+    """
+
+    __tablename__ = "audit_log"
+    __table_args__ = (
+        # 链遍历与自作用域读取都按 (actor, seq)
+        Index("ix_audit_log_actor_seq", "actor_id", "seq"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    # 该 actor 链内的序号，从 1 起。并发同 actor 追加极少见，真撞上会让链在
+    # verify 时报断点（而非静默改数）——可接受的诚实边界
+    seq: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # 复合索引 ix_audit_log_actor_seq 已覆盖 actor 前缀查询，这里不再单列 index
+    actor_id: Mapped[str] = mapped_column(String(36))
+
+    # tool.write / approval.decision / auth.login / auth.register …
+    action: Mapped[str] = mapped_column(String(40))
+    # 动作作用于什么：工具名、文档 id、或一句短描述
+    target: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # 参数摘要与预览，复用 approval_audit 的算法（sorted-json sha256 + 截断）。
+    # 不存完整参数：写知识库正文可到 AGENT_WRITE_MAX_CHARS，digest 足以证明同一性
+    args_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    args_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # 线索，非外键：审计不该阻止业务数据被删
+    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    chat_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    # 链：prev_hash = 上一条的 entry_hash（首条为 genesis 常量）
+    prev_hash: Mapped[str] = mapped_column(String(64))
+    entry_hash: Mapped[str] = mapped_column(String(64))
+
+    # 在 record() 里用 naive_now() 显式落值——它进哈希载荷，必须在算 hash 时就已知，
+    # 不能交给数据库 server_default
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+class Notification(Base):
+    """发给某个用户的"有事等你处理"通知。
+
+    为什么要有它：审批挂起 / ask_user / prose_question 这些中断事件，眼下**只在那条
+    实时 SSE 连接上存在一瞬**（见 chat_service 的 approval_required 发射点）——刷新、
+    切页、断网之后就没了，用户只能靠轮询 /chats/runs/pending 重新发现。HITL 是这个
+    审核工作台的核心，审批人不在场时闭环就断在这里。这张表把"有事等你"落成持久的
+    per-user 收件箱，与那条易失连接解耦。
+
+    不设外键：``run_id`` / ``chat_id`` 只作深链线索（点通知跳回那次运行/对话），
+    断了不影响通知本身——同 TraceSpan / MessageFeedback 的取舍。
+
+    ``read_at`` 为 NULL 即未读（仿 MessageFeedback.exported_at 那个"处理过一次"的
+    时间戳）。本轮只做应用内拉取式收件箱；IM/邮件/WebSocket 主动推送属外部基建、
+    留作后续，而它们将来的数据源正是这张表。
+    """
+
+    __tablename__ = "notifications"
+    __table_args__ = (
+        # 收件箱按时间倒序翻页
+        Index("ix_notifications_user_created", "user_id", "created_at"),
+        # 未读计数 / 未读筛选
+        Index("ix_notifications_user_read", "user_id", "read_at"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    # 收件人：要处理这件事的那个人（审批人 / 发起人）
+    user_id: Mapped[str] = mapped_column(String(36))
+    # approval_required / input_required / run_abandoned / health_alert
+    # （前三条是 per-run 的 HITL 事件，带 run_id；health_alert 是线上健康监控的
+    #  全局告警，发给管理员、不带 run_id，去重靠"每人同时只留一条未读"）
+    kind: Mapped[str] = mapped_column(String(32))
+    title: Mapped[str] = mapped_column(String(255))
+    body: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 深链线索，非外键
+    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    chat_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+    # NULL = 未读
+    read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

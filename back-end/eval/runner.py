@@ -473,6 +473,7 @@ async def _run_case(
     case: QuestionCase,
     top_k: int,
     answer_prompt: prompt_library.PromptTemplate,
+    answer_temperature: float = 0.0,
 ) -> QuestionResult:
     session = SessionLocal()
     try:
@@ -503,7 +504,7 @@ async def _run_case(
                         ],
                         tools=[],
                         model=settings.LLM_MODEL,
-                        temperature=0.0,
+                        temperature=answer_temperature,
                         max_tokens=_ANSWER_MAX_TOKENS,
                         purpose="eval_answer",
                     )
@@ -609,6 +610,11 @@ def summarize(variant: Variant, results: list[QuestionResult]) -> dict[str, Any]
         "avgRetrievalMs": metrics.mean([float(r.retrieval_ms) for r in results]),
     }
 
+    # 分位延迟，理由同 agent_runner：均值掩盖长尾，P95 才是分维度指标
+    _latencies = [float(r.latency_ms) for r in results]
+    summary["p50LatencyMs"] = metrics.percentile(_latencies, 50)
+    summary["p95LatencyMs"] = metrics.percentile(_latencies, 95)
+
     costs = [r.cost for r in results if r.cost is not None]
     summary["cost"] = sum(costs) if costs else None
     summary["currency"] = next((r.currency for r in results if r.currency), None)
@@ -687,7 +693,7 @@ def summarize(variant: Variant, results: list[QuestionResult]) -> dict[str, Any]
 
 
 async def run_variant(
-    variant: Variant, cases: list[QuestionCase]
+    variant: Variant, cases: list[QuestionCase], answer_temperature: float = 0.0
 ) -> tuple[dict[str, Any], list[QuestionResult]]:
     """套用变体配置跑完一轮，结束后恢复原配置。"""
     original = {key: getattr(settings, key) for key in variant.overrides}
@@ -715,7 +721,8 @@ async def run_variant(
         results: list[QuestionResult] = []
         for index, case in enumerate(cases, start=1):
             result = await _run_case(
-                knowledge, judge, adapter, case, top_k, answer_prompt
+                knowledge, judge, adapter, case, top_k, answer_prompt,
+                answer_temperature=answer_temperature,
             )
             results.append(result)
             logger.info(
@@ -736,7 +743,7 @@ async def run_variant(
 
 
 async def run(
-    variants: list[Variant], cases: list[QuestionCase]
+    variants: list[Variant], cases: list[QuestionCase], answer_temperature: float = 0.0
 ) -> dict[str, Any]:
     # 评估依赖埋点来算成本与延迟，强制打开
     settings.TELEMETRY_ENABLED = True
@@ -744,7 +751,7 @@ async def run(
     summaries: list[dict[str, Any]] = []
     details: dict[str, list[dict[str, Any]]] = {}
     for variant in variants:
-        summary, results = await run_variant(variant, cases)
+        summary, results = await run_variant(variant, cases, answer_temperature)
         summaries.append(summary)
         details[variant.name] = [
             {

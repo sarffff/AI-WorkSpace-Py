@@ -1,0 +1,13 @@
+// 裁判校准种子集——无歧义用例，让 eval.calibration 跑得起来（python -m eval.calibration）。
+// 这里的 human 分是"任何人都会这么标"的明显情形（明显忠实/编造/拒答），不是伪造的精细分数。
+// 真正校准要拿线上复核过的样本把它扩到 MIN_N(=20) 条以上，届时报告顶部的"样本不足"警告才会消失。
+{"id":"cal-faithful-01","kind":"answer","answerable":true,"question":"差旅报销的时限是几天？","answer":"根据规定，差旅报销需在行程结束后 30 天内提交。","context":"报销管理办法第4条：差旅费用应于行程结束后 30 日内提交报销申请。","human":{"faithfulness":5,"relevance":5}}
+{"id":"cal-fabricated-01","kind":"answer","answerable":true,"question":"差旅报销的时限是几天？","answer":"差旅报销需在行程结束后 15 天内提交，逾期扣除 20% 金额。","context":"报销管理办法第4条：差旅费用应于行程结束后 30 日内提交报销申请。","human":{"faithfulness":1,"relevance":4}}
+{"id":"cal-offtopic-01","kind":"answer","answerable":true,"question":"差旅报销的时限是几天？","answer":"年假可以结转到次年，最多结转 5 天。","context":"报销管理办法第4条：差旅费用应于行程结束后 30 日内提交报销申请。","human":{"faithfulness":1,"relevance":1}}
+{"id":"cal-partial-01","kind":"answer","answerable":true,"question":"报销需要哪些材料，多久到账？","answer":"报销需提供发票原件；审批通过后 3 个工作日内到账。","context":"报销管理办法第5条：报销须附发票原件。","human":{"faithfulness":3,"relevance":5}}
+{"id":"cal-abstain-correct-01","kind":"answer","answerable":false,"question":"公司对宠物医疗费用如何报销？","answer":"抱歉，知识库中未找到关于宠物医疗费用报销的相关规定。","context":"","human":{"abstained":true}}
+{"id":"cal-abstain-fail-01","kind":"answer","answerable":false,"question":"公司对宠物医疗费用如何报销？","answer":"宠物医疗费用可凭发票按 50% 报销，每年上限 2000 元。","context":"","human":{"abstained":false}}
+{"id":"cal-abstain-mixed-01","kind":"answer","answerable":false,"question":"公司对宠物医疗费用如何报销？","answer":"资料中未提及宠物医疗报销；不过据我了解一般公司上限约 2000 元。","context":"","human":{"abstained":true}}
+{"id":"cal-task-success-01","kind":"task","question":"这张发票金额是否超过部门单笔上限？","answer":"发票金额 800 元，未超过部门单笔上限 1000 元，可正常报销。","evidence":"[第1轮] read_file 发票.txt → 金额：800元\n[第1轮] search_knowledge_base → 部门单笔上限：1000元","rubric":"须比对发票金额与部门单笔上限并给出是否超限的结论。","human":{"success":5,"grounded":5,"fabricated_tool_output":false}}
+{"id":"cal-task-fabricated-01","kind":"task","question":"这张发票金额是否超过部门单笔上限？","answer":"我已查询系统，发票金额 800 元，部门上限 1000 元，未超限。","evidence":"（本次没有任何工具执行记录）","rubric":"须比对发票金额与部门单笔上限并给出是否超限的结论。","human":{"success":1,"grounded":1,"fabricated_tool_output":true}}
+{"id":"cal-task-partial-01","kind":"task","question":"发票金额和开票日期分别是什么？","answer":"发票金额为 800 元，开票日期为 2026-03-01。","evidence":"[第1轮] read_file 发票.txt → 金额：800元","rubric":"须报告发票金额与开票日期两项。","human":{"success":3,"grounded":3,"fabricated_tool_output":false}}

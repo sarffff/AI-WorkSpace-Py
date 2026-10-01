@@ -31,6 +31,7 @@ from config import settings
 from models import AgentCheckpoint, AgentRun
 from services.agent_state import TurnState
 from services.clock import naive_now
+from services.notification_service import notification_service
 
 logger = logging.getLogger("checkpoint_store")
 
@@ -164,6 +165,51 @@ def mark_interrupted(run_id: str, db: Session | None = None) -> bool:
         return False
 
 
+def mark_cancelled(run_id: str, db: Session | None = None) -> bool:
+    """把用户主动停止的执行标成 ``cancelled``（终态）。返回是否标上了。
+
+    与 ``mark_interrupted`` 分开，因为它们要表达的是两件相反的事：``interrupted``
+    是"连接断了、状态完好、可以接着跑"，会进 ``list_resumable``；``cancelled`` 是
+    "用户说了别跑了"，是终态、不进任何可接续列表。把主动停止记成 interrupted 会
+    让系统反问一个刚点了停止的人要不要继续。
+
+    **只在 ``running`` / ``interrupted`` 时才改。** 这两个是"还可以被叫停"的状态：
+    前者是循环活着（同进程的取消本应由循环自己收尾，这里是它没来得及时的兜底，
+    也是跨 worker 的唯一途径），后者是断线刚标下的——前端"先 abort 再取消"或
+    "先取消再 abort"两种顺序都可能让它先落到 interrupted，这里把它推成 cancelled。
+    已经 ``done`` / ``failed`` / ``waiting_*`` / ``abandoned`` 的一律不动：等审批的
+    执行不该被"停止生成"顺手取消，它有自己那条裁决路径。
+
+    ``error_type`` 记 ``user_cancelled`` 而不是留空：这样"取消率"和"故障率"在
+    ``agent_runs`` 上是两个能分别查的数，取消不会被算进错误。
+    """
+    if not enabled():
+        return False
+
+    def _apply(session: Session) -> bool:
+        run = session.get(AgentRun, run_id)
+        if run is None or run.status not in ("running", "interrupted"):
+            return False
+        now = naive_now()
+        run.status = "cancelled"
+        run.error_type = "user_cancelled"
+        run.updated_at = now
+        run.finished_at = now
+        session.commit()
+        return True
+
+    try:
+        if db is not None:
+            return _apply(db)
+        from database import SessionLocal
+
+        with SessionLocal() as owned:
+            return _apply(owned)
+    except Exception:
+        logger.exception("failed to mark run %s cancelled", run_id)
+        return False
+
+
 def orphan_timeout_seconds() -> float:
     """``running`` 多久没动就算没人在驱动它。
 
@@ -283,6 +329,19 @@ def expire_stale_runs(db: Session, user_id: str | None = None, limit: int = 100)
             run.error_type = "approval_timeout"
         if stale:
             db.commit()
+        # 通知：超时废弃的 run 给发起人落一条通知——否则它悄无声息地没了，用户永远
+        # 不知道自己有个审批/提问过期了。放在 commit 之后：通知写失败不该回滚这次废弃
+        # （create 本身也 non-blocking）。run 已不在 waiting_* 态，下次扫描不会重入，
+        # 不会重复通知。
+        for run in stale:
+            notification_service.create(
+                db,
+                user_id=run.user_id,
+                kind="run_abandoned",
+                title="一个待审批/待回答的任务已超时废弃",
+                run_id=run.id,
+                chat_id=run.chat_id,
+            )
         return len(stale)
     except Exception:
         db.rollback()

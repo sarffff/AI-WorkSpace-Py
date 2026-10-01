@@ -19,6 +19,7 @@ from services import file_types
 from services import workspace_service
 from services.workspace_service import VISIBILITY_WORKSPACE
 from services import ingest_clean
+from services import ocr
 from services import chunking
 from services import vector_store
 from services.chunking import Chunk, split_document
@@ -37,6 +38,17 @@ logger = logging.getLogger("knowledge_service")
 # 理由与代价见 services/file_types.py 的模块文档。保留这个名字是因为
 # parse_document 用它做分派，改名对调用方没有收益。
 TEXT_EXTENSIONS = file_types.TEXT
+
+# OOXML 三件套的分派表：扩展名 -> 解析器。用 dict 而不是元组清单：扩展名
+# **白名单**的真相源是 file_types（准入在路由那一层按 file_types 判），这里只是
+# "某个已准入的扩展名该用哪个解析器"的映射。dict 不被
+# test_no_backend_module_relists_extensions 的扫描器当成清单（它只看 set/list/tuple），
+# 而这份映射也确实不是清单：加一个格式时改的是 file_types.DOCUMENT（准入）+ 这里一行（解析器）。
+_OOXML_PARSERS = {
+    "docx": ingest_clean.extract_docx,
+    "xlsx": ingest_clean.extract_xlsx,
+    "pptx": ingest_clean.extract_pptx,
+}
 
 
 @dataclass(slots=True)
@@ -92,15 +104,13 @@ def parse_document(filename: str, content: bytes) -> ParsedDocument:
             warnings=list(extraction.warnings),
         )
 
-    if extension in ("docx", "xlsx"):
+    parser = _OOXML_PARSERS.get(extension)
+    if parser is not None:
         # 和 PDF 走同一个返回类型与同一套 warning 词汇，所以这里只是转形状。
         # 没有 INGEST_* 开关对照组：PDF 那个开关存在是因为"结构恢复"是启发式的
-        # （字号猜层级），需要一个能关掉的对照。docx 的层级在样式名里是显式的，
-        # 没有什么可对照的——加一个恒定更差的分支只会多一条没人跑的路径。
-        if extension == "docx":
-            extraction = ingest_clean.extract_docx(content)
-        else:
-            extraction = ingest_clean.extract_xlsx(content)
+        # （字号猜层级），需要一个能关掉的对照。OOXML 三件套的层级在样式/结构里是
+        # 显式的，没有什么可对照的——加一个恒定更差的分支只会多一条没人跑的路径。
+        extraction = parser(content)
         return ParsedDocument(
             text=extraction.text,
             backend=extraction.backend,
@@ -133,6 +143,35 @@ def _load_warnings(raw: str | None) -> list[str]:
     except ValueError:
         return []
     return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def _file_extension(filename: str) -> str:
+    """与 parse_document 同一套扩展名提取。``name#...`` 的锚点在 # 之后被丢掉。"""
+    base_name = filename.split("#", 1)[0]
+    return base_name.rsplit(".", 1)[-1].lower() if "." in base_name else ""
+
+
+def _merge_ocr(parsed: ParsedDocument, recovered: "ocr.OcrResult") -> ParsedDocument:
+    """把 OCR 结果并回解析结果。
+
+    抽到字:用 OCR 正文,并摘掉 no_text_layer / no_extractable_text(它们已经不成立了),
+    换成 ocr_recovered:N 这条可溯源的告警。``backend`` 带上 ``+ocr`` 后缀,排查时
+    一眼能看出这篇正文不是解析出来的、是转写出来的。
+    没抽到字:正文和原 backend 都不动,只追加 OCR 自己的 warning——让 index_document
+    的 no_chunks 自检照旧把它判 failed,而 warning 里能看出 OCR 试过且为什么没成。
+    """
+    if recovered.text.strip():
+        kept = [w for w in parsed.warnings if w not in ocr.OCR_TRIGGER_WARNINGS]
+        return ParsedDocument(
+            text=recovered.text,
+            backend=f"{parsed.backend}+ocr",
+            warnings=kept + [f"ocr_recovered:{recovered.pages_ocred}"] + recovered.warnings,
+        )
+    return ParsedDocument(
+        text=parsed.text,
+        backend=parsed.backend,
+        warnings=list(parsed.warnings) + recovered.warnings,
+    )
 
 
 
@@ -233,6 +272,17 @@ class KnowledgeService:
         同一份内容既是团队资产又是某人的私有副本,是两篇不同归属的文档。
         """
         parsed = parse_document(filename, content)
+        # 扫描件兜底:解析判定"有文件、一个字都没抽到"(no_text_layer /
+        # no_extractable_text)时,用视觉模型把页面转写成正文,再走后续正常的
+        # 分块/自检链路。闸门全在 ocr.maybe_ocr 里(默认关)。必须放在算 content_hash
+        # 之前——OCR 出来的正文才会参与去重与落库;放在之后的话去重按空串算,
+        # 两篇不同的扫描件会撞成同一个哈希。
+        if settings.INGEST_OCR_ENABLED and any(
+            w in ocr.OCR_TRIGGER_WARNINGS for w in parsed.warnings
+        ):
+            recovered = await ocr.maybe_ocr(_file_extension(filename), content)
+            if recovered is not None:
+                parsed = _merge_ocr(parsed, recovered)
         content_hash = hashlib.sha256(parsed.text.encode("utf-8")).hexdigest()
 
         duplicate_query = db.query(Document).filter(

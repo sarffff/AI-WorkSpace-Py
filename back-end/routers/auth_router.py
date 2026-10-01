@@ -25,7 +25,7 @@ from auth import (
 from config import settings
 from database import get_db
 from models import User
-from services import workspace_service
+from services import workspace_service, audit_log
 
 # 限流器
 from rate_limit import limiter
@@ -151,6 +151,9 @@ async def register(
     # 工作区初始化:自建个人空间并成为其 admin
     workspace_service.resolve_for_user(db, new_user)
 
+    # 审计：账号创建是审计链的起点动作
+    audit_log.record(db, actor_id=new_user.id, action="auth.register", target=new_user.email)
+
     # 生成 access token + refresh token
     access_token = create_access_token(data={"sub": new_user.id})
     refresh_token = create_refresh_token(data={"sub": new_user.id})
@@ -211,6 +214,9 @@ async def login(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="账号已被禁用"
         )
+
+    # 审计：一次成功登录（凭证已验证、账号有效）
+    audit_log.record(db, actor_id=user.id, action="auth.login", target=user.email)
 
     # 生成 access token + refresh token
     access_token = create_access_token(data={"sub": user.id})

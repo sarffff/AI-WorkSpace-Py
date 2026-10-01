@@ -41,6 +41,9 @@ from services import agent_roles
 from services import agent_state
 from services import approval
 from services import approval_audit
+from services import audit_log
+from services.notification_service import notification_service
+from services import cancellation
 from services import checkpoint_store
 from services import planner
 from services import retrieval_index
@@ -1676,8 +1679,15 @@ class ChatService:
                 "chatId": chat_id,
             }
 
-        async for event in self._drive_loop(db, state, ctx):
-            yield event
+        # 登记取消令牌。位置在 run_started 之后、进循环之前：前端只能先拿到
+        # runId 才能发取消请求，所以令牌总在任何一个取消可能到达之前就位。
+        # try/finally 保证连断线导致生成器被回收的情况也会摘除，不泄露。
+        cancellation.register(state.run_id)
+        try:
+            async for event in self._drive_loop(db, state, ctx):
+                yield event
+        finally:
+            cancellation.unregister(state.run_id)
 
     async def _drive_loop(
         self,
@@ -1720,6 +1730,24 @@ class ChatService:
         messages = state.messages
 
         while True:
+            # 安全点一：轮首。用户点了"停止生成"就在这里收尾——不再发下一轮的
+            # 模型调用，也不再跑任何工具。终态是 ``cancelled``（不可接续），与断线的
+            # ``interrupted`` 分开。成本不会丢：每一轮的 span 在发生时就已落库，
+            # 取消只是不再产生新的花费。
+            if cancellation.is_cancelled(state.run_id):
+                self._finish_run(
+                    db,
+                    state,
+                    status="cancelled",
+                    error="user_cancelled",
+                    rounds=round_index,
+                )
+                yield {
+                    "type": "cancelled",
+                    "runId": state.run_id,
+                    "round": round_index,
+                }
+                return
             if not resuming:
                 round_index += 1
                 state.round_index = round_index
@@ -1924,6 +1952,25 @@ class ChatService:
             for call_index, call in enumerate(
                 pending_calls[start_index:], start=start_index
             ):
+                # 安全点二：每个工具执行之前。一轮可能并行调好几个工具，
+                # 只在轮首查的话，用户在本轮第一个工具跑完、第二个还没开始时
+                # 点停止，那第二个（可能是一次写入）还是会跑。写操作尤其不能白跑。
+                if cancellation.is_cancelled(state.run_id):
+                    state.pending_index = call_index
+                    self._finish_run(
+                        db,
+                        state,
+                        status="cancelled",
+                        error="user_cancelled",
+                        rounds=round_index,
+                    )
+                    yield {
+                        "type": "cancelled",
+                        "runId": state.run_id,
+                        "round": round_index,
+                        "beforeTool": call.name,
+                    }
+                    return
                 try:
                     arguments = json.loads(call.arguments)
                 except json.JSONDecodeError:
@@ -2011,6 +2058,17 @@ class ChatService:
                             call_index=call_index,
                             arguments=arguments,
                             reason=request.reason,
+                        )
+                        # 通知：审批挂起落一条持久通知，审批人刷新/离开后仍能发现
+                        # （HITL 闭环不再只依赖这条实时 SSE 连接）。非阻断、按 run 去重。
+                        notification_service.create(
+                            db,
+                            user_id=state.user_id,
+                            kind="approval_required",
+                            title=f"待审批：{call.name}",
+                            body=(request.reason or None),
+                            run_id=state.run_id,
+                            chat_id=state.chat_id,
                         )
                         turn.set(interrupted="tool_approval", interrupt_tool=call.name)
                         yield {
@@ -2130,6 +2188,24 @@ class ChatService:
                     run_id=state.run_id,
                 )
 
+                # 审计：改变状态的工具**成功执行后**落一条防篡改链。写操作是
+                # "这个 agent 到底动过什么"的核心，要记录它——与审批开没开无关
+                # （审批可能被配成 off 或只 gate 一部分）。失败/被拒/重复的调用不记：
+                # 那几种没有真的改变状态。
+                if (
+                    result.status is ToolStatus.OK
+                    and call.name in approval.STATE_CHANGING_TOOLS
+                ):
+                    audit_log.record(
+                        db,
+                        actor_id=state.user_id,
+                        action="tool.write",
+                        target=call.name,
+                        arguments=arguments,
+                        run_id=state.run_id,
+                        chat_id=state.chat_id,
+                    )
+
                 # 澄清工具:回合在这里停下,等用户回答。
                 # 非 OK 状态(参数校验不过)走正常回灌路径,让模型自己改。
                 if (
@@ -2171,6 +2247,17 @@ class ChatService:
                             bump_interrupts=True,
                         )
                         turn.set(interrupted="user_input")
+                        # 通知：模型抛回一个问题、回合挂起等人回答——同审批，落一条
+                        # 持久通知，别让它只活在这条 SSE 连接上。
+                        notification_service.create(
+                            db,
+                            user_id=state.user_id,
+                            kind="input_required",
+                            title=f"待回答：{question[:40]}",
+                            body=question,
+                            run_id=state.run_id,
+                            chat_id=state.chat_id,
+                        )
                         yield {
                             "type": "clarification",
                             "runId": state.run_id,
@@ -2362,6 +2449,16 @@ class ChatService:
             status="waiting_input",
             rounds=round_index,
             bump_interrupts=True,
+        )
+        # 通知：框架把正文里那句问题收编成一次中断，同样落一条持久通知
+        notification_service.create(
+            db,
+            user_id=state.user_id,
+            kind="input_required",
+            title=f"待回答：{question[:40]}",
+            body=question,
+            run_id=state.run_id,
+            chat_id=state.chat_id,
         )
         ctx.turn.set(interrupted="prose_question", clarification=True)
         return {
@@ -2585,6 +2682,16 @@ class ChatService:
             effective_arguments=effective,
             edited_fields=changed_keys,
         )
+        # 审计：审批裁决进防篡改链。AgentApproval 存审批的详细状态（改没改参数、
+        # 谁批的），这一条只作跨动作的完整性链——记的是**真正要执行的那份**参数。
+        audit_log.record(
+            db,
+            actor_id=user_id,
+            action="approval.approved" if approved else "approval.rejected",
+            target=request.tool,
+            arguments=effective,
+            run_id=run_id,
+        )
 
         resolved: dict[str, Any] = {
             "type": "approval_resolved",
@@ -2696,8 +2803,12 @@ class ChatService:
                 ctx.restore_from(state)
                 turn.set(replayed_writes=len(state.writes))
 
-                async for event in self._drive_loop(db, state, ctx):
-                    yield event
+                cancellation.register(state.run_id)
+                try:
+                    async for event in self._drive_loop(db, state, ctx):
+                        yield event
+                finally:
+                    cancellation.unregister(state.run_id)
 
     async def continue_orphan(
         self,
