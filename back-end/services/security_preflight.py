@@ -55,9 +55,57 @@ def audit_settings(settings) -> list[str]:
     return issues
 
 
+def audit_write_gates(settings, registered: set[str], gated: set[str]) -> list[str]:
+    """改状态的工具已经注册，却不在审批门集里 = 没有人确认就写得进去。
+
+    判据不在这儿重复一遍：``registered`` 由 ``fs_tools.enabled_names()`` 与
+    ``workspace_tools.enabled_names()`` 给（它们就是注册那一段的同一份代码），
+    ``gated`` 由 ``approval.gated_tools()`` 给。这里只做集合差。之所以不让本函数
+    自己去调那两个模块，是因为 ``audit_*`` 都是纯函数——启动闸门要能被单测喂进
+    任意组合，而不必真把工具注册起来。
+
+    三个条件叠在一起才会漏，而它们各自看起来都"没什么"：
+    ``AGENT_APPROVAL_MODE="off"``（默认）+ ``AGENT_CHECKPOINT_ENABLED=False``
+    （默认）+ 有人把 ``TOOL_WRITE_KNOWLEDGE_ENABLED`` 之类打开了。前两个默认值是
+    成套的（都关，所以默认配置没问题），坏在第三个是逐个打开的：运营按
+    `standard.md` §8"写操作要人确认"的理解去开写工具时，并不会同时得到审批。
+    """
+    # 延迟 import：审计函数要能在没装齐依赖、或测试喂假 settings 的情况下被调用，
+    # 而这个模块被 main.py 在启动很早期就 import。
+    from services.approval import STATE_CHANGING_TOOLS
+
+    ungated = sorted(registered & set(STATE_CHANGING_TOOLS) - gated)
+    if not ungated:
+        return []
+    return [
+        "已注册但不过审批的改状态工具："
+        + "、".join(ungated)
+        + "——写操作会在没有人确认的情况下直接执行。"
+        "要么关掉对应 TOOL_*_ENABLED，要么同时开 "
+        "AGENT_APPROVAL_MODE=write 与 AGENT_CHECKPOINT_ENABLED=True"
+        "（审批要跨请求等人点同意，没有快照就没有东西可恢复，两个都得开）"
+    ]
+
+
+def _live_tool_names() -> tuple[set[str], set[str]]:
+    """当前配置下"注册了哪些工具"与"哪些要审批"。给 enforce 用，不参与纯函数审计。"""
+    from services import fs_tools, workspace_tools
+    from services.approval import gated_tools
+
+    registered = set(fs_tools.enabled_names()) | set(workspace_tools.enabled_names())
+    return registered, set(gated_tools())
+
+
 def enforce(settings, *, logger) -> None:
     """启动体检。生产有问题即抛 RuntimeError 拒绝启动；非生产只告警。"""
-    issues = audit_settings(settings)
+    issues = list(audit_settings(settings))
+    try:
+        registered, gated = _live_tool_names()
+    except Exception as exc:  # 工具面取不到不该挡住启动，但也别装作查过了
+        logger.warning("[写操作审批] 无法核对工具面（%s），这一项没检查", type(exc).__name__)
+    else:
+        issues += audit_write_gates(settings, registered, gated)
+
     if not issues:
         return
     if settings.is_production:

@@ -2,6 +2,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any, AsyncGenerator
 
 from sqlalchemy.orm import Session
@@ -2556,6 +2557,22 @@ class ChatService:
             yield {"type": "error", "error": "回答不能为空。"}
             return
 
+        # 抢占：同一条澄清被两个标签页各答一次，只该有一个真的接着跑。
+        # 放在"空回答"之后——空回答按上面的约定不消耗这次中断，所以也不该抢。
+        claimed, now_status = checkpoint_store.claim_for_resume(
+            db, run_id, from_statuses=("waiting_input",)
+        )
+        if not claimed:
+            yield {
+                "type": "error",
+                "error": (
+                    f"这次执行当前状态是 {now_status}，不在等待回答。"
+                    if now_status
+                    else "这次执行已不可用。"
+                ),
+            }
+            return
+
         # 用户的原话要过 mask_markup 再进 messages。它会以 role=tool 的身份出现，
         # 而模型对 tool 内容的信任度比 user 更高——这个位置更值得防注入，
         # 不是更不值得。
@@ -2582,7 +2599,6 @@ class ChatService:
         state.interrupt = None
         state.phase = "pre_tools"
         state.status = "running"
-        checkpoint_store.update_run(db, run_id, status="running")
 
         yield {
             "type": "clarification_answered",
@@ -2646,6 +2662,7 @@ class ChatService:
         # 按工具名放行等于"以后这个工具都不用问了"，那审批就只剩第一次有意义。
         call_key = request.tool_call_id or f"r{state.round_index}c{request.call_index}"
         changed_keys: list[str] = []
+        merged_args: dict[str, Any] | None = None
         if approved and edited_arguments is not None:
             # 只能改**这次调用的参数**，工具名不可改。放开工具名等于让审批弹窗
             # 变成越权通道：用户看到并同意的是"保存到知识库"，改成"删除文档"
@@ -2659,12 +2676,32 @@ class ChatService:
                 for key in merged
                 if merged.get(key) != request.arguments.get(key)
             )
-            state.edited_arguments = {
-                **state.edited_arguments,
-                call_key: json.dumps(merged, ensure_ascii=False),
-            }
+            merged_args = merged
             # 改完的参数**不再回到闸门**。人刚刚亲手写了这些值，再弹一次让他确认
             # 自己写的东西，是在训练无脑点确认——而那正是审批失效的方式。
+
+        # 抢占放在参数校验**之后**、改状态之前：一次填错的"同意"不该把这张审批
+        # 消耗掉，否则用户改对了也没有第二次可以点。从这里往后的早退都是真的
+        # 执行过了（审计已记、循环已跑），令牌花得对。
+        claimed, now_status = checkpoint_store.claim_for_resume(
+            db, run_id, from_statuses=("waiting_approval",)
+        )
+        if not claimed:
+            yield {
+                "type": "error",
+                "error": (
+                    f"这次执行当前状态是 {now_status}，不在等待审批。"
+                    if now_status
+                    else "这次执行已不可用。"
+                ),
+            }
+            return
+
+        if merged_args is not None:
+            state.edited_arguments = {
+                **state.edited_arguments,
+                call_key: json.dumps(merged_args, ensure_ascii=False),
+            }
         if approved:
             state.approved_call_ids = [*state.approved_call_ids, call_key]
         else:
@@ -2673,7 +2710,6 @@ class ChatService:
         state.interrupt = None
         state.phase = "pre_tools"
         state.status = "running"
-        checkpoint_store.update_run(db, run_id, status="running")
         # 审计留痕：谁批的、什么时候、以及**真正要执行的那份参数**。
         # effective_arguments 传改后的那份（没改就是原始那份），它的 digest
         # 与请求时的不同就说明执行的不是模型原本要执行的东西。
@@ -2879,7 +2915,27 @@ class ChatService:
             chat_id=state.chat_id,
             message_id=state.message_id,
         )
-        checkpoint_store.update_run(db, run_id, status="running")
+        # 抢占。``interrupted`` 是 SSE 的 finally 标下的断线，改状态就是足够的判据；
+        # ``running`` 那一路（进程被杀、finally 都没跑到）改状态等于没改，所以只能
+        # 靠"多久没人碰过它"来区分僵尸和正在跑的回合——两个并发接续里，赢的那个把
+        # updated_at 推到现在，另一个的 stale 谓词当场不成立。
+        claimed, now_status = checkpoint_store.claim_for_resume(
+            db,
+            run_id,
+            from_statuses=("interrupted",),
+            stale_before=naive_now()
+            - timedelta(seconds=checkpoint_store.orphan_timeout_seconds()),
+        )
+        if not claimed:
+            yield {
+                "type": "error",
+                "error": (
+                    f"这次执行当前状态是 {now_status}，不是断线未完成。"
+                    if now_status
+                    else "这次执行已不可用。"
+                ),
+            }
+            return
         yield {"type": "run_resumed", "runId": run_id, "round": state.round_index}
 
         async with tracer.trace(

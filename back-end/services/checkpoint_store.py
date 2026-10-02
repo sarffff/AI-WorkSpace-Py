@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import and_, or_
@@ -119,6 +119,81 @@ def update_run(
     except Exception:
         db.rollback()
         logger.warning("update_run failed for %s", run_id, exc_info=True)
+
+
+def claim_for_resume(
+    db: Session,
+    run_id: str,
+    *,
+    from_statuses: tuple[str, ...],
+    stale_before: datetime | None = None,
+) -> tuple[bool, str | None]:
+    """原子地把一个"在等人 / 断线未完成"的执行抢过来继续跑。
+
+    **为什么不能"先读 status 看一眼再写"**：审批和澄清都跑在另一个 HTTP 请求里
+    （``resume_turn`` 的文档串），双击同意按钮、同一个审批在两个标签页里开着、
+    多 worker 各收到一次请求，拿到的是**同一个 run_id**。两边都读到
+    ``waiting_approval``、双双过了检查，已批准的写操作就执行两遍——而写操作是不可
+    逆的，审批闸门卖的正是"一次同意换一次执行"。
+
+    判据是一条 ``UPDATE ... WHERE 谓词`` 的影响行数：同一个 run 上只有一个请求能
+    把谓词满足掉，其余的拿到 0 行。这不是"读起来像原子"，是同一条语句在行锁上
+    串行，所以不需要再配一次读。
+
+    两个细节决定了它必须是**短事务**：
+
+    - 谓词要求状态真的**变**（``waiting_*`` → ``running``）。若源状态就等于目标
+      状态，两次 UPDATE 都会满足谓词、各赢一次——所以 ``continue_orphan`` 那种
+      "从 running 接回来"的情形不能靠状态判，只能靠 ``stale_before``。
+    - 抢占之后立刻 commit 释放行锁，绝不把锁带进 LLM 流。那意味着一次回答期间
+      一直持着行锁，同 run 的取消请求、孤儿回收、审计写都会被顶住，MySQL 上还会
+      把行锁扩成表锁（1205）。这里只做一次 UPDATE 就提交，真正的状态推进仍由
+      后面的 ``update_run`` 完成。
+
+    ``stale_before`` 是给硬崩溃那一路留的：进程死得太快、连 SSE 的 ``finally`` 都
+    没跑到，run 会停在 ``running``。它和"有人在跑"看起来一模一样，唯一的区别是
+    时间——超过孤儿超时仍未被触碰的才算僵尸。把它写进谓词顺带换来一个好处：两个
+    并发接续里只有一个能赢，因为赢的那个会把 ``updated_at`` 推到现在，另一个的
+    ``< stale_before`` 当场不成立。
+
+    返回 ``(是否抢到, 当前状态)``。抢不到时把状态读回来只为拼一句人话，不参与
+    任何判断。检查点没开时返回 ``(True, None)``：那时 ``update_run`` 本来就是空操
+    作，这里维持原行为，不因加了这道守卫反而多关掉一条路径。
+    """
+    if not enabled():
+        return True, None
+
+    status_matches = [AgentRun.status.in_(from_statuses)]
+    if stale_before is not None:
+        status_matches.append(
+            and_(
+                AgentRun.status == "running",
+                AgentRun.updated_at < stale_before,
+            )
+        )
+
+    try:
+        claimed = (
+            db.query(AgentRun)
+            .filter(
+                AgentRun.id == run_id,
+                or_(*status_matches),
+            )
+            .update(
+                {AgentRun.status: "running", AgentRun.updated_at: naive_now()},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning("claim_for_resume failed for %s", run_id, exc_info=True)
+        return False, None
+
+    if claimed:
+        return True, "running"
+    run = db.query(AgentRun).filter(AgentRun.id == run_id).first()
+    return False, (run.status if run is not None else None)
 
 
 def mark_interrupted(run_id: str, db: Session | None = None) -> bool:

@@ -70,9 +70,10 @@ class User(Base):
     #   admin — 可增删工作区共享文档,可重置邀请码
     #   user  — 共享文档只读;但可以自由增删**自己的**私有文档
     # 所以 user 不是"只读账号",它只是不能改组织资产。
-    workspace_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True, index=True
-    )
+    # 不设外键：0007 建列时就没带，库里至今也没有，而应用层从不删工作区——
+    # 那句 ondelete="SET NULL" 是一次都不会兑现的空头承诺。留着它反而让
+    # create_all 建出来的测试库（SQLite 会建 FK）与生产库结构不一致。
+    workspace_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     role: Mapped[str] = mapped_column(String(20), default="admin")
 
     # 账号状态
@@ -133,6 +134,10 @@ class MessageToolStep(Base):
     __table_args__ = (
         Index("ix_message_tool_steps_chat_created", "chat_id", "created_at"),
         Index("ix_message_tool_steps_message", "message_id"),
+        # 名字跟着 0010 迁移走，而不是跟着 ``index=True`` 的自动名（``..._run_id``）。
+        # 库里已经叫 ``ix_message_tool_steps_run`` 了，为了一个名字去线上 RENAME INDEX
+        # 不划算——而自动名只是 SQLAlchemy 的默认，不是约定。
+        Index("ix_message_tool_steps_run", "run_id"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -159,7 +164,7 @@ class MessageToolStep(Base):
     # 归属的 agent_runs.id。有了它，"这一步是哪次执行做的"是一次 join 而不是
     # 按 (agent_role, 时间) 推断——同一回合里委派两个 researcher 时后者会错。
     # NULL = 这一步产生于 agent_runs 存在之前，或埋点关闭时
-    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
     # ToolStatus 的三档（ok / invalid_arguments / unavailable），预检索失败记 error
     status: Mapped[str] = mapped_column(String(20), default="ok")
@@ -315,7 +320,9 @@ class AgentApproval(Base):
     arguments_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # pending / approved / rejected / expired
-    decision: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    # 单列索引刻意不加：__table_args__ 里那条 (decision, requested_at) 的复合索引
+    # 最左前缀就是 decision，单列版本只是让每次写入多维护一棵树。
+    decision: Mapped[str] = mapped_column(String(16), default="pending")
     # 过期时为 NULL——那正是"没有人做这个决定"的准确表示
     decided_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -337,9 +344,10 @@ class Document(Base):
     size: Mapped[int] = mapped_column(Integer)
     content: Mapped[str | None] = mapped_column(Text, nullable=True)  # 文档全文内容
     # 知识库的外层作用域:工作区。检索/去重/缓存都先按它过滤
-    workspace_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True, index=True
-    )
+    # 不设外键：0007 建列时就没带，库里至今也没有，而应用层从不删工作区——
+    # 那句 ondelete="SET NULL" 是一次都不会兑现的空头承诺。留着它反而让
+    # create_all 建出来的测试库（SQLite 会建 FK）与生产库结构不一致。
+    workspace_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     # 上传者。**参与权限判断**:private 文档只有 user_id == 当前用户时可见可删。
     # 改动之前这一列只用于展示"这份文档是谁放的",加了 visibility 之后它成了
     # 私有文档的归属键——所以它为 NULL 的 private 文档谁都看不见(见下)。
@@ -859,7 +867,9 @@ class DocumentJob(Base):
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
     )
-    document_id: Mapped[str] = mapped_column(String(36), index=True)
+    # 索引由下面 __table_args__ 的 ix_document_jobs_document 提供；这里再写
+    # index=True 只会多出一个同名同列的自动索引（..._document_id）。
+    document_id: Mapped[str] = mapped_column(String(36))
     # queued / running / succeeded / failed
     status: Mapped[str] = mapped_column(String(16), default="queued")
     attempts: Mapped[int] = mapped_column(Integer, default=0)
