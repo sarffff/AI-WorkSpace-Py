@@ -756,13 +756,17 @@ def _stub_fetch(monkeypatch, html=_HTML):
 
 
 def _stub_index(monkeypatch):
-    """后台索引会打真实 embedding，换成 no-op。"""
-    from routers import knowledge_router
+    """后台抽干会打真实 embedding，换成 no-op。
 
-    async def noop(document_id: str) -> None:
+    上传现在走持久队列：enqueue 落一行 document_jobs，再由 run_pending 抽干。
+    把 run_pending 换成 noop 即可让响应里不发生真实索引（入队本身是纯 DB 写，无妨）。
+    """
+    from services import document_queue
+
+    async def noop(*args, **kwargs) -> None:
         return None
 
-    monkeypatch.setattr(knowledge_router, "_index_document_task", noop)
+    monkeypatch.setattr(document_queue, "run_pending", noop)
 
 
 def test_从URL入库生成md文档(client, db_session, monkeypatch):

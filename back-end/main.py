@@ -335,6 +335,34 @@ def _check_ocr_config() -> None:
         print(f"OCR: 扫描件兜底已启用（模型 {model}，≤{settings.INGEST_OCR_MAX_PAGES} 页/篇）")
 
 
+def _check_multiworker_vector_store() -> None:
+    """多 worker 部署但向量库还是 memory —— 响亮告警（不拒启动）。
+
+    memory 后端的索引是每个 worker 进程各建一份、从 MySQL 派生（见 services/vector_store
+    模块文档）：一次上传只在服务了那个请求的 worker 上生效，之后能不能检索到取决于
+    下个请求打到谁。单 worker 没事，多 worker 就是"刚传的文档一半时间搜不到"这种
+    查不出的间歇性 bug。
+
+    不硬拦（不像 pdfplumber 那条必需依赖）：worker 数没有可靠的自省途径——
+    ``WEB_CONCURRENCY`` 是 gunicorn/uvicorn 的约定 env，但不是每种起法都设它。按这个
+    约定给 hint，误报只多一条告警，漏报由 README 部署章节与这条共同兜。切 Qdrant 消除。
+    """
+    try:
+        workers = int(os.environ.get("WEB_CONCURRENCY", "1"))
+    except ValueError:
+        workers = 1
+    if workers <= 1:
+        return
+    from services import vector_store
+
+    if not vector_store.uses_qdrant():
+        print(
+            f"  ⚠ WEB_CONCURRENCY={workers}（多 worker）但 VECTOR_STORE 仍是 memory —— "
+            "每个 worker 各建一份索引，刚上传的文档会间歇检索不到。多 worker 请切 "
+            "VECTOR_STORE=qdrant（见 docker-compose.qdrant.yml 与 README 部署章节）。"
+        )
+
+
 def _adopt_orphaned_documents() -> None:
     """把删用户留下的无主私有文档收编成工作区共享文档。
 
@@ -367,25 +395,24 @@ def _adopt_orphaned_documents() -> None:
 
 
 def _recover_stalled_documents() -> None:
-    """重启后把卡在 ``processing`` 的文档重新索引。
+    """重启后把卡在 ``processing`` 的文档重新排进持久队列。
 
-    上传走 ``BackgroundTasks``（进程内 fire-and-forget，不落磁盘），进程在索引
-    中途重启的话，那些文档会永远停在 ``processing``——既没 ``indexed``（检索不到）
-    也没 ``failed``（看不出出了问题）。这里在启动时把它们捞出来重新驱动。
+    上传后的索引现在走 ``document_jobs`` 持久队列（见 services/document_queue.py），
+    但进程在索引中途被杀时，可能留下两类残留：文档停在 ``processing``、而队列行停在
+    ``running``（认领它的进程没了）。这里把前者重新入队、把后者的过期租约回收，
+    然后触发一次抽干。
 
-    ``index_document`` 是幂等的（先删旧分块再写新的，见它里那段注释），所以重跑
-    安全；它自己吞异常并落 ``failed``，所以重跑失败也不会把文档留在 ``processing``。
+    ``index_document`` 幂等（先删旧分块再写新的），所以重跑安全；``enqueue`` 对已有
+    未结束任务去重，所以重复入队不会把一篇并发索引两次。
 
-    只在 startup 扫一次：项目里没有 worker 进程，而 ``processing`` 是"正在这个进程
-    里跑"的状态，重启后没有别的进程会接它们，所以启动是唯一能兜住的位置
-    （同 ``_adopt_orphaned_documents`` 的取舍）。
-
-    每篇一个独立的后台任务、各自建 session：``index_document`` 会跑 embedding（慢、
-    可能失败），串在启动里会拖慢冷启动，且一篇失败不该连累其它篇。任务数封顶，
-    避免一次异常重启（比如 embedding 端点挂了）后启动瞬间涌出无限制的并发任务。
+    只在 startup 扫一次：``processing`` 是"正在某个进程里跑"的状态，重启后没有别的
+    进程会接它们（同 ``_adopt_orphaned_documents`` 的取舍）。队列的持久性 + 启动重驱
+    一起把改动前"进程内 fire-and-forget 重启即丢"那个洞补上。
     """
     from models import Document
+    from services import document_queue
 
+    enqueued = 0
     db = SessionLocal()
     try:
         stalled = (
@@ -394,23 +421,23 @@ def _recover_stalled_documents() -> None:
             .limit(500)
             .all()
         )
-        ids = [row[0] for row in stalled]
+        for row in stalled:
+            if document_queue.enqueue(db, row[0]) is not None:
+                enqueued += 1
+        # 回收上次崩在 running 的队列任务（租约早过期），它们也会被重新认领
+        document_queue.reap_expired_leases(db)
     except Exception as exc:  # noqa: BLE001
         print(f"  ⚠ 扫描中断文档失败（不影响启动）：{type(exc).__name__}: {exc}")
         return
     finally:
         db.close()
 
-    if not ids:
-        return
-
-    for doc_id in ids:
-        # 复用路由那个后台任务包装：它已经做了"自建 session + 用完关掉"。
-        asyncio.create_task(knowledge_router._index_document_task(doc_id))
-    print(
-        f"  ↻ 重新索引 {len(ids)} 篇上次中断在 processing 的文档"
-        "（进程内后台任务不落磁盘，重启会丢，这里补跑）。"
-    )
+    if enqueued:
+        asyncio.create_task(document_queue.run_pending())
+        print(
+            f"  ↻ 重新入队 {enqueued} 篇上次中断在 processing 的文档"
+            "（现在走持久队列，重启不丢、失败重试）。"
+        )
 
 
 @app.on_event("startup")
@@ -429,6 +456,7 @@ async def startup():
     # 只是永远不被选中）。
     skill_library.validate()
     _check_ingest_backend()
+    _check_multiworker_vector_store()
     _adopt_orphaned_documents()
     _recover_stalled_documents()
     # 工具是按开关注册的，而"开关开了但没配 key 的 web_search 根本不注册"这类

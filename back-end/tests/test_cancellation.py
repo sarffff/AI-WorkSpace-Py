@@ -207,3 +207,33 @@ def test_mark_cancelled_missing_run_returns_false(db_real, monkeypatch):
 
     monkeypatch.setattr(settings, "AGENT_CHECKPOINT_ENABLED", True)
     assert checkpoint_store.mark_cancelled("does-not-exist", db=db_real) is False
+
+
+# ========== 4. 跨 worker 兜底：循环查落库的 cancelled 状态 ==========
+
+
+def test_is_run_cancelled_reads_db_status(db_real, monkeypatch):
+    """取消打到别的 worker 时，本进程没有 Event，但循环查 DB 能看到 cancelled。
+
+    这是 cancellation.is_cancelled（只看进程内 Event）的跨 worker 兜底：另一个
+    worker 的 mark_cancelled 落了 agent_runs.status，这里据此让循环收尾。
+    """
+    from services import checkpoint_store
+
+    monkeypatch.setattr(settings, "AGENT_CHECKPOINT_ENABLED", True)
+    _make_run(db_real, run_id="run-cxl", status="cancelled")
+    _make_run(db_real, run_id="run-live", status="running")
+
+    assert checkpoint_store.is_run_cancelled(db_real, "run-cxl") is True
+    assert checkpoint_store.is_run_cancelled(db_real, "run-live") is False
+    # 没有这个 run（例如还没落库）按未取消处理，不炸
+    assert checkpoint_store.is_run_cancelled(db_real, "no-such-run") is False
+
+
+def test_is_run_cancelled_false_when_checkpoints_disabled(db_real, monkeypatch):
+    """关掉快照就没有 agent_runs 行、也没有多 worker——直接 False，不查库。"""
+    from services import checkpoint_store
+
+    monkeypatch.setattr(settings, "AGENT_CHECKPOINT_ENABLED", False)
+    _make_run(db_real, run_id="run-cxl2", status="cancelled")
+    assert checkpoint_store.is_run_cancelled(db_real, "run-cxl2") is False

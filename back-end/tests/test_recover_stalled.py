@@ -1,18 +1,18 @@
 """重启后恢复卡在 ``processing`` 的文档（main._recover_stalled_documents）。
 
-上传走进程内 BackgroundTasks，不落磁盘。进程在索引中途重启，那些文档会永远停在
-``processing``——既检索不到，也看不出出了问题。这个启动钩子把它们捞出来重新驱动。
+索引现在走持久的 document_jobs 队列，但进程在索引中途被杀仍可能留下文档停在
+``processing``。这个启动钩子把它们重新**入队**（而不是改动前的进程内 create_task），
+重启不丢、失败重试。
 
-测的是"哪些被重新排了"：只有 ``processing`` 的该重跑，``indexed`` / ``failed`` 是
-终态，重跑 indexed 是浪费、重跑 failed 会把一个已经如实报告失败的文档又变回
-processing（掩盖失败）。
+测的是"哪些被重新入队"：只有 ``processing`` 的该重排，``indexed`` / ``failed`` 是
+终态——重排 indexed 是浪费、重排 failed 会把一个已如实报告失败的文档又变回处理中。
 """
 from __future__ import annotations
 
 import asyncio
 
 from conftest import run
-from models import Document
+from models import Document, DocumentJob
 
 
 def _seed(db, doc_id: str, status: str) -> None:
@@ -32,50 +32,52 @@ def _seed(db, doc_id: str, status: str) -> None:
     db.commit()
 
 
-def _patch(monkeypatch, db_real):
-    """把 SessionLocal 指到测试库，把后台索引任务换成记录器。返回 scheduled 列表。"""
+def _patch(monkeypatch, db_real) -> None:
+    """SessionLocal 指到测试库；抽干换成 no-op（否则会打真实 embedding）。"""
     import main
-    from routers import knowledge_router
+    from services import document_queue
 
-    scheduled: list[str] = []
+    async def noop(*args, **kwargs) -> None:
+        return None
 
-    async def fake_task(doc_id: str) -> None:
-        scheduled.append(doc_id)
-
-    monkeypatch.setattr(knowledge_router, "_index_document_task", fake_task)
+    monkeypatch.setattr(document_queue, "run_pending", noop)
     monkeypatch.setattr(main, "SessionLocal", lambda: db_real)
-    return scheduled
 
 
-async def _drive(main):
-    # _recover_stalled_documents 用 asyncio.create_task 排任务，需要一个在跑的 loop；
-    # 排完 sleep(0) 几次让那些任务真的执行到（fake_task 无 await，一次让出即可跑完）。
+async def _drive(main) -> None:
+    # _recover_stalled_documents 入队后用 create_task 触发抽干，需要一个在跑的 loop；
+    # 抽干已被 no-op 掉，sleep(0) 让那个 task 跑完即可。
     main._recover_stalled_documents()
     for _ in range(3):
         await asyncio.sleep(0)
 
 
-def test_recover_reindexes_only_processing(db_real, monkeypatch):
+def _job_doc_ids(db) -> list[str]:
+    return sorted(job.document_id for job in db.query(DocumentJob).all())
+
+
+def test_recover_enqueues_only_processing(db_real, monkeypatch):
     import main
 
     _seed(db_real, "d-proc", "processing")
     _seed(db_real, "d-proc2", "processing")
     _seed(db_real, "d-idx", "indexed")
     _seed(db_real, "d-fail", "failed")
-    scheduled = _patch(monkeypatch, db_real)
+    _patch(monkeypatch, db_real)
 
     run(_drive(main))
 
-    assert sorted(scheduled) == ["d-proc", "d-proc2"]
+    assert _job_doc_ids(db_real) == ["d-proc", "d-proc2"]
+    assert all(job.status == "queued" for job in db_real.query(DocumentJob).all())
 
 
 def test_recover_noop_when_nothing_stalled(db_real, monkeypatch):
-    """没有中断文档时不排任何任务、也不报错（正常启动走的就是这条）。"""
+    """没有中断文档时不入任何队、也不报错（正常启动走的就是这条）。"""
     import main
 
     _seed(db_real, "d-idx", "indexed")
-    scheduled = _patch(monkeypatch, db_real)
+    _patch(monkeypatch, db_real)
 
     run(_drive(main))
 
-    assert scheduled == []
+    assert _job_doc_ids(db_real) == []

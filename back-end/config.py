@@ -546,6 +546,24 @@ class Settings(BaseSettings):
     # 单页转写结果低于这么多字符就当这页没抽到东西(空白页/插图页),跳过并计数。
     # 不设的话模型对空白页返回的"这页没有文字"之类说明会被当成正文混进库。
     INGEST_OCR_MIN_CHARS: int = 8
+
+    # ---- 入库任务队列（持久化，替代进程内 fire-and-forget）----
+    # 改动前上传后的索引是 FastAPI BackgroundTasks：同事件循环、不落盘、无并发上限、
+    # 无进度、无重试。进程在索引中途重启那篇文档就永远卡在 processing。这里换成一张
+    # document_jobs 表 + 认领/租约/重试，照搬 agent_runs 的 reaper 模式（惰性挂在读
+    # 路径上，项目里没有调度器）。幂等已满足（index_document 删后插），至少一次投递安全。
+    # 一个进程里最多同时索引几篇。索引慢在 embedding（N 次网络调用），并发太高会打爆
+    # embedding 端点的速率；2 是保守默认。
+    INGEST_QUEUE_CONCURRENCY: int = 2
+    # 认领一篇后租约多久过期。超过没完成即判为"认领它的进程死了"，重新入队。给得宽：
+    # 一篇大文档的 embedding 可能要几分钟，比"一篇真的可能花多久"宽才不会把正在跑的
+    # 任务误判成死锁（同 orphan_timeout 的取舍）。
+    INGEST_QUEUE_LEASE_SECONDS: float = 600.0
+    # 一篇最多尝试几次。瞬时失败（embedding 端点抖动）值得重试；到顶仍失败即落 failed。
+    INGEST_QUEUE_MAX_ATTEMPTS: int = 3
+    # 重试退避基数（秒），实际等待 = 基数 × 已尝试次数。避免 embedding 端点挂了之后
+    # 立刻原地重试、把失败放大成一个紧循环。
+    INGEST_QUEUE_BACKOFF_SECONDS: float = 30.0
     # 评估语料的降级方式:none | pdf_like | gbk_bytes | scanned(见 eval/corpus_degrade.py)。
     # 只影响离线评估,线上永远是 none。
     #

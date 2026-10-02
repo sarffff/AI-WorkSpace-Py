@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from auth import get_current_user
 from database import SessionLocal, get_db
 from models import User
-from services import egress, file_types, ingest_clean, workspace_service, workspace_tools
+from services import document_queue, egress, file_types, ingest_clean, workspace_service, workspace_tools
 from services.knowledge_service import KnowledgeService
 from services.workspace_service import WorkspaceError
 
@@ -35,17 +35,15 @@ class QueryRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=20)
 
 
-async def _index_document_task(document_id: str) -> None:
-    """后台索引任务。
+def _kick_indexing(db: Session, background_tasks: BackgroundTasks, document_id: str) -> None:
+    """把一篇排进持久队列并触发一次抽干。
 
-    必须自建 session：请求作用域的 session 在响应返回时就被 get_db 关掉了。
-    index_document 内部自行处理失败并把文档标成 failed。
+    入队落 document_jobs 行（持久、可重试、可跨重启恢复）；抽干作为响应后的后台
+    任务跑，不占 HTTP 连接。替代了改动前的 ``background_tasks.add_task(_index_document_task)``
+    那条进程内 fire-and-forget——现在进程中途重启，队列里的行还在，启动重驱会接上。
     """
-    db = SessionLocal()
-    try:
-        await knowledge_service.index_document(db, document_id)
-    finally:
-        db.close()
+    if document_queue.enqueue(db, document_id) is not None:
+        background_tasks.add_task(document_queue.run_pending)
 
 
 @router.get("/documents")
@@ -60,12 +58,25 @@ async def get_documents(
     （``require_can_modify``）——知情权和处置权是分开的。
     """
     workspace = workspace_service.resolve_for_user(db, current_user)
-    return await knowledge_service.get_documents(
+    # 惰性回收过期租约（认领它的进程死了的任务重新入队）——挂在读路径上,
+    # 项目里没有调度器,同 expire_stale_runs 挂在 /chats/runs/pending 的做法。
+    document_queue.reap_expired_leases(db)
+    docs = await knowledge_service.get_documents(
         db,
         workspace.id,
         viewer_id=current_user.id,
         include_member_private=workspace_service.is_admin(current_user),
     )
+    # 给还在处理/失败的文档带上队列进度与尝试次数,界面能显示"排队中/第 2 次重试"
+    # 而不是一个干巴巴的 processing。只对非终态查,正常列表几乎不多花查询。
+    for item in docs:
+        if isinstance(item, dict) and item.get("status") in ("processing", "failed"):
+            job = document_queue.job_for_document(db, item.get("id"))
+            if job is not None:
+                item["jobStatus"] = job.status
+                item["jobProgress"] = job.progress
+                item["jobAttempts"] = job.attempts
+    return docs
 
 
 @router.post("/documents/upload")
@@ -124,7 +135,7 @@ async def upload_document(
     # 向量化是整个流程里最慢的一环(N 次 embedding 调用),不该占着 HTTP 连接。
     # 重复上传直接返回已有文档,不再排一次索引任务。
     if not duplicate:
-        background_tasks.add_task(_index_document_task, doc.id)
+        _kick_indexing(db, background_tasks, doc.id)
 
     return {
         "id": doc.id,
@@ -217,7 +228,7 @@ async def add_document_from_url(
         raise HTTPException(status_code=500, detail="文档入库失败，请稍后重试") from e
 
     if not duplicate:
-        background_tasks.add_task(_index_document_task, doc.id)
+        _kick_indexing(db, background_tasks, doc.id)
 
     return {
         "id": doc.id,
@@ -281,3 +292,38 @@ async def query_knowledge(
         db, request.query, workspace.id, request.top_k, viewer_id=current_user.id
     )
     return {"query": request.query, "results": results, "total": len(results)}
+
+
+@router.get("/documents/{document_id}/chunks/{chunk_index}")
+async def get_document_chunk(
+    document_id: str,
+    chunk_index: int,
+    window: int = 1,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """按 (文档, 分块号) 取原文及相邻分块——引用点击跳原文用（B5）。
+
+    按**当前用户检索得到的范围**收口（共享 + 自己的私有，传 viewer_id）：引用来自
+    用户自己那次回答的检索，这里让他回看命中块的上下文，但不能借它去读别人的私有
+    文档。窗口夹在 0–5：回看上下文够用，又不至于把半篇文档拉回来。
+    """
+    workspace = workspace_service.resolve_for_user(db, current_user)
+    chunks = await knowledge_service.read_chunks(
+        db,
+        workspace.id,
+        document_id,
+        chunk_index,
+        window=max(0, min(window, 5)),
+        viewer_id=current_user.id,
+    )
+    if not chunks:
+        # 不存在、或不在当前用户可见范围内——都报 404，不泄露"存在但不是你的"
+        raise HTTPException(status_code=404, detail="分块不存在或无权查看")
+    return {
+        "documentId": document_id,
+        "documentName": chunks[0]["document_name"],
+        "chunks": [
+            {"chunkIndex": c["chunk_index"], "content": c["content"]} for c in chunks
+        ],
+    }

@@ -621,13 +621,23 @@ class KnowledgeService:
         document_id: str,
         chunk_index: int,
         window: int = 1,
+        viewer_id: str | None = None,
     ) -> list[dict]:
-        """读取指定分块及其相邻分块，仅返回归属于该工作区的文档。"""
-        document = (
-            db.query(Document)
-            .filter(Document.id == document_id, Document.workspace_id == workspace_id)
-            .first()
-        )
+        """读取指定分块及其相邻分块。
+
+        ``viewer_id``：给了就按**这个人检索得到的范围**收口（共享 + 自己的私有，同
+        ``listable_documents``）——引用跳原文的 HTTP 端点必须传它，否则同工作区的人能
+        读到别人的私有文档。不传（Agent 的 read_document_chunk 工具）保持原行为：
+        只按 workspace_id 过滤。两种模式分开，是为了不动工具那条已有路径。
+        """
+        query = db.query(Document).filter(Document.id == document_id)
+        if viewer_id is not None:
+            query = query.filter(
+                workspace_service.listable_documents(workspace_id, viewer_id)
+            )
+        else:
+            query = query.filter(Document.workspace_id == workspace_id)
+        document = query.first()
         if not document:
             return []
 

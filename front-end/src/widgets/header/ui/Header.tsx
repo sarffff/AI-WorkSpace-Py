@@ -7,6 +7,7 @@ import {
   setServerStatus,
 } from "@/entities/chat/model/chatSlice";
 import { apiClient } from "@/shared/api/client";
+import { NotificationBell } from "@/features/notifications/ui/NotificationBell";
 import { ChevronDown, ShieldCheck, Sparkles } from "lucide-react";
 
 const TITLES: Record<string, { title: string; eyebrow: string }> = {
@@ -17,6 +18,7 @@ const TITLES: Record<string, { title: string; eyebrow: string }> = {
   knowledge: { title: "知识库", eyebrow: "Retrieval" },
   skills: { title: "作业指导", eyebrow: "SOPs" },
   prompts: { title: "提示词工作台", eyebrow: "Lab" },
+  metrics: { title: "运营指标", eyebrow: "Metrics" },
   settings: { title: "设置", eyebrow: "System" },
 };
 
@@ -114,6 +116,8 @@ export const Header: React.FC = () => {
           <ShieldCheck className="w-3.5 h-3.5" />
           <span className="hidden sm:inline">{statusLabel}</span>
         </div>
+
+        <NotificationBell />
       </div>
     </header>
   );

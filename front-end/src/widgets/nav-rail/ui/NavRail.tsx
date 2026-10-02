@@ -12,7 +12,9 @@ import {
   ClipboardCheck,
   BookOpen,
   ScrollText,
+  FlaskConical,
   Route as RouteIcon,
+  BarChart3,
   Settings,
   Sun,
   Moon,
@@ -24,7 +26,8 @@ import {
  *
  * 换掉旧的 chat-centric 侧栏——旧侧栏把"新对话 + 会话历史"顶在最高层级，让一个
  * 审核生产工具长得像 chatbot。这里主模块平权：工作台 / 对话·审核 / 台账 / 知识库 /
- * 作业指导 / 轨迹。会话列表下沉到「对话」模块的上下文面板，作业指导从设置里提上来。
+ * 作业指导 / 提示词 / 轨迹 / 运营指标。会话列表下沉到「对话」模块的上下文面板，
+ * 作业指导从设置里提上来，提示词与运营指标从"有页面却进不去"接回导航。
  */
 const MODULES = [
   { id: "dashboard", label: "工作台", icon: LayoutDashboard, path: "/dashboard" },
@@ -32,7 +35,9 @@ const MODULES = [
   { id: "reviews", label: "审核台账", icon: ClipboardCheck, path: "/reviews", badge: true },
   { id: "knowledge", label: "知识库", icon: BookOpen, path: "/knowledge" },
   { id: "skills", label: "作业指导", icon: ScrollText, path: "/skills" },
+  { id: "prompts", label: "提示词工作台", icon: FlaskConical, path: "/prompts" },
   { id: "traces", label: "运行轨迹", icon: RouteIcon, path: "/traces" },
+  { id: "metrics", label: "运营指标", icon: BarChart3, path: "/metrics" },
 ] as const;
 
 export const NavRail: React.FC = () => {
