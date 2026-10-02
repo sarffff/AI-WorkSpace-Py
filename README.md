@@ -334,7 +334,7 @@ curl -X POST http://localhost:3000/chats/completions/stream \
 ### 测试与门禁
 
 ```bash
-# 后端(1668 条)
+# 后端(1692 条)
 cd back-end && python -m pytest
 
 # 提示词契约:模板缺失或占位符漂移直接失败
@@ -448,6 +448,17 @@ uvicorn main:app --reload --log-level debug
 # 使用 Gunicorn + Uvicorn Workers
 gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:3000
 ```
+
+> **多 worker（`-w` > 1）必须切 Qdrant。** 默认 `VECTOR_STORE=memory` 的索引是
+> 每个 worker 进程各建一份、从 MySQL 派生：一次上传只在服务了那个请求的 worker 上
+> 生效，之后能不能检索到取决于下个请求打到谁——表现为"刚传的文档一半时间搜不到"
+> 这种查不出的间歇性 bug。横向扩之前把 `VECTOR_STORE=qdrant` 配好
+> （`docker-compose.qdrant.yml`，向量变持久态、多 worker 共享），并设 `QDRANT_API_KEY`
+> （Qdrant 默认无鉴权）。设了 `WEB_CONCURRENCY>1` 却仍是 memory 时，启动会打一条告警。
+>
+> 入库索引走持久队列（`document_jobs` 表 + 认领/租约/重试），所以多 worker 下任务不会
+> 重复、进程重启不丢；取消「停止生成」也能跨 worker 生效（落库的 `cancelled` 状态，
+> 循环在轮首顺带查一次）。
 
 #### 前端部署
 

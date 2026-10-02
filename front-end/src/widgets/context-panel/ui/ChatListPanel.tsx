@@ -11,7 +11,7 @@ import {
 } from "@/entities/chat/model/chatSlice";
 import { apiClient } from "@/shared/api/client";
 import { toastMessageFrom, useToast } from "@/shared/ui/Toast";
-import { Plus, Pin, PinOff, Trash2, Pencil } from "lucide-react";
+import { Plus, Pin, PinOff, Trash2, Pencil, Download } from "lucide-react";
 
 /**
  * 对话模块的上下文面板：会话列表 + 新对话。
@@ -80,6 +80,25 @@ export const ChatListPanel: React.FC = () => {
       );
   };
 
+  // 导出整段对话为 Markdown（B5）。后端带 Content-Disposition 直接吐文件正文，
+  // 这里把 Blob 变成一次浏览器下载。JSON 导出端点也支持（format=json），列表这里
+  // 先只给最常用的 Markdown，不塞满悬浮操作行。
+  const handleExport = async (id: string) => {
+    try {
+      const blob = await apiClient.exportChat(id, "md");
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `chat-${id}.md`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      toast.error(toastMessageFrom(e, "导出失败"));
+    }
+  };
+
   const sorted = [...sessions].sort((a, b) => {
     if (a.pinned && !b.pinned) return -1;
     if (!a.pinned && b.pinned) return 1;
@@ -142,6 +161,17 @@ export const ChatListPanel: React.FC = () => {
 
               {editingId !== chat.id && (
                 <div className="hidden group-hover:flex items-center gap-0.5 shrink-0">
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleExport(chat.id);
+                    }}
+                    className="p-1 rounded hover:bg-[#dcd7cb] dark:hover:bg-[#33312d] text-[#6e6b63] dark:text-[#a19f96] hover:text-[#da7756] transition-colors"
+                    title="导出 Markdown"
+                    aria-label="导出对话"
+                  >
+                    <Download className="w-3 h-3" />
+                  </button>
                   <button
                     onClick={(e) => {
                       e.stopPropagation();

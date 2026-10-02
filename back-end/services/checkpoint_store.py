@@ -210,6 +210,32 @@ def mark_cancelled(run_id: str, db: Session | None = None) -> bool:
         return False
 
 
+def is_run_cancelled(db: Session, run_id: str) -> bool:
+    """这个 run 是否已被标成 ``cancelled``——跨 worker 取消的兜底判据。
+
+    ``cancellation.is_cancelled`` 只看进程内的 ``asyncio.Event``。取消请求打到**另一个**
+    worker 时，那边的 ``mark_cancelled`` 把 ``agent_runs.status`` 落成 ``cancelled``，
+    但本进程循环持有的那个 Event 永远不会被置位，于是循环察觉不到、一路跑到底
+    （正是 cancellation.py 顶部注释里记的那个待补缺口）。循环在轮首顺带查一次这里，
+    跨 worker 的停止才真的能收尾。
+
+    读失败按**未取消**处理：取消是尽力而为、不是正确性约束，查库抖一下不该让一次
+    正常回答崩在半路。关掉快照时没有 agent_runs 行，直接返回 False（也无多 worker）。
+    """
+    if not enabled():
+        return False
+    try:
+        row = (
+            db.query(AgentRun.status)
+            .filter(AgentRun.id == run_id)
+            .first()
+        )
+        return row is not None and row[0] == "cancelled"
+    except Exception:
+        logger.exception("failed to read cancel status for run %s", run_id)
+        return False
+
+
 def orphan_timeout_seconds() -> float:
     """``running`` 多久没动就算没人在驱动它。
 
@@ -493,6 +519,65 @@ def at_seq(db: Session, run_id: str, seq: int) -> TurnState | None:
     except Exception:
         logger.warning("checkpoint decode failed for %s@%s", run_id, seq, exc_info=True)
         return None
+
+
+# 只读回放视图的裁剪上限：messages 带整段对话正文，不能原样吐（隐私 + 体积）。
+_VIEW_MSG_MAX = 2000
+_VIEW_MSG_COUNT = 50
+_VIEW_ARG_MAX = 1000
+
+
+def _view_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        # 多模态内容块：只取 text 部分，丢掉 image_url 的 base64（否则一条消息几 MB）
+        return "".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return ""
+
+
+def state_view(db: Session, run_id: str, seq: int) -> dict[str, Any] | None:
+    """``at_seq`` 的只读净化视图：那一轮当时的状态，正文裁剪、不含 base64。
+
+    给回放 UI「看第 N 轮当时什么样」用（B4，**只读**——不重跑；重跑要 fork 新 run、
+    处理副作用工具的重放，是另一件事）。裁剪三条：每条消息截断、只留最近 N 条、工具
+    参数截断。回放要看的是"走到这里模型手上有什么、想调什么、预算还剩多少"，不是把
+    整段对话再吐一遍（那是 messages 表的事）。
+    """
+    state = at_seq(db, run_id, seq)
+    if state is None:
+        return None
+    messages = state.messages or []
+    pending = [
+        {
+            "name": call.get("name"),
+            "arguments": (call.get("arguments") or "")[:_VIEW_ARG_MAX],
+        }
+        for call in (state.pending_calls or [])
+    ]
+    return {
+        "seq": seq,
+        "round": state.round_index,
+        "phase": state.phase,
+        "status": state.status,
+        "messageCount": len(messages),
+        "messages": [
+            {"role": m.get("role"), "content": _view_text(m.get("content"))[:_VIEW_MSG_MAX]}
+            for m in messages[-_VIEW_MSG_COUNT:]
+        ],
+        "pendingCalls": pending,
+        "pendingIndex": state.pending_index,
+        "plan": state.plan,
+        "budgetRemaining": state.budget_remaining,
+        "repeatBlocked": state.repeat_blocked,
+        "breakerTripped": state.breaker_tripped,
+        "delegationsUsed": state.delegations_used,
+        "loadedSkills": state.loaded_skills,
+    }
 
 
 def history(db: Session, run_id: str) -> list[dict[str, Any]]:

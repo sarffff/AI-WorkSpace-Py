@@ -15,13 +15,13 @@ interface ProtectedRouteProps {
 export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children }) => {
   const { isAuthenticated, isLoading } = useSelector((state: RootState) => state.auth)
 
-  // 加载中显示loading
+  // 加载中显示 loading（跟随暖纸主题，避免启动瞬间闪一屏旧的靛蓝渐变）
   if (isLoading) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-slate-950 via-blue-950 to-slate-950 flex items-center justify-center">
-        <div className="text-center">
-          <div className="inline-block w-12 h-12 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin mb-4"></div>
-          <p className="text-slate-400">加载中...</p>
+      <div className="min-h-screen app-atmosphere flex items-center justify-center">
+        <div className="relative z-10 text-center">
+          <div className="inline-block w-10 h-10 border-[3px] border-[#da7756] border-t-transparent rounded-full animate-spin mb-4"></div>
+          <p className="text-sm text-[#6e6b63] dark:text-[#a19f96]">加载中...</p>
         </div>
       </div>
     )

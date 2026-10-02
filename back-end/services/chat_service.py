@@ -1734,7 +1734,14 @@ class ChatService:
             # 模型调用，也不再跑任何工具。终态是 ``cancelled``（不可接续），与断线的
             # ``interrupted`` 分开。成本不会丢：每一轮的 span 在发生时就已落库，
             # 取消只是不再产生新的花费。
-            if cancellation.is_cancelled(state.run_id):
+            #
+            # 两条取消来源都查：进程内 Event（同 worker 的快路径）+ 落库的
+            # ``agent_runs.status==cancelled``（取消请求打到别的 worker 时的兜底，
+            # 见 checkpoint_store.is_run_cancelled）。轮首本就在写 DB，顺带一次
+            # 索引点查可忽略，而最多 AGENT_MAX_TOOL_ROUNDS 轮、不会每工具都打库。
+            if cancellation.is_cancelled(state.run_id) or checkpoint_store.is_run_cancelled(
+                db, state.run_id
+            ):
                 self._finish_run(
                     db,
                     state,

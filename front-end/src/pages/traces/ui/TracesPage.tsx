@@ -16,6 +16,7 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { SpanWaterfall } from "../components/SpanWaterfall";
+import { RunReplay } from "@/widgets/run-replay/ui/RunReplay";
 
 export const TracesPage: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -32,6 +33,9 @@ export const TracesPage: React.FC = () => {
   const traceParam = searchParams.get("trace");
   const chatParam = searchParams.get("chat");
   const messageParam = searchParams.get("message");
+  // ?run=<id> 时整页切成只读回放（B4）：轨迹列表按 trace 走、回放按 run 走，
+  // 两条轴没有现成的 trace→run 链接，所以回放靠对话页/直达链接带 runId 进来。
+  const runParam = searchParams.get("run");
 
   const fetchTraces = useCallback(() => {
     setLoading(true);
@@ -95,29 +99,46 @@ export const TracesPage: React.FC = () => {
       <div className="relative z-10 space-y-5 h-full flex flex-col max-w-6xl">
         <PageHeader
           eyebrow="回放"
-          title="运行轨迹"
-          description="把一次回答拆成 span 瀑布。核对耗时、token、失败点——不是看热闹。"
+          title={runParam ? "回放执行" : "运行轨迹"}
+          description={
+            runParam
+              ? "只读看一次执行：每个检查点上，模型手上有什么、想调什么、预算还剩多少。不重跑。"
+              : "把一次回答拆成 span 瀑布。核对耗时、token、失败点——不是看热闹。"
+          }
           actions={
-            <div className="flex items-center gap-2">
+            runParam ? (
               <button
-                onClick={() => setFailuresOnly(!failuresOnly)}
-                className={`chip ${failuresOnly ? "chip-accent" : ""}`}
+                onClick={() => setSearchParams({}, { replace: true })}
+                className="chip"
               >
-                {failuresOnly ? "仅失败" : "全部"}
+                ← 返回运行轨迹
               </button>
-              <button
-                onClick={fetchTraces}
-                disabled={loading}
-                className="btn-accent px-3 py-1.5 rounded-lg text-[11px] flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
-              >
-                <RefreshCw
-                  className={`w-3.5 h-3.5 ${loadingMore ? "animate-spin" : ""}`}
-                />
-                刷新
-              </button>
-            </div>
+            ) : (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setFailuresOnly(!failuresOnly)}
+                  className={`chip ${failuresOnly ? "chip-accent" : ""}`}
+                >
+                  {failuresOnly ? "仅失败" : "全部"}
+                </button>
+                <button
+                  onClick={fetchTraces}
+                  disabled={loading}
+                  className="btn-accent px-3 py-1.5 rounded-lg text-[11px] flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  <RefreshCw
+                    className={`w-3.5 h-3.5 ${loadingMore ? "animate-spin" : ""}`}
+                  />
+                  刷新
+                </button>
+              </div>
+            )
           }
         />
+
+        {runParam && <RunReplay runId={runParam} />}
+        {!runParam && (
+          <>
 
         {error && (
           <div className="flex items-center gap-2 p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-600 dark:text-rose-400 text-xs">
@@ -231,6 +252,8 @@ export const TracesPage: React.FC = () => {
               )}
             </div>
           </div>
+        )}
+          </>
         )}
       </div>
     </div>

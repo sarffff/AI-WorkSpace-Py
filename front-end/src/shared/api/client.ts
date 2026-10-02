@@ -42,6 +42,10 @@ import type {
   PendingApproval,
   ResumableRun,
   AgentRunDetail,
+  CheckpointStateView,
+  AppNotification,
+  NotificationListResponse,
+  DocumentChunkView,
 } from "../types/api.types";
 
 /**
@@ -686,6 +690,47 @@ export class ApiClient {
   }
 
   /**
+   * 某次执行第 `seq` 个快照时的**只读**状态（回放用，B4）。
+   * GET /chats/runs/{runId}/checkpoints/{seq}
+   *
+   * `getAgentRun` 的 `checkpoints` 只给目录（seq/phase/round），这里才给那一格的
+   * 正文（已裁剪、不含 base64）。只读、不触发重跑。404 时抛错，调用方据此提示
+   * "该快照已被清理"（AGENT_CHECKPOINT_KEEP 只留最近若干份）。
+   */
+  async getRunCheckpoint(
+    runId: string,
+    seq: number,
+  ): Promise<CheckpointStateView> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/chats/runs/${runId}/checkpoints/${seq}`,
+      { method: "GET" },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch checkpoint: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 导出整段对话为可下载的 Markdown 或 JSON（B5）。
+   * GET /chats/{chatId}/export?format=md|json
+   *
+   * 返回 Blob 而不是解析后的对象：后端带 `Content-Disposition: attachment` 直接吐
+   * 文件正文，调用方据此触发浏览器下载。文件名由后端定（chat-{id}.{ext} 纯 ASCII，
+   * 中文标题在正文里——塞进 header 的 filename 会撞上 latin-1 限制）。
+   */
+  async exportChat(chatId: string, format: "md" | "json" = "md"): Promise<Blob> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/chats/${chatId}/export?format=${format}`,
+      { method: "GET" },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to export chat: ${response.statusText}`);
+    }
+    return response.blob();
+  }
+
+  /**
    * 重命名对话
    * PATCH /chats/{chat_id}
    */
@@ -997,6 +1042,33 @@ export class ApiClient {
       throw new Error(`Failed to query knowledge: ${response.statusText}`);
     }
 
+    return response.json();
+  }
+
+  /**
+   * 按 (文档, 分块号) 取原文及相邻分块——引用点击跳原文用（B5）。
+   * GET /knowledge/documents/{documentId}/chunks/{chunkIndex}?window=
+   *
+   * 按**当前用户的检索可见范围**收口（共享 + 自己的私有）：引用来自用户自己那次
+   * 回答的检索，这里让他回看命中块的上下文，但不能借它去读别人的私有文档——
+   * 不可见时后端返回 404（不泄露"存在但不是你的"）。window 后端夹在 0–5。
+   */
+  async getDocumentChunk(
+    documentId: string,
+    chunkIndex: number,
+    window = 1,
+  ): Promise<DocumentChunkView> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/knowledge/documents/${documentId}/chunks/${chunkIndex}?window=${window}`,
+      { method: "GET" },
+    );
+    if (!response.ok) {
+      const detail = await response
+        .json()
+        .then((body) => body?.detail)
+        .catch(() => null);
+      throw new Error(detail || `Failed to fetch chunk: ${response.statusText}`);
+    }
     return response.json();
   }
 
@@ -1581,6 +1653,86 @@ export class ApiClient {
       throw new Error(detail || `处置失败：${response.statusText}`);
     }
     return response.json();
+  }
+
+  // ========== 通知收件箱 API ==========
+
+  /**
+   * 当前用户的通知，按时间倒序。自作用域。
+   * GET /notifications
+   */
+  async getNotifications(
+    unreadOnly = false,
+    limit = 50,
+    offset = 0,
+  ): Promise<NotificationListResponse> {
+    const params = new URLSearchParams({
+      limit: String(limit),
+      offset: String(offset),
+    });
+    if (unreadOnly) params.set("unread_only", "true");
+    const response = await this.authedFetch(
+      `${this.baseUrl}/notifications?${params.toString()}`,
+      { method: "GET" },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch notifications: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * 未读数——给顶栏铃铛的红点徽标用。
+   * GET /notifications/unread_count
+   *
+   * 这个端点在后端顺带当线上健康监控的**心跳**（evaluate_and_alert 自带节流/非阻塞
+   * 兜底，关着时直接空转）：前端定时轮询红点，于是不必引调度器就能让告警"主动"起来。
+   * 所以铃铛的轮询不只是刷新红点，也是在替整个部署驱动健康评估。
+   */
+  async getUnreadCount(): Promise<number> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/notifications/unread_count`,
+      { method: "GET" },
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to fetch unread count: ${response.statusText}`);
+    }
+    const body = (await response.json()) as { count?: number };
+    return body.count ?? 0;
+  }
+
+  /**
+   * 标记一条通知已读。按 user 自作用域——改不动别人的。
+   * POST /notifications/{id}/read
+   */
+  async markNotificationRead(notificationId: string): Promise<void> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/notifications/${notificationId}/read`,
+      { method: "POST" },
+    );
+    if (!response.ok) {
+      throw new Error(
+        `Failed to mark notification read: ${response.statusText}`,
+      );
+    }
+  }
+
+  /**
+   * 全部标记已读，返回标记了几条。
+   * POST /notifications/read_all
+   */
+  async markAllNotificationsRead(): Promise<number> {
+    const response = await this.authedFetch(
+      `${this.baseUrl}/notifications/read_all`,
+      { method: "POST" },
+    );
+    if (!response.ok) {
+      throw new Error(
+        `Failed to mark all notifications read: ${response.statusText}`,
+      );
+    }
+    const body = (await response.json()) as { marked?: number };
+    return body.marked ?? 0;
   }
 }
 

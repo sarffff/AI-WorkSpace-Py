@@ -829,3 +829,49 @@ class Notification(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime)
     # NULL = 未读
     read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class DocumentJob(Base):
+    """一篇文档的持久化索引任务。
+
+    改动前入库索引走 FastAPI ``BackgroundTasks``：进程内、不落盘、无重试、无并发上限，
+    进程在索引中途重启那篇就永远卡在 ``processing``。这张表把"要索引谁"落成持久状态，
+    配合 ``services/document_queue.py`` 的认领/租约/重试，形态与 ``agent_runs`` 的
+    lease/reaper 完全一致（都挂在读路径上惰性清理，项目里没有调度器）。
+
+    不设外键到 documents：删文档时孤儿任务无害——``index_document`` 对"文档已消失"
+    本就优雅返回（见其首行判断），下一次认领时自然 complete 掉。与 ``agent_runs`` /
+    ``trace_spans`` 同一套"side-table 不设 FK、删除顺序由代码控制"的取舍。
+
+    ``available_at`` 是退避的载体：重试时把它推到未来，``claim_next`` 只认领
+    ``available_at <= now`` 的任务。``attempts`` 在**认领时**自增（而非失败时），
+    这样租约过期被回收的任务也会消耗一次尝试，不会无限重试一个每次都把进程拖垮的任务。
+    """
+
+    __tablename__ = "document_jobs"
+    __table_args__ = (
+        # 认领扫描：按 (status, available_at) 取最老的可认领任务
+        Index("ix_document_jobs_status_available", "status", "available_at"),
+        # 入队去重 / 按文档查任务
+        Index("ix_document_jobs_document", "document_id"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    document_id: Mapped[str] = mapped_column(String(36), index=True)
+    # queued / running / succeeded / failed
+    status: Mapped[str] = mapped_column(String(16), default="queued")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    # 0-100 的粗粒度进度（queued=0 / running=10 / done=100）。细粒度要在
+    # index_document 里埋钩子，不值当——入库对用户是"传完等一会儿"，粗粒度够用。
+    progress: Mapped[int] = mapped_column(Integer, default=0)
+    # 认领者标识与租约到期时刻。NULL = 当前没有进程持有它。
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 最早可认领时刻（退避把它推向未来）
+    available_at: Mapped[datetime] = mapped_column(DateTime)
+    error: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+    updated_at: Mapped[datetime] = mapped_column(DateTime)

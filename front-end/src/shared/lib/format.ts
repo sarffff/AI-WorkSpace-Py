@@ -73,3 +73,25 @@ export const TOOL_LABELS: Record<string, string> = {
 
 export const toolLabel = (tool?: string) =>
   (TOOL_LABELS[tool ?? ""] ?? tool) || "工具";
+
+/**
+ * 相对时间（“刚刚 / N 分钟前 / N 小时前 / N 天前”），约一周以上回落到日期。
+ *
+ * 直接 `new Date(iso)` 解析——业务时间戳是 naive 本地墙上时间（见后端 clock.py），
+ * 与浏览器本地时区对齐时准确；这与 app 其余地方（会话列表 / 轨迹页）处理时间的方式
+ * 一致。空值 / 不可解析返回空串；细小的时钟差导致的"未来"一律按"刚刚"处理。
+ */
+export const fmtRelativeTime = (iso: string | null | undefined): string => {
+  if (!iso) return "";
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "";
+  const sec = Math.max(0, Math.floor((Date.now() - then) / 1000));
+  if (sec < 60) return "刚刚";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min} 分钟前`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr} 小时前`;
+  const day = Math.floor(hr / 24);
+  if (day < 7) return `${day} 天前`;
+  return new Date(iso).toLocaleDateString();
+};

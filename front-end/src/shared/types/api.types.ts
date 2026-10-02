@@ -790,6 +790,86 @@ export interface AgentCheckpointInfo {
   createdAt?: string | null;
 }
 
+/**
+ * 一个快照的**只读**回放视图（GET /chats/runs/{runId}/checkpoints/{seq}）。
+ *
+ * 对齐后端 `checkpoint_store.state_view`：看的是"执行走到这一步时，模型手上有什么、
+ * 想调哪些工具、预算还剩多少、哪些工具被熔断了"。正文已裁剪——每条消息截断、只留
+ * 最近 N 条、工具参数截断、不含图片 base64。
+ *
+ * **只读**：回放不重跑（从第 N 轮真的重跑要 fork 新 run 并处理副作用工具的重放，
+ * 是另一件事）。`AgentCheckpointInfo` 给目录，这个给某一格的正文。
+ */
+export interface CheckpointStateView {
+  seq: number;
+  round: number;
+  phase: string;
+  status: string;
+  /** 裁剪前的消息总数；`messages` 可能只含最近若干条 */
+  messageCount: number;
+  messages: { role: string; content: string }[];
+  /** 这一步模型想调、但还没执行的工具 */
+  pendingCalls: { name: string | null; arguments: string }[];
+  pendingIndex: number;
+  /** 事前规划（AGENT_PLAN_MODE=plan_execute 时非空） */
+  plan: PlanStep[];
+  budgetRemaining: number;
+  /** 被重复调用检测拦下的次数 */
+  repeatBlocked: number;
+  /** 已熔断（本回合移出工具面）的工具名 */
+  breakerTripped: string[];
+  delegationsUsed: number;
+  loadedSkills: string[];
+}
+
+// ========== 通知收件箱 ==========
+
+/**
+ * 通知类别。决定图标与点击去向：
+ * - `approval_required` / `input_required` → 跳对话去裁决 / 回答（带 chatId）
+ * - `run_abandoned` → 超时废弃，只作记录
+ * - `health_alert` → 线上健康告警（发给管理员），跳设置
+ *
+ * 用宽松联合 + string 兜底：后端可能加新类别，前端不认时按默认图标渲染而不是崩。
+ */
+export type NotificationKind =
+  | "approval_required"
+  | "input_required"
+  | "run_abandoned"
+  | "health_alert"
+  | (string & {});
+
+/**
+ * 一条应用内通知（对齐后端 notification_service._to_dict）。
+ *
+ * 命名 `AppNotification` 而不是 `Notification`：后者是浏览器全局类型，撞名会让
+ * 到处 import 的 DOM 类型被悄悄遮盖。
+ */
+export interface AppNotification {
+  id: string;
+  kind: NotificationKind;
+  title: string;
+  body: string | null;
+  runId: string | null;
+  chatId: string | null;
+  createdAt: string | null;
+  readAt: string | null;
+  read: boolean;
+}
+
+/** GET /notifications 的返回：当前页 + 总未读数（红点用总数，不是本页数） */
+export interface NotificationListResponse {
+  notifications: AppNotification[];
+  unreadCount: number;
+}
+
+/** 引用点击跳原文：命中块 + 邻域（GET /knowledge/documents/{id}/chunks/{idx}） */
+export interface DocumentChunkView {
+  documentId: string;
+  documentName: string;
+  chunks: { chunkIndex: number; content: string }[];
+}
+
 // ========== 消息反馈 ==========
 
 /** 差评原因标签，与后端 services/feedback_service.py 的 REASONS 对齐 */

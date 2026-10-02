@@ -224,6 +224,54 @@ async def get_chat_tool_steps(
     return {"steps": await chat_service.get_chat_tool_steps(db, chat_id)}
 
 
+@router.get("/{chat_id}/export")
+async def export_chat(
+    chat_id: str,
+    format: str = "md",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """导出整段对话为可下载的 Markdown 或 JSON（B5）。自作用域。
+
+    文件名用 ``chat-{id}.{ext}`` 这个纯 ASCII 名，标题放进正文——对话标题常是中文，
+    直接塞进 Content-Disposition 的 filename 会撞上 header 的 latin-1 编码限制。
+    """
+    from fastapi.responses import Response
+
+    if format not in ("md", "json"):
+        raise HTTPException(status_code=400, detail="format 只支持 md 或 json")
+    chat = await chat_service.get_chat_by_id(db, chat_id)
+    if not chat or chat.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="对话不存在")
+
+    messages = await chat_service.get_chat_messages(db, chat_id)
+    title = chat.title or "对话"
+    if format == "json":
+        payload = json.dumps(
+            {"chatId": chat_id, "title": title, "messages": messages},
+            ensure_ascii=False,
+            indent=2,
+        )
+        media_type = "application/json"
+    else:
+        _label = {"user": "用户", "assistant": "助手", "system": "系统"}
+        lines = [f"# {title}", ""]
+        for msg in messages:
+            lines.append(f"### {_label.get(msg['role'], msg['role'])}")
+            lines.append(msg.get("content") or "")
+            lines.append("")
+        payload = "\n".join(lines)
+        media_type = "text/markdown; charset=utf-8"
+
+    return Response(
+        content=payload,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="chat-{chat_id}.{format}"'
+        },
+    )
+
+
 @router.post("")
 async def create_chat(
     request: CreateChatRequest,
@@ -1032,3 +1080,28 @@ async def get_run(
         # 常见的失效方式恰恰是这个,而它在测试里完全看不出来。
         "approvals": approval_audit.history(db, run_id),
     }
+
+
+@router.get("/runs/{run_id}/checkpoints/{seq}")
+async def get_run_checkpoint(
+    run_id: str,
+    seq: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """某次执行第 ``seq`` 个快照时的**只读**状态（回放用，B4）。
+
+    展示那一轮当时的 messages / 想调的工具 / 计划 / 预算余额——``get_run`` 的
+    ``checkpoints`` 目录只给元信息（seq/phase/round），这里才给正文（已裁剪，
+    不吐整段原文、不含图片 base64）。按 user 自作用域（同 get_run）。
+
+    **只读、不触发重跑**：从第 N 轮真的重跑要 fork 一个新 run、还要处理副作用工具
+    被重放的风险，是另一件事（本轮只做看）。
+    """
+    run = checkpoint_store.get_run(db, run_id)
+    if run is None or run.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+    view = checkpoint_store.state_view(db, run_id, seq)
+    if view is None:
+        raise HTTPException(status_code=404, detail="该快照不存在或已被清理")
+    return view

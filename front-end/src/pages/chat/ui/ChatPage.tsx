@@ -45,6 +45,7 @@ import {
   ChatInsightPanel,
   type InsightEvent,
 } from "@/widgets/chat-insight/ui/ChatInsightPanel";
+import { CitationSourceViewer } from "@/widgets/citation-source/ui/CitationSourceViewer";
 import { useNavigate } from "react-router-dom";
 import { BrandMark } from "@/shared/ui/BrandMark";
 import { CapabilityStrip } from "@/shared/ui/CapabilityStrip";
@@ -71,6 +72,8 @@ import {
   Wrench,
   Shield,
   Zap,
+  History,
+  ChevronRight,
 } from "lucide-react";
 
 const FLUSH_INTERVAL = 60;
@@ -199,6 +202,8 @@ export const ChatPage: React.FC = () => {
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState("");
+  // 点开的引用来源：非空时弹出来源查看器，看命中分块 + 邻域原文（B5）
+  const [sourceCitation, setSourceCitation] = useState<Citation | null>(null);
   // 已有的赞踩状态，切换会话后要把按钮点亮回去
   const [feedbackByMessage, setFeedbackByMessage] = useState<
     Record<string, MessageFeedback>
@@ -2176,30 +2181,34 @@ export const ChatPage: React.FC = () => {
                       </div>
                       <ul className="space-y-1">
                         {msg.citations.map((citation, index) => (
-                          <li
-                            key={`${citation.document_id}-${index}`}
-                            title={citation.content?.slice(0, 400)}
-                            className="flex items-center gap-2 text-[11px] text-[#6e6b63] dark:text-[#a19f96]"
-                          >
-                            <span className="shrink-0 w-4 h-4 rounded bg-[#e3dfd5] dark:bg-[#2e2d2a] text-[10px] flex items-center justify-center">
-                              {index + 1}
-                            </span>
-                            <span className="truncate text-[#1f1e1d] dark:text-[#edece8]">
-                              {citation.document_name}
-                            </span>
-                            <span className="shrink-0">
-                              {citationSpan(citation)}
-                            </span>
-                            {typeof citation.score === "number" && (
-                              <span className="shrink-0 opacity-70">
-                                {citation.score.toFixed(2)}
+                          <li key={`${citation.document_id}-${index}`}>
+                            <button
+                              type="button"
+                              onClick={() => setSourceCitation(citation)}
+                              title={citation.content?.slice(0, 400)}
+                              className="group/cite w-full flex items-center gap-2 text-[11px] text-[#6e6b63] dark:text-[#a19f96] rounded-md px-1 py-0.5 -mx-1 text-left hover:bg-[#f3f0e6] dark:hover:bg-[#232220] transition-colors"
+                            >
+                              <span className="shrink-0 w-4 h-4 rounded bg-[#e3dfd5] dark:bg-[#2e2d2a] text-[10px] flex items-center justify-center">
+                                {index + 1}
                               </span>
-                            )}
-                            {!!citation.channels?.length && (
-                              <span className="shrink-0 opacity-70">
-                                {citation.channels.join("+")}
+                              <span className="truncate text-[#1f1e1d] dark:text-[#edece8] group-hover/cite:text-[#da7756]">
+                                {citation.document_name}
                               </span>
-                            )}
+                              <span className="shrink-0">
+                                {citationSpan(citation)}
+                              </span>
+                              {typeof citation.score === "number" && (
+                                <span className="shrink-0 opacity-70">
+                                  {citation.score.toFixed(2)}
+                                </span>
+                              )}
+                              {!!citation.channels?.length && (
+                                <span className="shrink-0 opacity-70">
+                                  {citation.channels.join("+")}
+                                </span>
+                              )}
+                              <ChevronRight className="w-3 h-3 ml-auto shrink-0 opacity-0 group-hover/cite:opacity-100 text-[#da7756] transition-opacity" />
+                            </button>
                           </li>
                         ))}
                       </ul>
@@ -2256,6 +2265,27 @@ export const ChatPage: React.FC = () => {
                           <RouteIcon className="w-3.5 h-3.5" />
                         </button>
                       )}
+                      {msg.role === "assistant" &&
+                        (() => {
+                          // 回放入口：从这条回答的工具轨迹里取 runId（落库的步骤都带）。
+                          // 两条轴（trace / run）没有现成互链，所以回放靠这里把 runId
+                          // 带进 /traces?run=。没有工具轨迹的纯回答就没有可回放的执行。
+                          const replayRunId = traceByAssistant[msg.id]?.find(
+                            (s) => s.runId,
+                          )?.runId;
+                          return replayRunId ? (
+                            <button
+                              onClick={() =>
+                                navigate(`/traces?run=${replayRunId}`)
+                              }
+                              title="回放执行（只读看每一轮的状态）"
+                              aria-label="回放执行"
+                              className="p-1 rounded hover:bg-[#f3f0e6] dark:hover:bg-[#262522] hover:text-[#1f1e1d] dark:hover:text-[#edece8]"
+                            >
+                              <History className="w-3.5 h-3.5" />
+                            </button>
+                          ) : null;
+                        })()}
                       {msg.role === "assistant" && (
                         <FeedbackButtons
                           messageId={msg.messageId ?? msg.id}
@@ -2557,6 +2587,12 @@ export const ChatPage: React.FC = () => {
             <path d="M15 18l-6-6 6-6" />
           </svg>
         </button>
+      )}
+      {sourceCitation && (
+        <CitationSourceViewer
+          citation={sourceCitation}
+          onClose={() => setSourceCitation(null)}
+        />
       )}
     </div>
   );
