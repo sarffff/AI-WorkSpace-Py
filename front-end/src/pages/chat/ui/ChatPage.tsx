@@ -31,6 +31,7 @@ import type {
   GuardrailNotice,
   MessageFeedback,
   PlanStep,
+  ResumableRun,
   ServerCapabilities,
   ToolStep,
 } from "@/shared/types/api.types";
@@ -38,6 +39,7 @@ import { MessageContent } from "./MessageContent";
 import { FeedbackButtons } from "@/features/message-feedback/ui/FeedbackButtons";
 import { ToolTrace } from "@/widgets/tool-trace/ui/ToolTrace";
 import { ToolApprovalCard } from "@/widgets/tool-approval";
+import { ResumableStrip } from "@/widgets/resumable-runs";
 import { ClarificationCard } from "@/widgets/clarification";
 import { PlanCard } from "@/widgets/plan";
 import { FileTree } from "@/widgets/file-tree";
@@ -284,6 +286,15 @@ export const ChatPage: React.FC = () => {
     resumable: boolean;
     attempts: number;
   } | null>(null);
+  /**
+   * 这个会话里断线没跑完的执行（GET /chats/runs/resumable）。
+   *
+   * 与 pendingApproval 分开：那个在等人做决定，这个没有人做错什么，只是连接断了。
+   * 后端接口和 client 方法早就写好了，但**没有任何调用方**——刷新之后
+   * `interrupted` 的那一轮在界面上等于不存在，只能重问一遍，而重问会把前面几轮
+   * 检索到的东西全部丢掉。接上它就是补那半边。
+   */
+  const [resumableRuns, setResumableRuns] = useState<ResumableRun[]>([]);
   // 当前回合的 runId 与它写在哪条气泡上。"再试一次"要用它接续。
   //
   // 用 ref 而不是 state：它在 SSE 循环里被写、被读，走 state 会因为闭包
@@ -651,6 +662,33 @@ export const ChatPage: React.FC = () => {
   }, [currentChatId]);
 
   /**
+   * 拉这个会话里"断线没跑完"的执行。
+   *
+   * 只在挂载和切会话时取一次，不轮询：这个列表不会因为别人操作而变——新增一条
+   * 的唯一来源是本回合断线，而那种情形已经由 reconnectFailed 那条提示接管了。
+   */
+  useEffect(() => {
+    if (!currentChatId) {
+      setResumableRuns([]);
+      return;
+    }
+    let cancelled = false;
+    apiClient
+      .getResumableRuns()
+      .then((items) => {
+        if (!cancelled) {
+          setResumableRuns(items.filter((r) => r.chatId === currentChatId));
+        }
+      })
+      .catch(() => {
+        // 检查点没开、或这个会话确实没有可接续的执行，都不该影响读对话
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentChatId]);
+
+  /**
    * 轨迹按用户消息归属，但要显示在回答下面，所以这里做一次映射。
    *
    * 按消息顺序把"最近一条用户消息"的东西挂到紧随其后的那条回答上，而不是去前端
@@ -720,21 +758,14 @@ export const ChatPage: React.FC = () => {
     }
   }, []);
 
-  const handleStop = useCallback(() => {
-    // 先告诉服务端"别跑了"，再 abort 掉本地的流。
-    //
-    // 顺序重要：cancel 走的是独立的 fetch，必须在 abort 关掉 SSE 之前发出去，
-    // 服务端才能把它作为一次显式停止落成 cancelled（终态）。只 abort 的话，
-    // 服务端看到的是"连接断了"，会标成 interrupted、归入可接续——用户明明点了
-    // 停止，却会在"接着跑吗"里看到它。fire-and-forget：不 await，不给停止按钮加延迟，
-    // 失败也不影响本地收尾（abort 本身已经能停下当前这一步）。
-    const activeRunId = activeRunRef.current?.runId;
-    if (activeRunId) {
-      apiClient.cancelRun(activeRunId).catch(() => {
-        // 取消请求失败不阻碍本地停止：abort 仍会关掉流。服务端那边即使没收到，
-        // 断线也会把它收成 interrupted（可接续），不会永远卡在 running。
-      });
-    }
+  /**
+   * 把本地这条流拆掉：保留已生成的部分、停定时器、abort、复位"生成中"。
+   *
+   * 不发给服务端任何取消请求——那是调用方的决定（按钮要取消，卸载只要别再往
+   * 气泡上长字）。抽出来是因为这两处原先各写一份，而漏写的那一份正是 bug：
+   * 卸载路径当初什么都没做。
+   */
+  const stopLocalStream = useCallback(() => {
     activeRunRef.current = null;
     abortRef.current?.abort();
     abortRef.current = null;
@@ -767,6 +798,48 @@ export const ChatPage: React.FC = () => {
     setReplyStarted(false);
     dispatch(setIsGenerating(false));
   }, [dispatch, stopFlushTimer]);
+
+  // 启动后端服务
+  const handleStop = useCallback(() => {
+    // 先告诉服务端"别跑了"，再 abort 掉本地的流。
+    //
+    // 顺序重要：cancel 走的是独立的 fetch，必须在 abort 关掉 SSE 之前发出去，
+    // 服务端才能把它作为一次显式停止落成 cancelled（终态）。只 abort 的话，
+    // 服务端看到的是"连接断了"，会标成 interrupted、归入可接续——用户明明点了
+    // 停止，却会在"接着跑吗"里看到它。fire-and-forget：不 await，不给停止按钮加延迟，
+    // 失败也不影响本地收尾（abort 本身已经能停下当前这一步）。
+    const activeRunId = activeRunRef.current?.runId;
+    if (activeRunId) {
+      apiClient.cancelRun(activeRunId).catch(() => {
+        // 取消请求失败不阻碍本地停止：abort 仍会关掉流。服务端那边即使没收到，
+        // 断线也会把它收成 interrupted（可接续），不会永远卡在 running。
+      });
+    }
+    stopLocalStream();
+  }, [stopLocalStream]);
+
+  /**
+   * 离开对话页时把本地这条流拆掉。
+   *
+   * 原先只有"停止生成"按钮会 abort，卸载什么都不做。后果不是难看，是**失控**：
+   * 生成中切去轨迹页再切回来，新实例的 ``abortRef`` / ``activeRunRef`` 都是 null，
+   * 停止按钮只能把全局 ``isGenerating`` 置 false——服务端那一跑继续烧 token，
+   * 旧的那个生成器还在往这个会话的气泡上长字，而再也没有入口能停它。
+   *
+   * 这里**只拆本地流、不 cancelRun**，两种终态是有意的区别：``cancelRun`` 落
+   * ``cancelled``（用户明确说了别跑），而断线由服务端的 ``finally`` 标成
+   * ``interrupted``——那是"没人做错什么、可以接着跑"，正好由上面的可接续列表接
+   * 回去。把离开页面当成取消，等于每次切页都丢掉一次可恢复的执行。
+   */
+  // 卸载时拆流。用 latest-ref 而不是把 stopLocalStream 放进依赖数组：那个 callback
+  // 今天的依赖恰好是稳定的（dispatch / stopFlushTimer），将来谁给它加一个依赖，
+  // 依赖变化就会在**流跑着的时候**触发一次 abort——症状是"回答时不时自己断了"，
+  // 而这正是本条 effect 要修的那类 bug。卸载才是要拆流的唯一时机。
+  const stopLocalStreamRef = useRef(stopLocalStream);
+  useEffect(() => {
+    stopLocalStreamRef.current = stopLocalStream;
+  });
+  useEffect(() => () => stopLocalStreamRef.current(), []);
 
   const isNearBottom = useCallback(() => {
     const el = messagesContainerRef.current;
@@ -1605,7 +1678,11 @@ export const ChatPage: React.FC = () => {
   );
 
   /**
-   * "再试一次"：手动接续一次断掉的回合。
+   * 接续一次断掉的回合。runId / 会话 / 气泡都由调用方给。
+   *
+   * 刷新过页面之后本地没有那条气泡，``assistantId`` 传 null，结尾改为拉后端
+   * 拼好的完整回答——这正是"可接续列表"那条路唯一可能的形状：人在页面外，
+   * 内存里什么都没有。
    *
    * 不套 `streamWithReconnect`：这一下是用户明确点的，再失败就该让他看到，
    * 而不是又悄悄重试一轮。静默那几次已经用掉了。
@@ -1614,6 +1691,86 @@ export const ChatPage: React.FC = () => {
    * 这两个字段没有意义，硬塞进去会让"审批恢复"和"断线接续"在同一个参数里
    * 表达两件不同的事。
    */
+  const continueRunById = useCallback(
+    async (target: {
+      runId: string;
+      sessionId: string;
+      assistantId: string | null;
+      /**
+       * 从哪条路来的。``retry`` 是"这一回合刚刚断了线"，接不回去要在页面上立一块
+       * 牌子告诉人；``list`` 是"从可接续列表里挑了一条"，那条 run 多半是别人
+       * （别的标签页、回收任务）先动过手，这时弹一块写着"连接中断"的牌子既是
+       * 谎话也挡住了用户正在看的其它内容——一句 toast 就够。
+       */
+      source: "retry" | "list";
+    }) => {
+      dispatch(setIsGenerating(true));
+      const controller = new AbortController();
+      abortRef.current = controller;
+      try {
+        for await (const chunk of apiClient.continueRun(
+          target.runId,
+          controller.signal,
+        )) {
+          if (chunk.type === "message_delta" && chunk.content) {
+            // 接着同一条气泡往后写。没有气泡（刷新过页面）时下面兜底重拉。
+            if (target.assistantId) {
+              dispatch(
+                appendToMessage({
+                  sessionId: target.sessionId,
+                  id: target.assistantId,
+                  content: chunk.content,
+                }),
+              );
+            }
+          }
+          if (chunk.type === "error" && chunk.error) {
+            toast.error(chunk.error);
+            break;
+          }
+          if (chunk.done) break;
+        }
+        if (!target.assistantId) {
+          // 本地没有那条气泡，拿后端拼好的完整回答。
+          const msgs = await apiClient.getMessages(target.sessionId);
+          dispatch(
+            setMessages({
+              sessionId: target.sessionId,
+              messages: msgs.map((m) => ({
+                id: m.id,
+                sessionId: m.chatId,
+                role: m.role,
+                content: m.content,
+                timestamp: new Date(m.createdAt).toLocaleTimeString([], {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                }),
+                model: m.model,
+              })),
+            }),
+          );
+        }
+      } catch (err) {
+        if ((err as Error)?.message === "NOT_RESUMABLE") {
+          if (target.source === "retry") {
+            setReconnectFailed({ resumable: false, attempts: 0 });
+          } else {
+            toast.error("这次执行已经不在可接续状态了，请重新提问。");
+          }
+        } else if ((err as Error)?.name !== "AbortError") {
+          toast.error(toastMessageFrom(err, "接续失败"));
+        }
+      } finally {
+        dispatch(setIsGenerating(false));
+        activeRunRef.current = null;
+      }
+    },
+    [dispatch, toast],
+  );
+
+  /**
+   * "再试一次"：手动接续**当前这一回合**断掉的连接。
+   */
   const handleRetryReconnect = useCallback(async () => {
     const active = activeRunRef.current;
     if (!active) {
@@ -1621,63 +1778,29 @@ export const ChatPage: React.FC = () => {
       return;
     }
     setReconnectFailed(null);
-    dispatch(setIsGenerating(true));
-    const controller = new AbortController();
-    abortRef.current = controller;
-    try {
-      for await (const chunk of apiClient.continueRun(
-        active.runId,
-        controller.signal,
-      )) {
-        if (chunk.type === "message_delta" && chunk.content) {
-          // 接着同一条气泡往后写。没有气泡（刷新过页面）时下面兜底重拉。
-          if (active.assistantId) {
-            dispatch(
-              appendToMessage({
-                sessionId: active.sessionId,
-                id: active.assistantId,
-                content: chunk.content,
-              }),
-            );
-          }
-        }
-        if (chunk.type === "error" && chunk.error) {
-          toast.error(chunk.error);
-          break;
-        }
-        if (chunk.done) break;
-      }
-      if (!active.assistantId) {
-        // 本地没有那条气泡，拿后端拼好的完整回答。
-        const msgs = await apiClient.getMessages(active.sessionId);
-        dispatch(
-          setMessages({
-            sessionId: active.sessionId,
-            messages: msgs.map((m) => ({
-              id: m.id,
-              sessionId: m.chatId,
-              role: m.role,
-              content: m.content,
-              timestamp: new Date(m.createdAt).toLocaleTimeString([], {
-                hour: "2-digit",
-                minute: "2-digit",
-              }),
-              model: m.model,
-            })),
-          }),
-        );
-      }
-    } catch (err) {
-      if ((err as Error)?.message === "NOT_RESUMABLE") {
-        setReconnectFailed({ resumable: false, attempts: 0 });
-      } else if ((err as Error)?.name !== "AbortError") {
-        toast.error(toastMessageFrom(err, "接续失败"));
-      }
-    } finally {
-      dispatch(setIsGenerating(false));
-      activeRunRef.current = null;
-    }
-  }, [dispatch, toast]);
+    await continueRunById({ ...active, source: "retry" });
+  }, [continueRunById]);
+
+  /**
+   * 从"可接续"列表里接回一次断掉的回合。
+   *
+   * 先把这一条从列表里摘掉再跑：接续本身要花几十秒，留着它会让用户在跑着的时候
+   * 再点一次，而第二次 continueRun 撞上已经在跑的 run 只会拿到一句"当前状态是
+   * running"。摘掉等于把按钮变成不可用，比让用户点了没反应诚实。
+   */
+  const handleContinueResumable = useCallback(
+    async (run: ResumableRun) => {
+      if (!currentChatId) return;
+      setResumableRuns((prev) => prev.filter((r) => r.runId !== run.runId));
+      await continueRunById({
+        runId: run.runId,
+        sessionId: currentChatId,
+        assistantId: null,
+        source: "list",
+      });
+    },
+    [currentChatId, continueRunById],
+  );
 
   /**
    * 把澄清的答案送回去，接着原来那一轮跑完。
@@ -2356,6 +2479,10 @@ export const ChatPage: React.FC = () => {
               </div>
             </div>
           )}
+          <ResumableStrip
+            runs={resumableRuns}
+            onContinue={handleContinueResumable}
+          />
           {reconnectFailed && (
             <div className="flex items-start gap-4 max-w-3xl">
               <div className="w-8 h-8 rounded-xl bg-[#282724] dark:bg-[#2e2d2a] flex items-center justify-center text-amber-500 shadow-sm">

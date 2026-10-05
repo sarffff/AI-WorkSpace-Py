@@ -895,45 +895,5 @@ def test_invalidating_by_viewer_reaches_buckets_in_any_workspace():
         _indexes.pop(key, None)
 
 
-def test_semantic_cache_invalidation_by_viewer_spans_workspaces():
-    from services.semantic_cache import CacheEntry, _Store
-
-    store = _Store()
-    entry = CacheEntry(
-        question="q", answer="a", model="m", use_rag=True,
-        prompt_ref="v1", embedding=[1.0], created_at=1.0,
-    )
-    store.add("wsA|alice", entry, max_entries=10)
-    store.add("wsB|alice", entry, max_entries=10)
-    store.add("wsB|bob", entry, max_entries=10)
-
-    # alice 在两个空间各有一条,都要清掉
-    assert store.drop_by_viewer("alice") == 2
-    assert store.bucket("wsA|alice") == []
-    assert store.bucket("wsB|alice") == []
-    # bob 的那条必须还在——反向断言，否则一个"清空所有桶"的实现也能通过
-    assert len(store.bucket("wsB|bob")) == 1
 
 
-def test_semantic_cache_buckets_do_not_leak_across_users():
-    """开 RAG 时缓存必须带 viewer,否则 A 的答案会命中给 B。
-
-    ``semantic_cache`` 自己的文档第一条就写着"跨用户命中就是数据泄露,不是优化";
-    工作区分桶是共享知识库那一轮加的,私有文档让它的前提不再成立。
-    """
-    from services.semantic_cache import CacheEntry, _Store
-
-    store = _Store()
-    entry = CacheEntry(
-        question="报销上限", answer="500", model="m", use_rag=True,
-        prompt_ref="v1", embedding=[1.0], created_at=1.0,
-    )
-    store.add("ws|alice", entry, max_entries=10)
-
-    assert store.bucket("ws|bob") == []
-    assert len(store.bucket("ws|alice")) == 1
-
-    # 知识库变化要清掉该工作区**所有**桶,含按用户细分的
-    removed = store.drop("ws")
-    assert removed == 1
-    assert store.bucket("ws|alice") == []

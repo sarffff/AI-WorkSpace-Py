@@ -30,7 +30,7 @@ def _by_name(trace, name: str):
 
 def test_nested_spans_build_a_tree(tracer):
     async def scenario():
-        async with tracer.trace(user_id="u1", chat_id="c1") as trace:
+        async with tracer.trace(user_id="u1", ticket_id="t1") as trace:
             async with tracer.span("chat.turn", SpanKind.AGENT):
                 async with tracer.span("llm.chat", SpanKind.LLM, model="m1"):
                     pass

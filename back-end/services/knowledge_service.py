@@ -19,7 +19,6 @@ from services import file_types
 from services import workspace_service
 from services.workspace_service import VISIBILITY_WORKSPACE
 from services import ingest_clean
-from services import ocr
 from services import chunking
 from services import vector_store
 from services.chunking import Chunk, split_document
@@ -28,7 +27,6 @@ from services.retrieval_index import (
     invalidate_scope_indexes,
     invalidate_viewer_indexes,
 )
-from services.semantic_cache import semantic_cache
 from services.retriever import HybridRetriever, RetrievedChunk, format_context
 from services.token_budget import get_token_counter
 
@@ -151,30 +149,6 @@ def _file_extension(filename: str) -> str:
     return base_name.rsplit(".", 1)[-1].lower() if "." in base_name else ""
 
 
-def _merge_ocr(parsed: ParsedDocument, recovered: "ocr.OcrResult") -> ParsedDocument:
-    """把 OCR 结果并回解析结果。
-
-    抽到字:用 OCR 正文,并摘掉 no_text_layer / no_extractable_text(它们已经不成立了),
-    换成 ocr_recovered:N 这条可溯源的告警。``backend`` 带上 ``+ocr`` 后缀,排查时
-    一眼能看出这篇正文不是解析出来的、是转写出来的。
-    没抽到字:正文和原 backend 都不动,只追加 OCR 自己的 warning——让 index_document
-    的 no_chunks 自检照旧把它判 failed,而 warning 里能看出 OCR 试过且为什么没成。
-    """
-    if recovered.text.strip():
-        kept = [w for w in parsed.warnings if w not in ocr.OCR_TRIGGER_WARNINGS]
-        return ParsedDocument(
-            text=recovered.text,
-            backend=f"{parsed.backend}+ocr",
-            warnings=kept + [f"ocr_recovered:{recovered.pages_ocred}"] + recovered.warnings,
-        )
-    return ParsedDocument(
-        text=parsed.text,
-        backend=parsed.backend,
-        warnings=list(parsed.warnings) + recovered.warnings,
-    )
-
-
-
 class KnowledgeService:
     def __init__(self, retriever: HybridRetriever | None = None) -> None:
         self.embedding = EmbeddingService()
@@ -272,17 +246,6 @@ class KnowledgeService:
         同一份内容既是团队资产又是某人的私有副本,是两篇不同归属的文档。
         """
         parsed = parse_document(filename, content)
-        # 扫描件兜底:解析判定"有文件、一个字都没抽到"(no_text_layer /
-        # no_extractable_text)时,用视觉模型把页面转写成正文,再走后续正常的
-        # 分块/自检链路。闸门全在 ocr.maybe_ocr 里(默认关)。必须放在算 content_hash
-        # 之前——OCR 出来的正文才会参与去重与落库;放在之后的话去重按空串算,
-        # 两篇不同的扫描件会撞成同一个哈希。
-        if settings.INGEST_OCR_ENABLED and any(
-            w in ocr.OCR_TRIGGER_WARNINGS for w in parsed.warnings
-        ):
-            recovered = await ocr.maybe_ocr(_file_extension(filename), content)
-            if recovered is not None:
-                parsed = _merge_ocr(parsed, recovered)
         content_hash = hashlib.sha256(parsed.text.encode("utf-8")).hexdigest()
 
         duplicate_query = db.query(Document).filter(
@@ -388,16 +351,14 @@ class KnowledgeService:
             document.status = "indexed"
             document.parse_warnings = _dump_warnings(warnings)
             db.commit()
-            # 知识库变了，旧答案可能已经错了：整桶清掉而不是逐条判断。
-            # 作用域是工作区:一个成员上传共享文档,全体成员的缓存都要失效
+            # 知识库变了：进程内检索索引要失效。作用域是工作区——一个成员上传
+            # 共享文档，全工作区的索引都要重建
             invalidate_scope_indexes(document.workspace_id)
-            semantic_cache.invalidate_user(document.workspace_id)
             # 私有文档还要按**人**清一次:它跟着人走,而这个人此刻所在的工作区
             # 未必是文档的 workspace_id(可能是他在上一个空间里传的)。
             # 漏掉的症状是刚传完的个人文档搜不到,而它明明 indexed 了。
             if document.visibility == "private" and document.user_id:
                 invalidate_viewer_indexes(document.user_id)
-                semantic_cache.invalidate_viewer(document.user_id)
 
             # 向量库是**持久态**,必须在这里同步写。进程内索引是派生态、丢了重建
             # 就行,而 Qdrant 里少一批点就是真的少了——靠下一次检索去兜是兜不住的,
@@ -723,12 +684,10 @@ class KnowledgeService:
         db.commit()
         for scope in {document_workspace, workspace_id}:
             invalidate_scope_indexes(scope)
-            semantic_cache.invalidate_user(scope)
         if owner_id:
             # 按用户清：这个人的桶键是 ``<他当前所在工作区>|<他>``，而那个工作区
-            # 未必是文档所属的那个。invalidate_by_viewer 扫的是键的后半段。
+            # 未必是文档所属的那个。invalidate_viewer_indexes 扫的是键的后半段。
             invalidate_viewer_indexes(owner_id)
-            semantic_cache.invalidate_viewer(owner_id)
         # MySQL 那边是 ON DELETE CASCADE，Qdrant 没有外键，所以这一步必须显式做。
         # 漏掉的后果是删掉的文档还能被召回，而 retriever 的 `if chunk_id in by_id`
         # 会把它静默丢掉——表现是 top_k 少了几条，没有任何报错。

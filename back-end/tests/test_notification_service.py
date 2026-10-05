@@ -1,16 +1,11 @@
-"""通知收件箱测试：create/list/unread、mark_read 自作用域、去重、abandoned 钩子。
+"""通知收件箱测试：create/list/unread、mark_read 自作用域、同工单去重。
 
 用 db_real（内存 SQLite 真建表）——要断言的是持久化后的行、未读过滤与自作用域，
 替身测不出来。
 """
 from __future__ import annotations
 
-from datetime import timedelta
-
-from config import settings
-from models import AgentRun, Notification
-from services import checkpoint_store
-from services.clock import naive_now
+from models import Notification
 from services.notification_service import notification_service
 
 
@@ -45,45 +40,28 @@ def test_mark_read_is_self_scoped(db_real):
     assert notification_service.unread_count(db_real, "u1") == 0
 
 
-def test_dedup_skips_unread_same_run(db_real):
+def test_dedup_skips_unread_same_ticket(db_real):
     first = notification_service.create(
-        db_real, user_id="u1", kind="approval_required", title="待审批", run_id="run-1"
+        db_real, user_id="u1", kind="approval_required", title="待审批", ticket_id="t-1"
     )
     dup = notification_service.create(
-        db_real, user_id="u1", kind="approval_required", title="待审批(重)", run_id="run-1"
+        db_real, user_id="u1", kind="approval_required", title="待审批(重)", ticket_id="t-1"
     )
-    assert first is not None and dup is None  # 同 (user,kind,run) 已有未读 → 跳过
-    assert db_real.query(Notification).filter(Notification.run_id == "run-1").count() == 1
-    # 已读之后，同一个 run 再来才算新事件
+    assert first is not None and dup is None  # 同 (user,kind,ticket) 已有未读 → 跳过
+    assert db_real.query(Notification).filter(Notification.ticket_id == "t-1").count() == 1
+    # 已读之后，同一张工单再次挂上来才算新事件（中断恢复会重入同一个状态）
     notification_service.mark_read(db_real, "u1", first)
     again = notification_service.create(
-        db_real, user_id="u1", kind="approval_required", title="待审批(新)", run_id="run-1"
+        db_real, user_id="u1", kind="approval_required", title="待审批(新)", ticket_id="t-1"
     )
     assert again is not None
-    assert db_real.query(Notification).filter(Notification.run_id == "run-1").count() == 2
+    assert db_real.query(Notification).filter(Notification.ticket_id == "t-1").count() == 2
 
 
 def test_mark_all_read_only_touches_own(db_real):
     for i in range(3):
-        notification_service.create(db_real, user_id="u1", kind="input_required", title=f"n{i}")
-    notification_service.create(db_real, user_id="u2", kind="input_required", title="别人的")
+        notification_service.create(db_real, user_id="u1", kind="ticket_handoff", title=f"n{i}")
+    notification_service.create(db_real, user_id="u2", kind="ticket_handoff", title="别人的")
     assert notification_service.mark_all_read(db_real, "u1") == 3
     assert notification_service.unread_count(db_real, "u1") == 0
     assert notification_service.unread_count(db_real, "u2") == 1
-
-
-def test_abandoned_run_creates_notification(db_real, monkeypatch):
-    monkeypatch.setattr(settings, "AGENT_APPROVAL_TIMEOUT_HOURS", 24)
-    old = naive_now() - timedelta(hours=48)
-    db_real.add(
-        AgentRun(
-            id="run-x", chat_id="c1", user_id="u1", status="waiting_approval",
-            rounds=1, started_at=old, updated_at=old,
-        )
-    )
-    db_real.commit()
-    assert checkpoint_store.expire_stale_runs(db_real, "u1") == 1
-    notes = notification_service.list(db_real, "u1")
-    assert len(notes) == 1
-    assert notes[0]["kind"] == "run_abandoned"
-    assert notes[0]["runId"] == "run-x"

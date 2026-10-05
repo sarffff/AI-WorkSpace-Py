@@ -1,12 +1,17 @@
-"""线上健康监控：从 trace_spans + agent_runs 聚合真实指标，越阈值经 B1 通知出口告警。
+"""线上健康监控：从 tickets + trace_spans 聚合真实指标，越阈值经通知出口告警。
 
 ``usage_guard`` 防的是**单个用户**跑飞，它答不了另一个问题：整条线**作为一个整体**
-是不是在变坏——错误率爬升、人工介入变多、单次回答变贵。离线金标（eval + 门禁）量的
-是"模型在固定题上的质量"，但它跑在温度 0、固定语料上，和线上（温度 0.7、真实流量）
-是两套分布。这里补的就是"线上这半环"。
+是不是在变坏——错误率爬升、人工介入变多、单张工单变贵。离线评估（eval + 门禁）量的
+是"模型在固定题上的质量"，但它跑在温度 0、固定语料上，和线上（真实流量）是两套分布。
+这里补的就是"线上这半环"。
 
 **机制而非话术**：阈值是代码里的数字判断，告警是一条真的 Notification，不是在提示词
 里写"请注意质量"。节流 + 去重让它能挂在高频读路径上而不刷屏（见 config 的 MONITOR_*）。
+
+计数单位是**工单**而不是"一次回答"：工单是这个产品的计数单位，也是文档里那五个核心
+指标（自动解决率、首次响应、平均处理时长、CSAT、错误操作率）的分母所在。一次编排
+可能跨天、被审批打断好几次，按回答计数会把"一张工单被反复折腾"这种最该看见的劣化
+平均掉。
 
 没有内置定时器（项目里没有调度器）。评估顺带挂在**通知未读数轮询**上（前端徽标心跳），
 也可以让外部 cron 打 ``GET /metrics/health``。多 worker 下每个 worker 各评估一次，靠
@@ -22,7 +27,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
 from config import settings
-from models import AgentRun, Notification, TraceSpan, User
+from models import Notification, Ticket, User
 from services.clock import naive_now
 from services.notification_service import notification_service
 
@@ -35,10 +40,10 @@ _last_eval_at: datetime | None = None
 _lock = threading.Lock()
 
 _LABELS = {
-    "errorRate": "错误率",
+    "errorRate": "失败率",
     "interventionRate": "人工介入率",
-    "avgCostPerRun": "单次回答平均成本",
-    "p95LatencyMs": "端到端 p95 延迟(ms)",
+    "avgCostPerTicket": "单工单平均成本",
+    "p95HandleMs": "平均处理时长 p95(ms)",
 }
 
 
@@ -55,93 +60,78 @@ def _percentile(values: list[float], p: float) -> float | None:
     return ordered[low] + (ordered[high] - ordered[low]) * (rank - low)
 
 
+# 走到人手里的状态：等审批 = 已经挂了人在回路；escalated = 已经转人工。
+# 两者都要算进"人工介入率"——文档里"人工坐席工作量下降比例"这个指标，
+# 分母减少的唯一来源就是这两类变少。
+_HUMAN_STATUSES = ("awaiting_approval", "escalated")
+
+
 def health_report(
-    db: Session, *, window_hours: float | None = None, min_runs: int | None = None
+    db: Session, *, window_hours: float | None = None, min_tickets: int | None = None
 ) -> dict:
     """窗口内的全局健康快照。只读，不发告警（告警在 evaluate_and_alert）。
 
-    只看主代理 run（``parent_run_id IS NULL``）：子代理失败是内部的，用户看到的
-    粒度是"一次回答"。成本按 run 的 trace_id 聚合 trace_spans.cost，NULL 不计入
-    （"未知"不是 0，同 pricing 的约定）。
+    成本取 ``tickets.llm_cost``，它在编排每步之后累加、挂起时也会落一次，所以
+    "还没办完但已经花了三块钱"的工单也在数里。NULL 表示这次运行没拿到用量
+    （"未知"不是 0，同 pricing 的约定），不计入均值也不计入分位。
     """
     window_hours = window_hours if window_hours is not None else settings.MONITOR_WINDOW_HOURS
-    min_runs = settings.MONITOR_MIN_RUNS if min_runs is None else min_runs
+    min_tickets = (
+        settings.MONITOR_MIN_TICKETS if min_tickets is None else min_tickets
+    )
     since = naive_now() - timedelta(hours=window_hours)
 
-    runs = (
-        db.query(AgentRun)
-        .filter(AgentRun.parent_run_id.is_(None), AgentRun.started_at >= since)
-        .all()
-    )
-    total = len(runs)
+    tickets = db.query(Ticket).filter(Ticket.created_at >= since).all()
+    total = len(tickets)
     report: dict = {
         "windowHours": window_hours,
-        "totalRuns": total,
-        "sufficient": total >= min_runs,
+        "totalTickets": total,
+        "sufficient": total >= min_tickets,
         "metrics": {},
         "breaches": [],
     }
     if total == 0:
         return report
 
-    failed = sum(1 for r in runs if r.status == "failed")
-    intervened = sum(
-        1 for r in runs if (r.interrupts or 0) > 0 or r.status == "abandoned"
-    )
+    failed = sum(1 for t in tickets if t.status == "failed")
+    intervened = sum(1 for t in tickets if t.status in _HUMAN_STATUSES)
     error_rate = failed / total
     intervention_rate = intervened / total
 
-    latencies = [
-        (r.finished_at - r.started_at).total_seconds() * 1000.0
-        for r in runs
-        if r.finished_at and r.started_at
+    handle_ms = [
+        (t.resolved_at - t.created_at).total_seconds() * 1000.0
+        for t in tickets
+        if t.resolved_at and t.created_at
     ]
-    p95_latency = _percentile(latencies, 95)
+    p95_handle = _percentile(handle_ms, 95)
 
-    costs = _run_costs(db, [r.trace_id for r in runs if r.trace_id])
+    costs = [float(t.llm_cost) for t in tickets if t.llm_cost is not None]
     avg_cost = sum(costs) / len(costs) if costs else None
     p95_cost = _percentile(costs, 95)
 
     report["metrics"] = {
         "errorRate": round(error_rate, 4),
         "interventionRate": round(intervention_rate, 4),
-        "failedRuns": failed,
-        "intervenedRuns": intervened,
-        "avgCostPerRun": round(avg_cost, 6) if avg_cost is not None else None,
-        "p95CostPerRun": round(p95_cost, 6) if p95_cost is not None else None,
-        "p95LatencyMs": round(p95_latency) if p95_latency is not None else None,
-        "runsWithKnownCost": len(costs),
+        "failedTickets": failed,
+        "intervenedTickets": intervened,
+        "avgCostPerTicket": round(avg_cost, 6) if avg_cost is not None else None,
+        "p95CostPerTicket": round(p95_cost, 6) if p95_cost is not None else None,
+        "p95HandleMs": round(p95_handle) if p95_handle is not None else None,
+        "ticketsWithKnownCost": len(costs),
     }
-    # 阈值判定只在样本够时做——三五个 run 的比例是噪声不是信号。
+    # 阈值判定只在样本够时做——三五个工单的比例是噪声不是信号。
     if report["sufficient"]:
-        report["breaches"] = _breaches(error_rate, intervention_rate, avg_cost, p95_latency)
+        report["breaches"] = _breaches(
+            error_rate, intervention_rate, avg_cost, p95_handle
+        )
     return report
-
-
-def _run_costs(db: Session, trace_ids: list[str]) -> list[float]:
-    """每个 run 的总成本（按 trace_id 聚合 trace_spans.cost）。
-
-    混币种时直接相加——有汇率问题,所以 MONITOR_MAX_COST_PER_RUN 默认 0(关)。
-    单币种部署(绝大多数)下这是对的;混币种部署该把成本阈值留 0,看错误率/延迟那几条。
-    """
-    from sqlalchemy import func
-
-    if not trace_ids:
-        return []
-    rows = (
-        db.query(TraceSpan.trace_id, func.sum(TraceSpan.cost))
-        .filter(TraceSpan.trace_id.in_(trace_ids), TraceSpan.cost.isnot(None))
-        .group_by(TraceSpan.trace_id)
-        .all()
-    )
-    return [float(amount) for _tid, amount in rows if amount is not None]
 
 
 def _breach(metric: str, value: float, threshold: float) -> dict:
     return {"metric": metric, "value": round(value, 4), "threshold": threshold}
 
 
-def _breaches(error_rate, intervention_rate, avg_cost, p95_latency) -> list[dict]:
+def _breaches(error_rate, intervention_rate, avg_cost, p95_handle) -> list[dict]:
     """各阈值独立判，0 = 关掉这一条（同 usage_guard 的约定）。"""
     out: list[dict] = []
     if 0 < settings.MONITOR_MAX_ERROR_RATE < error_rate:
@@ -150,15 +140,17 @@ def _breaches(error_rate, intervention_rate, avg_cost, p95_latency) -> list[dict
         out.append(
             _breach("interventionRate", intervention_rate, settings.MONITOR_MAX_INTERVENTION_RATE)
         )
-    if avg_cost is not None and 0 < settings.MONITOR_MAX_COST_PER_RUN < avg_cost:
-        out.append(_breach("avgCostPerRun", avg_cost, settings.MONITOR_MAX_COST_PER_RUN))
-    if p95_latency is not None and 0 < settings.MONITOR_MAX_P95_LATENCY_MS < p95_latency:
-        out.append(_breach("p95LatencyMs", p95_latency, settings.MONITOR_MAX_P95_LATENCY_MS))
+    if avg_cost is not None and 0 < settings.MONITOR_MAX_COST_PER_TICKET < avg_cost:
+        out.append(
+            _breach("avgCostPerTicket", avg_cost, settings.MONITOR_MAX_COST_PER_TICKET)
+        )
+    if p95_handle is not None and 0 < settings.MONITOR_MAX_P95_HANDLE_MS < p95_handle:
+        out.append(_breach("p95HandleMs", p95_handle, settings.MONITOR_MAX_P95_HANDLE_MS))
     return out
 
 
 def _format_body(report: dict) -> str:
-    lines = [f"窗口 {report['windowHours']} 小时内 {report['totalRuns']} 次回答："]
+    lines = [f"窗口 {report['windowHours']} 小时内 {report['totalTickets']} 张工单："]
     for breach in report["breaches"]:
         label = _LABELS.get(breach["metric"], breach["metric"])
         lines.append(f"- {label}：{breach['value']}（阈值 {breach['threshold']}）")

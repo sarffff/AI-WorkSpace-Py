@@ -70,9 +70,10 @@ class User(Base):
     #   admin — 可增删工作区共享文档,可重置邀请码
     #   user  — 共享文档只读;但可以自由增删**自己的**私有文档
     # 所以 user 不是"只读账号",它只是不能改组织资产。
-    workspace_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True, index=True
-    )
+    # 不设外键：0007 建列时就没带，库里至今也没有，而应用层从不删工作区——
+    # 那句 ondelete="SET NULL" 是一次都不会兑现的空头承诺。留着它反而让
+    # create_all 建出来的测试库（SQLite 会建 FK）与生产库结构不一致。
+    workspace_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     role: Mapped[str] = mapped_column(String(20), default="admin")
 
     # 账号状态
@@ -81,252 +82,6 @@ class User(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
-
-    chats: Mapped[list["Chat"]] = relationship(back_populates="user", cascade="all, delete-orphan")
-
-
-class Chat(Base):
-    __tablename__ = "chats"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    title: Mapped[str] = mapped_column(String(255))
-    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"))
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
-
-    user: Mapped["User"] = relationship(back_populates="chats")
-    messages: Mapped[list["Message"]] = relationship(back_populates="chat", cascade="all, delete-orphan")
-
-
-class Message(Base):
-    __tablename__ = "messages"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    content: Mapped[str] = mapped_column(Text)
-    role: Mapped[str] = mapped_column(String(20))  # user, assistant, system
-    model: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    chat_id: Mapped[str] = mapped_column(String(36), ForeignKey("chats.id", ondelete="CASCADE"))
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    seq: Mapped[int | None] = mapped_column(Integer, autoincrement=True, unique=True)
-
-    chat: Mapped["Chat"] = relationship(back_populates="messages")
-
-
-class MessageToolStep(Base):
-    """一个回合里的单步工具执行。
-
-    单独建表而不是往 ``messages`` 里塞 role='tool' 的行：那张表是前端逐条渲染的
-    对话气泡，多出来的工具行会被当成一条消息画出来，所有读它的地方都得先学会
-    过滤。工具轨迹的形状本来也不同（轮次、参数、状态、引用），挤进同一张表
-    只能靠一堆可空列。
-
-    不设外键到 messages：触发回合的用户消息会被"编辑并重新生成"删掉，而轨迹是
-    可复盘的资产（后续要进 Agent 端到端评估），不该跟着一起消失。失效的轨迹由
-    ``revise_user_message`` 按 message_id 显式清理，删对话时按 chat_id 清理。
-
-    ``result_content`` 确实存工具返回的正文，其中可能包含用户自己文档里的内容——
-    这与 ``trace_spans.attributes`` 只存元数据的约定不冲突：那是埋点，这是对话
-    数据，和 ``messages.content`` 同一性质。
-    """
-
-    __tablename__ = "message_tool_steps"
-    __table_args__ = (
-        Index("ix_message_tool_steps_chat_created", "chat_id", "created_at"),
-        Index("ix_message_tool_steps_message", "message_id"),
-    )
-
-    id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
-    )
-    chat_id: Mapped[str] = mapped_column(String(36))
-    # 触发这一回合的用户消息 id。与 trace_spans.message_id 是同一个锚点，
-    # 于是"这次回答走了哪几步"和"这次回答花了多少钱"能对齐到同一轮。
-    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-
-    # 0 表示回合开始前的 RAG 预检索，1 起是模型自己决定的轮次
-    round_index: Mapped[int] = mapped_column(Integer, default=0)
-    # 同一轮里可能有多个并行工具调用，靠它保持回放顺序稳定
-    call_index: Mapped[int] = mapped_column(Integer, default=0)
-
-    tool_name: Mapped[str] = mapped_column(String(120))
-    tool_call_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
-    # 调用参数的 JSON。这是模型写的，不是用户文本
-    arguments: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # 哪个子代理执行的这一步。NULL = 主代理自己调的。
-    # 不区分的话"这次回答查了 8 次知识库"既可能是主代理反复检索，也可能是一次
-    # 委派里 researcher 查了 6 次——这两种情况的改进方向正好相反。
-    agent_role: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    # 归属的 agent_runs.id。有了它，"这一步是哪次执行做的"是一次 join 而不是
-    # 按 (agent_role, 时间) 推断——同一回合里委派两个 researcher 时后者会错。
-    # NULL = 这一步产生于 agent_runs 存在之前，或埋点关闭时
-    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-
-    # ToolStatus 的三档（ok / invalid_arguments / unavailable），预检索失败记 error
-    status: Mapped[str] = mapped_column(String(20), default="ok")
-    # 工具返回的正文，落库时按 TOOL_HISTORY_STORE_MAX_CHARS 截断。
-    # 存全量而不是只存摘要：回灌粒度是会反复调的策略，只留摘要等于把当时的
-    # 策略烙进数据，回头想换粒度已经没有原始内容可用了。
-    result_content: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # 截断前的原始长度，用来判断摘要到底丢了多少
-    result_chars: Mapped[int] = mapped_column(Integer, default=0)
-    # 命中的引用（document_id / document_name / chunk_index），JSON 数组
-    citations: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    created_at: Mapped[datetime] = mapped_column(DateTime)
-
-
-class AgentRun(Base):
-    """一次 Agent 执行的一等记录：主代理一行，每个子代理各一行。
-
-    为什么不继续往 ``message_tool_steps`` 加列：那张表的粒度是"一步工具调用"，
-    而这里要回答的问题的粒度是"一次执行"——这次回答起了几个子代理、哪个最慢、
-    researcher 失败之后主代理有没有重试、委派在总成本里占多少。用 ``agent_role``
-    加排序去推断这些，在一次回答里委派两个同角色子代理时就会失效。
-
-    ``parent_run_id`` 自引用而不设外键：删对话时按 chat_id 显式清理（与
-    ``message_tool_steps`` 同一套取舍），外键的级联顺序反而会挡住删除。
-
-    ``status`` 里 ``waiting_approval`` 是唯一一个"没有任何进程在跑它、但它还活着"
-    的状态。那正是可恢复执行的意义：一次执行的生命周期不再等于一个 HTTP 请求的
-    生命周期。
-    """
-
-    __tablename__ = "agent_runs"
-    __table_args__ = (
-        Index("ix_agent_runs_chat_started", "chat_id", "started_at"),
-        Index("ix_agent_runs_user_status", "user_id", "status"),
-        Index("ix_agent_runs_parent", "parent_run_id"),
-    )
-
-    id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
-    )
-    chat_id: Mapped[str] = mapped_column(String(36))
-    user_id: Mapped[str] = mapped_column(String(36))
-    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    parent_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-
-    # NULL = 主代理（与 message_tool_steps.agent_role 同一套约定）
-    agent_role: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    # running / waiting_approval / done / failed / abandoned
-    status: Mapped[str] = mapped_column(String(24), default="running", index=True)
-    # 走到第几轮。中断恢复后接着涨，不重置
-    rounds: Mapped[int] = mapped_column(Integer, default=0)
-    # 这次执行里委派了几次（子代理 run 恒为 0，它们不能再委派）
-    delegations: Mapped[int] = mapped_column(Integer, default=0)
-    # 被人工审批打断过几次。审批一次也没有和审批三次是完全不同的体验，
-    # 这个数是"人被打扰了多少次"的唯一记录
-    interrupts: Mapped[int] = mapped_column(Integer, default=0)
-
-    model: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    # 提示词版本引用（key@version），与 trace_spans.attributes 里的同一个值
-    prompt_ref: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    # 关联到埋点树，成本与耗时从那边聚合，不在这里重复存
-    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
-    error_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
-
-    started_at: Mapped[datetime] = mapped_column(DateTime)
-    updated_at: Mapped[datetime] = mapped_column(DateTime)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-
-
-class AgentCheckpoint(Base):
-    """一个 run 在某个安全点上的状态快照。
-
-    一个 run 有多个快照，靠 ``seq`` 排序，最大的那个是当前状态。保留历史而不是
-    原地覆盖，是为了"回到第 3 轮再跑一次"——这是评估复现与事后调试要的能力，
-    而只留最新快照的话，恢复就只有一个方向。
-
-    ``state`` 是 ``agent_state.TurnState`` 的 JSON。它**确实包含对话消息正文**，
-    与 ``message_tool_steps.result_content`` 同一性质（对话数据），
-    和 ``trace_spans.attributes`` 只存元数据的约定不冲突——那是埋点。
-
-    体积是这张表的主要代价：一份快照就是整个 messages 列表，一次回答几轮下来
-    可能有几十 KB。所以要有保留策略（见 ``checkpoint_store.prune``），
-    否则它会比 messages 表本身还大。
-    """
-
-    __tablename__ = "agent_checkpoints"
-    __table_args__ = (
-        UniqueConstraint("run_id", "seq", name="uq_agent_checkpoints_run_seq"),
-        Index("ix_agent_checkpoints_run_seq", "run_id", "seq"),
-    )
-
-    id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
-    )
-    run_id: Mapped[str] = mapped_column(String(36))
-    seq: Mapped[int] = mapped_column(Integer, default=0)
-
-    # pre_tools / waiting_approval / post_tools
-    phase: Mapped[str] = mapped_column(String(24), default="pre_tools")
-    round_index: Mapped[int] = mapped_column(Integer, default=0)
-    state: Mapped[str] = mapped_column(Text)
-    # 中断请求的 JSON，仅 waiting_approval 的快照有
-    interrupt: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    created_at: Mapped[datetime] = mapped_column(DateTime)
-
-
-class AgentApproval(Base):
-    """一次人工审批的审计记录。
-
-    改动之前裁决只活在快照里（``TurnState.approved_call_ids`` /
-    ``rejected_call_ids`` / ``edited_arguments``），而快照有两个性质让它当不了
-    审计记录：**会被 ``AGENT_CHECKPOINT_KEEP`` 裁剪掉**，而且**不记录人与时间**。
-    审批这个功能的全部意义是"有人授权了这次写入"，那么"谁、什么时候、看到的
-    参数是哪一版"就是它必须能回答的问题。
-
-    与 run 是一对多：一次执行可以被打断多次（``AgentRun.interrupts`` 就是这个
-    数），而"第一次拒绝、改了参数第二次才批"恰恰是最需要留痕的形状。
-
-    **不存完整参数，只存摘要 + 预览。** 写知识库的参数里是整篇文档正文，可以到
-    ``AGENT_WRITE_MAX_CHARS``。整份复制进来等于同一份用户内容在库里存两遍，
-    而审计要回答的是"当时批准的到底是不是这一份"——digest 足以证明同一性。
-
-    ``decision`` 里 ``expired`` 与 ``rejected`` 必须分开：拒绝是人做的决定，
-    过期是没人做决定。在审计上这两件事完全不同，混成一个会让"这个团队到底在
-    认真审批还是放着不管"这个问题查不出来。
-    """
-
-    __tablename__ = "agent_approvals"
-    __table_args__ = (
-        Index("ix_agent_approvals_run", "run_id"),
-        Index("ix_agent_approvals_user_requested", "user_id", "requested_at"),
-        Index("ix_agent_approvals_decision_requested", "decision", "requested_at"),
-    )
-
-    id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
-    )
-    run_id: Mapped[str] = mapped_column(String(36))
-    chat_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    # 发起执行的用户。与 decided_by 通常相同但不必然——将来若允许管理员代批，
-    # 两者的差异正是审计要看的东西
-    user_id: Mapped[str] = mapped_column(String(36))
-
-    tool_name: Mapped[str] = mapped_column(String(80))
-    tool_call_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    round_index: Mapped[int] = mapped_column(Integer, default=0)
-    call_index: Mapped[int] = mapped_column(Integer, default=0)
-
-    # 请求时的参数摘要：模型原本想执行的那一份
-    arguments_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    arguments_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    # pending / approved / rejected / expired
-    decision: Mapped[str] = mapped_column(String(16), default="pending", index=True)
-    # 过期时为 NULL——那正是"没有人做这个决定"的准确表示
-    decided_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    # 用户改过参数的话这里是**改后**那份的摘要。与 arguments_digest 不同就说明
-    # 真正执行的不是模型原本要执行的东西
-    decided_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    edited_fields: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    note: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    requested_at: Mapped[datetime] = mapped_column(DateTime)
-    reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class Document(Base):
@@ -337,9 +92,10 @@ class Document(Base):
     size: Mapped[int] = mapped_column(Integer)
     content: Mapped[str | None] = mapped_column(Text, nullable=True)  # 文档全文内容
     # 知识库的外层作用域:工作区。检索/去重/缓存都先按它过滤
-    workspace_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("workspaces.id", ondelete="SET NULL"), nullable=True, index=True
-    )
+    # 不设外键：0007 建列时就没带，库里至今也没有，而应用层从不删工作区——
+    # 那句 ondelete="SET NULL" 是一次都不会兑现的空头承诺。留着它反而让
+    # create_all 建出来的测试库（SQLite 会建 FK）与生产库结构不一致。
+    workspace_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     # 上传者。**参与权限判断**:private 文档只有 user_id == 当前用户时可见可删。
     # 改动之前这一列只用于展示"这份文档是谁放的",加了 visibility 之后它成了
     # 私有文档的归属键——所以它为 NULL 的 private 文档谁都看不见(见下)。
@@ -349,7 +105,7 @@ class Document(Base):
     # 默认 workspace 而不是 private,理由是**存量数据**:这一列加上去之前所有文档
     # 都是工作区共享语义,迁移时必须保持原样,否则升级一次就等于把团队知识库
     # 全部变成某个人的私有文档。新上传的默认值由调用方给,不靠这里
-    # (chat 附件默认 private,知识库页面上传默认 workspace)。
+    # (个人上传默认 private，知识库页面上传默认 workspace)。
     #
     # user_id 为 NULL 且 visibility=private 的组合是**不该长期存在的中间态**:
     # 那种文档谁都检索不到、谁都删不掉,是一份没人能处置的孤儿。它由
@@ -386,33 +142,6 @@ class Document(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
-class UserMemory(Base):
-    """跨会话的长期记忆:用户的事实与偏好。
-
-    与滚动摘要的分工:摘要活在单个会话内,压的是"这段对话说过什么";
-    这里存的是"关于这个用户,哪些信息值得在**所有**以后的对话里知道"
-    ——部门、角色、偏好、长期约束。抽取由辅助模型在每轮回答后异步完成,
-    注入发生在系统提示词之后、历史之前。
-    """
-
-    __tablename__ = "user_memories"
-    __table_args__ = (
-        Index("ix_user_memories_user_created", "user_id", "created_at"),
-    )
-
-    id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
-    )
-    user_id: Mapped[str] = mapped_column(String(36))
-    # fact(已确认的事实) / preference(表达的偏好)。kind 只做展示分组,
-    # 注入时不加区分——对模型来说都是"关于用户的背景"。
-    kind: Mapped[str] = mapped_column(String(20), default="fact")
-    content: Mapped[str] = mapped_column(Text)
-    # 这条记忆来自哪个会话,便于用户追问"你为什么知道这个"时溯源
-    chat_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime)
-
-
 class DocumentChunk(Base):
     __tablename__ = "document_chunks"
 
@@ -424,20 +153,6 @@ class DocumentChunk(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
-class Prompt(Base):
-    __tablename__ = "prompts"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    title: Mapped[str] = mapped_column(String(255))
-    description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    category: Mapped[str] = mapped_column(String(100), default="General")
-    content: Mapped[str] = mapped_column(Text)  # 提示词模板正文（含 {input} 占位）
-    user_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    is_public: Mapped[bool] = mapped_column(default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
-
-
 class TraceSpan(Base):
     """一次回答里的单个执行片段（模型调用 / 工具执行 / 检索 / 向量化）。
 
@@ -445,7 +160,7 @@ class TraceSpan(Base):
     与其为每类操作建一张表，不如让共有字段（耗时、状态）成为列、
     差异字段落在 attributes JSON 里——查询时才不用 union 五张表。
 
-    不设外键到 chats/messages：埋点不该阻止业务数据被删除，
+    不设外键到 tickets：埋点不该阻止业务数据被删除，
     也不该因为级联删除而丢掉历史成本记录。
     """
 
@@ -453,7 +168,7 @@ class TraceSpan(Base):
     __table_args__ = (
         Index("ix_trace_spans_trace_started", "trace_id", "started_at"),
         Index("ix_trace_spans_user_started", "user_id", "started_at"),
-        Index("ix_trace_spans_chat_started", "chat_id", "started_at"),
+        Index("ix_trace_spans_ticket_started", "ticket_id", "started_at"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
@@ -464,9 +179,8 @@ class TraceSpan(Base):
     kind: Mapped[str] = mapped_column(String(20))
 
     user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    chat_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    # 触发这次回答的用户消息 id，用于把一棵 trace 关联回具体对话轮次
-    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # 一次编排运行的归属：工单 id。NULL = 不属于任何工单（健康巡检、后台索引）
+    ticket_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
     started_at: Mapped[datetime] = mapped_column(DateTime)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -492,112 +206,16 @@ class TraceSpan(Base):
     attributes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
-class MessageFeedback(Base):
-    """用户对某条助手回答的评价。
-
-    一条消息只保留一份反馈（``message_id`` 唯一）：用户改主意时更新而不是追加，
-    否则"点了三次踩"会被算成三个负样本，把满意度指标压得比实际更低。
-
-    不设外键到 messages：这一行是**自洽**的——question / model / expected_answer
-    都存在本行里，不依赖那条消息还在。所以"编辑并重新生成"删掉旧回答之后，
-    它依然是一条有效的回归用例，不该被级联删除带走。
-
-    用户显式删除整个对话是另一回事，那时反馈会跟着删（取舍写在
-    ``feedback_service.discard_chat``）。删除策略由代码决定而不是数据库默认，
-    正是不设外键的目的。
-    """
-
-    __tablename__ = "message_feedback"
-    __table_args__ = (
-        UniqueConstraint("message_id", name="uq_message_feedback_message"),
-        Index("ix_message_feedback_user_created", "user_id", "created_at"),
-        Index("ix_message_feedback_rating", "rating", "created_at"),
-    )
-
-    id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
-    )
-    message_id: Mapped[str] = mapped_column(String(36))
-    chat_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    user_id: Mapped[str] = mapped_column(String(36), index=True)
-
-    # up / down。只做两档：五星量表在单人使用场景里分辨不出差别,
-    # 反而让"到底几星算差"变成新的争论点。
-    rating: Mapped[str] = mapped_column(String(8))
-    # 差评原因标签(不准确/没引用/答非所问/格式差/其它),便于按类型聚合
-    reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    # 用户补充说明与期望答案。会随反馈导出进评估集,所以这里**确实**存用户文本——
-    # 与 trace_spans.attributes 的约定不同,那是埋点,这是用户主动提交的标注。
-    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
-    expected_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    # 反馈时的模型与提问,导出回归用例时需要,不必再回表拼
-    model: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    question: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    created_at: Mapped[datetime] = mapped_column(DateTime)
-    updated_at: Mapped[datetime] = mapped_column(DateTime)
-    # 是否已被导出进评估数据集,避免每次导出都重复追加同一条
-    exported_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-
-
-class WorkspaceRoot(Base):
-    """一个被授权给文件系统工具的本机目录。
-
-    文件系统工具（``list_directory`` / ``read_file`` / ``search_files`` /
-    ``write_file`` / ``edit_file`` / ``delete_file``）只能在这张表里登记过的目录
-    之下工作。一个用户名下没有任何一行时，这些工具**根本不注册**——没有沙箱根，
-    它们除了报错什么都做不了，而注册一个每轮都失败的工具只会白烧上下文
-    （同 ``workspace_tools.build`` 里那条理由）。
-
-    ## 判据是 user_id，不是 workspace_id
-
-    授权是**本机行为**：用户在自己那台机器上点了一次系统对话框。而工作区是多人
-    共享的（邀请码加入、admin/member 两种角色）。按工作区授权的话，一个成员选的
-    目录会让同工作区的另一个人"有权"读它——而那个人的机器上可能根本没有这个路径，
-    或者更糟，有一个同路径但内容完全不同的目录。
-
-    ``workspace_id`` 存下来是为了回答"这次授权是在哪个工作区的上下文里给的"，
-    它不参与权限判断。
-
-    ## path 原样存
-
-    不在入库时做规范化改写。``fs_roots.resolve_within_roots`` 每次校验都对两边
-    重新 ``realpath``——那才是符号链接会变的地方，入库时解析一次并不能保证之后
-    那个链接指向的还是同一处。存原样也让界面上显示的与用户当初选的是同一个字符串。
-    """
-
-    __tablename__ = "workspace_roots"
-    __table_args__ = (
-        # 同一个人重复授权同一个目录是幂等的，而不是攒出两行让撤销只撤掉一半
-        UniqueConstraint("user_id", "path", name="uq_workspace_roots_user_path"),
-        Index("ix_workspace_roots_user_id", "user_id"),
-    )
-
-    id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
-    )
-    user_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    workspace_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    # 512 而不是 255：Windows 长路径 + 中文目录名很容易超过 255 字节，而截断的
-    # 后果是沙箱根变成一个**不同的目录**——前缀校验照样通过，只是通过的是错的那个
-    path: Mapped[str] = mapped_column(String(512), nullable=False)
-    label: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-
-
 class WorkspaceSkill(Base):
     """一个工作区自己写的 skill（作业指导）。
 
     skill 回答"这件事在本组织该怎么做"。内置 skill 在 ``back-end/skills/`` 里跟
     代码版本化，这张表装的是各家自己的 SOP——admin 在界面上写，不改代码不重启。
 
-    ## 判据是 workspace_id，和 WorkspaceRoot 相反
+    ## 判据是 workspace_id
 
-    两者的对比正好说明判据是怎么定的：文件夹授权是**本机行为**（这台机器上的
-    这个目录，换个人就不成立），而 SOP 是**组织资产**（全公司同一套报销流程）。
-    按 user 存的话每个员工都要自己录一遍，而且会录出互相矛盾的版本——那时
-    "到底按谁的流程审"没有答案。
+    SOP 是**组织资产**（全公司同一套退款流程）。按 user 存的话每个坐席都要自己
+    录一遍，而且会录出互相矛盾的版本——那时"到底按谁的流程办"没有答案。
 
     ## 同名盖掉内置
 
@@ -646,94 +264,11 @@ class WorkspaceSkill(Base):
     )
 
 
-class ReviewRecord(Base):
-    """一条审核结论的台账记录。审核类任务的**交付物**。
-
-    ## 名字为什么不叫 ReviewVerdict
-
-    ``structured.ReviewVerdict`` 是模型产出的那个 Pydantic 结构（inputs / basis /
-    verdict 三件）。这一行装的东西更多：审的是什么、采样几次、有没有人复核过。
-    verdict 是它的一个字段，不是它本身。两个类同名会让 import 处处要起别名，
-    而"到底是哪一个"这件事在代码里必须一眼看出来。
-
-    ## 为什么不塞进 message_tool_steps
-
-    那张表是工具调用轨迹，给排查用，随对话一起被清理。这张表是业务记录：一张单子
-    的审核结论不该因为有人清了聊天记录就消失。所以 ``chat_id`` / ``message_id``
-    只作线索留着（"想看当时怎么审的，去这段对话"），**不设外键约束**——断了不影响
-    这条结论本身的有效性。
-
-    ## needs_human 是一等公民
-
-    三档里它最有价值：审核这份工作的全部意义在于"拿不准就往上抬一级"。把它当成
-    某种错误状态会让人去优化掉它，而那正好优化掉了价值。
-
-    ## sop_version 是快照值不是外键
-
-    引用 ``WorkspaceSkill.version`` 的话，SOP 再改一次这条结论的依据又变了——
-    而这张表存在的理由正是"当时按的第几版"。存下来的数字是事实，外键指向的是现状。
-    """
-
-    __tablename__ = "review_verdicts"
-    __table_args__ = (
-        # 台账按工作区 + 时间倒序翻页
-        Index("ix_review_verdicts_ws_created", "workspace_id", "created_at"),
-        # 待办队列："还有哪些等着人看"
-        Index(
-            "ix_review_verdicts_pending", "workspace_id", "verdict", "resolved_at"
-        ),
-    )
-
-    id: Mapped[str] = mapped_column(
-        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
-    )
-    workspace_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    user_id: Mapped[str] = mapped_column(String(36), nullable=False)
-    chat_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    # 审的是什么。自由文本：可能是文件名、单号或一句描述，取决于材料从哪来。
-    # 不做成指向文件的外键——文件会被移走、改名、删除，而结论要比它长命
-    subject: Mapped[str] = mapped_column(String(500), nullable=False)
-    sop_name: Mapped[str] = mapped_column(String(80), nullable=False)
-    sop_version: Mapped[int] = mapped_column(Integer, nullable=False)
-    # 不用枚举类型：三档还会长（"部分通过"是可预见的下一档），
-    # 而 MySQL 改枚举要锁表
-    verdict: Mapped[str] = mapped_column(String(20), nullable=False)
-    # JSON 数组。核对项 3~6 个、只整体读写，拆表要多一次 join 换一个用不上的
-    # 查询能力
-    inputs: Mapped[str] = mapped_column(Text, nullable=False)
-    basis: Mapped[str] = mapped_column(Text, nullable=False)
-    # 一致性检查采样了几次、结论一致吗。
-    #
-    # runs=1 有两种含义且处置不同：没开这个检查，或者开了但只有一次跑通。
-    # 所以 agreed 单独一列——runs=1 且 agreed=True 说的是"没检查过"，
-    # 不是"检查过并且一致"（见 services/review_consensus.combine）
-    runs: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
-    agreed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    # 人复核之后的处置。NULL = 还没人看过。
-    # 转人工必须查得出"接手了没有"，否则它等于扔进一个没人看的队列
-    resolved_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    resolution: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    resolution_note: Mapped[str | None] = mapped_column(String(1000), nullable=True)
-    # 模型据以判断的材料原文。两个用途：人复核时要看的就是它，
-    # 独立复审（review_consensus）拿它重新判一次。
-    #
-    # Text 而不是 String(n)：一整张单子的 OCR 文本可能很长，而给具体上限就一定有
-    # 被截断的那天——静默截掉的正好是尾部，而尾部常常是签字与日期。
-    # 入参那侧由 REVIEW_EVIDENCE_MAX_CHARS 挡着，超限明确报错。
-    #
-    # NULL 读作"这条结论是加这一列之前记的"，与空串（材料是空的，那是 bug）
-    # 分得开。
-    evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-
 class AuditLog(Base):
     """防篡改审计链：谁、什么时候、做了哪一个改变状态的动作。
 
-    与已有两张"留痕"表互补，不替代：``AgentApproval`` 记审批这件事的详细状态
-    （改没改参数、谁批的）；``TraceSpan`` 是可观测性埋点，刻意不存正文、按窗口聚合。
+    与已有两张"留痕"表互补，不替代：``CsOperation`` 记一次业务写操作的详细状态
+    （幂等键、批没批、执行结果）；``TraceSpan`` 是可观测性埋点，刻意不存正文、按窗口聚合。
     这张表回答合规要问的另一个问题——"这串动作有没有被事后改过"。
 
     手段是**哈希链**：每条存上一条的 ``entry_hash`` 作 ``prev_hash``，自己的
@@ -774,9 +309,9 @@ class AuditLog(Base):
     args_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     args_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # 线索，非外键：审计不该阻止业务数据被删
-    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    chat_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # 线索，非外键：审计不该阻止业务数据被删。NULL = 这次动作不属于任何工单
+    # （登录、改文档、暂停 Agent）
+    ticket_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
     # 链：prev_hash = 上一条的 entry_hash（首条为 genesis 常量）
     prev_hash: Mapped[str] = mapped_column(String(64))
@@ -790,18 +325,16 @@ class AuditLog(Base):
 class Notification(Base):
     """发给某个用户的"有事等你处理"通知。
 
-    为什么要有它：审批挂起 / ask_user / prose_question 这些中断事件，眼下**只在那条
-    实时 SSE 连接上存在一瞬**（见 chat_service 的 approval_required 发射点）——刷新、
-    切页、断网之后就没了，用户只能靠轮询 /chats/runs/pending 重新发现。HITL 是这个
-    审核工作台的核心，审批人不在场时闭环就断在这里。这张表把"有事等你"落成持久的
-    per-user 收件箱，与那条易失连接解耦。
+    为什么要有它：工单挂在人工审批上、或到点转人工时，这件事**只在那条实时
+    SSE 连接上存在一瞬**——刷新、切页、断网之后就没了，审批人只能靠打开队列
+    重新发现。人在回路是这个产品的核心，审批人不在场时闭环就断在这里。这张表
+    把"有事等你"落成持久的 per-user 收件箱，与那条易失连接解耦。
 
-    不设外键：``run_id`` / ``chat_id`` 只作深链线索（点通知跳回那次运行/对话），
-    断了不影响通知本身——同 TraceSpan / MessageFeedback 的取舍。
+    不设外键：``ticket_id`` 只作深链线索（点通知跳回那张工单），断了不影响通知
+    本身——同 TraceSpan 的取舍。全局健康告警没有对应工单，那行为 NULL。
 
-    ``read_at`` 为 NULL 即未读（仿 MessageFeedback.exported_at 那个"处理过一次"的
-    时间戳）。本轮只做应用内拉取式收件箱；IM/邮件/WebSocket 主动推送属外部基建、
-    留作后续，而它们将来的数据源正是这张表。
+    ``read_at`` 为 NULL 即未读。本轮只做应用内拉取式收件箱；给客户的回复走
+    ``ticket_outbox``（那是面向客户的出口，不是坐席的通知）。
     """
 
     __tablename__ = "notifications"
@@ -817,15 +350,14 @@ class Notification(Base):
     )
     # 收件人：要处理这件事的那个人（审批人 / 发起人）
     user_id: Mapped[str] = mapped_column(String(36))
-    # approval_required / input_required / run_abandoned / health_alert
-    # （前三条是 per-run 的 HITL 事件，带 run_id；health_alert 是线上健康监控的
-    #  全局告警，发给管理员、不带 run_id，去重靠"每人同时只留一条未读"）
+    # approval_required / ticket_handoff / health_alert
+    # （前两条是 per-ticket 的人审与交接事件，带 ticket_id；health_alert 是线上
+    #  健康监控的全局告警，发给管理员、不带 ticket_id，去重靠"每人同时只留一条未读"）
     kind: Mapped[str] = mapped_column(String(32))
     title: Mapped[str] = mapped_column(String(255))
     body: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 深链线索，非外键
-    run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    chat_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    ticket_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime)
     # NULL = 未读
     read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -836,12 +368,12 @@ class DocumentJob(Base):
 
     改动前入库索引走 FastAPI ``BackgroundTasks``：进程内、不落盘、无重试、无并发上限，
     进程在索引中途重启那篇就永远卡在 ``processing``。这张表把"要索引谁"落成持久状态，
-    配合 ``services/document_queue.py`` 的认领/租约/重试，形态与 ``agent_runs`` 的
+    配合 ``services/document_queue.py`` 的认领/租约/重试，形态与 ``ticket_outbox`` 的
     lease/reaper 完全一致（都挂在读路径上惰性清理，项目里没有调度器）。
 
     不设外键到 documents：删文档时孤儿任务无害——``index_document`` 对"文档已消失"
-    本就优雅返回（见其首行判断），下一次认领时自然 complete 掉。与 ``agent_runs`` /
-    ``trace_spans`` 同一套"side-table 不设 FK、删除顺序由代码控制"的取舍。
+    本就优雅返回（见其首行判断），下一次认领时自然 complete 掉。与 ``trace_spans`` /
+    ``notifications`` 同一套"side-table 不设 FK、删除顺序由代码控制"的取舍。
 
     ``available_at`` 是退避的载体：重试时把它推到未来，``claim_next`` 只认领
     ``available_at <= now`` 的任务。``attempts`` 在**认领时**自增（而非失败时），
@@ -859,7 +391,9 @@ class DocumentJob(Base):
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
     )
-    document_id: Mapped[str] = mapped_column(String(36), index=True)
+    # 索引由下面 __table_args__ 的 ix_document_jobs_document 提供；这里再写
+    # index=True 只会多出一个同名同列的自动索引（..._document_id）。
+    document_id: Mapped[str] = mapped_column(String(36))
     # queued / running / succeeded / failed
     status: Mapped[str] = mapped_column(String(16), default="queued")
     attempts: Mapped[int] = mapped_column(Integer, default=0)
@@ -875,3 +409,553 @@ class DocumentJob(Base):
     error: Mapped[str | None] = mapped_column(String(200), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime)
     updated_at: Mapped[datetime] = mapped_column(DateTime)
+
+
+# ---------------------------------------------------------------------------
+# 工单域（客服 + 工单解决 Agent）
+#
+# 下面两组表服务两件不同的事，别混：
+#   1. ``tickets`` / ``ticket_events`` / ``cs_governors`` 是**这个 Agent 自己的**
+#      工单生命周期、可回放轨迹与治理开关。
+#   2. ``cs_*`` 里其余的表是**外部业务系统的靶子**（订单、物流、退款、发票）。
+#      真实部署里它们是 ERP/CRM/支付网关，本 Agent 只能通过工具读它们；这里自建
+#      同名结构是为了让写操作（改地址、发起退款）有对象可写、能在离线评估里
+#      断言"到底改没改对"。它们由 ``services/ticket/`` 下的工具独占访问，
+#      业务代码不要绕过工具直接写。
+#
+# 状态列一律 ``String(n)`` 而不是枚举类型（同 ``Document.status``：MySQL 改
+# 枚举要锁表，而这些取值集还会长）。时间列一律由应用侧 ``naive_now()`` 显式写入
+# （同 ``DocumentJob``/``Notification``），不要交给 ``server_default``——一个进程内
+# 混两个时区，回放出来的顺序就是错的。
+# ---------------------------------------------------------------------------
+
+
+class Ticket(Base):
+    """一张工单：Agent 的工作单元，也是所有指标的计数单位。
+
+    为什么不复用会话表：对话是**逐条气泡渲染**的前端模型，一张工单要挂的是
+    客户、订单、风险等级、SLA、CSAT、处置结论，且它的生命周期**长于一次会话**
+    （高风险操作等人批可能要几小时，跨天恢复靠的是它自己的状态而不是聊天记录）。
+
+    ``risk_level`` 可空而 ``status`` 不可空：NULL 读作"还没评估过"，和"评估完判定
+    为低风险"是两回事——把后者当成前者会让没走过风险节点的工单悄悄走自动执行。
+    """
+
+    __tablename__ = "tickets"
+    __table_args__ = (
+        # 待办队列：按工作区筛状态、按时间排。坐席打开工单台看到的就是这个顺序
+        Index("ix_tickets_ws_status_created", "workspace_id", "status", "created_at"),
+        # 指标聚合：自动解决率、平均处理时长都是"某窗口内的工单"
+        Index("ix_tickets_ws_created", "workspace_id", "created_at"),
+        Index("ix_tickets_customer", "customer_id"),
+        # 渠道重投递去重。external_ref 为空时不参与（MySQL/SQLite 的唯一索引都
+        # 放行多个 NULL），所以网页聊天这类没有外部 ID 的渠道照常工作
+        UniqueConstraint(
+            "workspace_id", "channel", "external_ref", name="uq_tickets_ws_channel_extref"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    # 工单是组织资产（同 Document 的共享语义），归属挂 workspace
+    workspace_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    # 客户档案。NULL = 还没认出是谁（匿名邮件、只有订单号）——认出来之后由工具回填
+    customer_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # 人类受理人。NULL = 无人认领，Agent 自己在处理
+    assignee_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    # web_chat / email / app / wecom / phone / api
+    channel: Mapped[str] = mapped_column(String(20), nullable=False)
+    # 渠道侧的消息或邮件标识。有了它，同一封邮件被重复投递只会建出一张工单
+    external_ref: Mapped[str | None] = mapped_column(String(120), nullable=True)
+
+    # new / understanding / planning / acting / awaiting_approval / escalated /
+    # resolved / closed / failed
+    status: Mapped[str] = mapped_column(String(24), default="new", nullable=False)
+    # low / mid / high。NULL = 尚未评估（见类文档）
+    risk_level: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # 意图识别的结果。自由文本而不是枚举：诉求类型清单会随业务变
+    intent: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # 实体抽取结果（订单号、商品、金额、诉求类型、情绪）。整体读写，不拆表
+    entities: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # 客户原话。Text：工单正文长度天然不可预知，给上限就一定有被截尾的那天，
+    # 而被截掉的尾部往往正是订单号和诉求
+    request_text: Mapped[str] = mapped_column(Text, nullable=False)
+    subject: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # 附件（文件名或 URI）列表，json 数组
+    attachments: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # 一句话把这张工单说清楚，供队列与审批列表显示
+    summary: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+    # 处置结果。resolved_* 与 status 分开：状态说明走到哪一步了，处置说明最后
+    # 到底怎么解决的（退款/改地址/仅答复/转人工），指标要的是后者
+    resolution: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    resolution_note: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    # 转人工的原因，用于反查"该转的没转"这类错误
+    escalation_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
+    # 客户满意度评分（1-5）与留言。NULL = 客户没评，不要拿 0 当"没评"
+    csat_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    csat_comment: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
+    # 成本与效率：这两个数是"自动解决率/平均处理时长"的原始材料，也是单工单
+    # 预算熔断的判定输入。计数与金额都由编排层在每步之后累加，不靠事后重算轨迹
+    tool_rounds: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    llm_cost: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+
+    # 首次响应时间（对外给出第一条答复）与 SLA 到期时刻。
+    # 两者都为空是正常态：前者要等真回复了才写，后者只有配了 SLA 才写
+    first_response_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    sla_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class TicketEvent(Base):
+    """工单的一步轨迹：append-only，用于事后回放与审计。
+
+    文档要求的"每一步思考、工具调用、结果都可回放"落在这里。与 ``trace_spans``
+    分工明确、互不替代：埋点是**可观测性**那一层（刻意不存正文、按窗口聚合、会被
+    清理），而这张表是**业务留痕**——工单是从业务视角被翻出来看的对象，"当时为什么
+    这么决定"必须在埋点被清掉之后仍然查得到。所以 ticket_id 不设外键。
+
+    存的是**摘要**不是全文：正文由 trace_spans 之外的原始工单文本承担，这里存到能
+    看懂决策为止（参数走 digest + preview，复用 approval_audit 的算法）。
+
+    ``seq`` 是该工单内的序号，应用侧取当前最大值 +1（同 ``AuditLog.seq`` 的取舍：
+    避开自增主键在 SQLite/MySQL 间的可移植坑）。
+    """
+
+    __tablename__ = "ticket_events"
+    __table_args__ = (
+        Index("ix_ticket_events_ticket_seq", "ticket_id", "seq"),
+        Index("ix_ticket_events_ws_created", "workspace_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    ticket_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    # 状态机节点：intake / understand / risk / retrieve / plan / act / confirm / escalate
+    node: Mapped[str] = mapped_column(String(24), nullable=False)
+    # thinking / tool_call / tool_result / approval / decision / state_change /
+    # error / reply
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+
+    tool_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tool_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 与 AuditLog 同一套摘要策略：digest 证明同一性，preview 供人读
+    args_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    args_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ok / error / blocked / rejected / pending
+    status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 该步的文本：思考摘要、给客户的答复、转人工说明
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    round_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cost: Mapped[Decimal | None] = mapped_column(Numeric(10, 6), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class CsGovernor(Base):
+    """一个工作区的治理开关。一行，按 workspace 唯一。
+
+    为什么不用 ``config``：``TICKET_*`` 环境变量要重启才生效，而"一键全局暂停"
+    是在事故当中按下的——那一刻没有部署窗口。所以限额与暂停态必须是**运行时可改**
+    且改完留痕的。config 里的同名设置退化为新工作区的默认值。
+
+    这里**不存**当日退款已用额度。那是一个可以从 ``cs_operations`` 聚合出来的
+    事实，存下来就有一个"计数与实际不一致"的窗口（并发写入、进程崩溃、事后补记），
+    而治理限值是安全边界，宁可每次多算一次查询也不能读到脏数字——同
+    ``usage_guard`` 走"读路径顺带聚合"而不维护计数器的做法。
+
+    限额列可空：NULL 表示"沿用全局默认"，与 0（一律不许退）分得开。
+    """
+
+    __tablename__ = "cs_governors"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", name="uq_cs_governors_workspace"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    workspace_id: Mapped[str] = mapped_column(String(36), nullable=False)
+
+    paused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    pause_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    pause_updated_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    # 当日退款总额上限（按应用时区自然日聚合）
+    daily_refund_limit: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    # 单工单成本上限与工具调用次数上限
+    max_cost_per_ticket: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
+    per_ticket_tool_calls: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class CsCustomer(Base):
+    """客户档案：跨工单的长期画像载体。
+
+    一个客户在网页聊天里是 session id、在邮件里是一个地址、在企微里是 external
+    userid。``email`` / ``phone`` 存**归一化之后**的形式（小写、只留数字），
+    否则同一个人会因为写了 ``+86`` 而被当成两个人，画像与限额都会分裂。
+    归一化只在 ``services/ticket/intake.py`` 做一次，别处不要各自再削一遍。
+
+    ``profile`` 是随时间累积的结论（偏好、历史问题摘要、沟通禁忌），整体读写；
+    ``profile_version`` 在每次改写时自增，让"这条工单用的是第几版画像"可以被
+    轨迹记下来——画像会变，而事后复盘要的是当时看到的那一版。
+    """
+
+    __tablename__ = "cs_customers"
+    __table_args__ = (
+        Index("ix_cs_customers_ws_email", "workspace_id", "email"),
+        Index("ix_cs_customers_ws_phone", "workspace_id", "phone"),
+        Index("ix_cs_customers_ws_external", "workspace_id", "external_ref"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    workspace_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    # 渠道侧的客户标识（企微 external userid / APP userId）。线索，不做唯一约束：
+    # 同一人可以从两个渠道进来，那正是要靠画像合并而不是分裂成两行的场景
+    external_ref: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    display_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+
+    # standard / vip / blacklist 之类。自由文本，档位清单是运营的事
+    tier: Mapped[str] = mapped_column(String(20), default="standard", nullable=False)
+    lifetime_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), default=Decimal("0"), nullable=False
+    )
+    # json 数组：投诉史、法律函件、多次退款等标记。风险分级要读它，所以单独成列
+    # 而不是埋进 profile——后者是给模型看的散文
+    risk_flags: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 长期用户画像（偏好、历史问题、沟通注意点），json 对象
+    profile: Mapped[str | None] = mapped_column(Text, nullable=True)
+    profile_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class CsOrder(Base):
+    """订单头。地址直接放在订单上而不是另立一张表：本系统里地址是**订单的快照**
+    （发货之后就固定了），"改地址"改的是这张还没发货的订单的快照，不是客户的通讯录。
+
+    ``refunded_amount`` 单独一列是退款幂等的第二道保险：即便某个重复请求带着新的
+    幂等键绕过了 ``cs_operations`` 的唯一约束，"累计退款 > 可退金额"这条校验
+    仍然会挡住超额。
+    """
+
+    __tablename__ = "cs_orders"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "order_no", name="uq_cs_orders_ws_orderno"),
+        Index("ix_cs_orders_customer", "customer_id"),
+        Index("ix_cs_orders_ws_created", "workspace_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    workspace_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    customer_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # 客户口中报出来的那个号。工具按它查，所以它必须在工作区内唯一
+    order_no: Mapped[str] = mapped_column(String(40), nullable=False)
+    # pending_payment / paid / packed / shipped / delivered / cancelled /
+    # refunding / refunded
+    status: Mapped[str] = mapped_column(String(20), default="paid", nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), default="CNY", nullable=False)
+    total_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), default=Decimal("0"), nullable=False
+    )
+    refunded_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), default=Decimal("0"), nullable=False
+    )
+
+    # 收货信息。改地址写的就是这三列
+    receiver_name: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    receiver_phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    address_text: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # 商品与库存扣减是"下单"那一刻的既成事实，之后的取消只改状态不改数量，
+    # 所以这里记快照而不引库存表
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class CsOrderItem(Base):
+    """订单行。实体抽取里"商品"这一项要有东西可对，退款也要能按行退。"""
+
+    __tablename__ = "cs_order_items"
+    __table_args__ = (Index("ix_cs_order_items_order", "order_id"),)
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    order_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    sku: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    quantity: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    unit_price: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), default=Decimal("0"), nullable=False
+    )
+    # 行级状态可与订单头不同（部分发货）。NULL = 跟随订单头
+    line_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class CsShipment(Base):
+    """物流。查物流是低风险高频操作，所以它的轨迹量最大，值得单独一张表。"""
+
+    __tablename__ = "cs_shipments"
+    __table_args__ = (
+        Index("ix_cs_shipments_order", "order_id"),
+        Index("ix_cs_shipments_tracking", "tracking_no"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    order_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    carrier: Mapped[str] = mapped_column(String(40), nullable=False)
+    tracking_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    # pending / in_transit / out_for_delivery / delivered / exception / returned
+    status: Mapped[str] = mapped_column(String(20), default="in_transit", nullable=False)
+    # 最后一条轨迹描述。真实系统里是一长串节点，这里留最后一条 + 时间够用
+    last_event: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    last_event_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class CsRefund(Base):
+    """退款申请单。资金类操作，全程要能被审计出来。
+
+    ``idempotency_key`` 上压了工作区内唯一约束——幂等在这里是**数据库事实**而不是
+    应用约定。模型重试、进程崩溃后恢复、用户重复点击，走的都是同一个键，撞了唯一
+    约束就返回首次结果，而不是再退一笔。这一条是文档里"每个写操作必须带幂等键"
+    唯一的硬保证。
+
+    这张表**只记状态，不动钱**。真实部署里 ``executed`` 由支付网关回调写入；
+    这里由工具写，评估集断言的是"该不该执行、金额对不对"。
+    """
+
+    __tablename__ = "cs_refunds"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "idempotency_key", name="uq_cs_refunds_ws_idem"),
+        Index("ix_cs_refunds_order", "order_id"),
+        Index("ix_cs_refunds_customer", "customer_id"),
+        # 当日退款额聚合：按 (workspace, status, created_at) 扫
+        Index("ix_cs_refunds_ws_status_created", "workspace_id", "status", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    workspace_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    order_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    customer_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # 是哪张工单要退的。线索，非外键
+    ticket_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), default="CNY", nullable=False)
+    # requested / awaiting_approval / approved / executed / rejected / failed
+    status: Mapped[str] = mapped_column(String(20), default="requested", nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
+    idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    requested_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # 人审痕迹：谁批的、批的还是改过的。这张表是业务侧的台账——"这笔退款谁批准的"
+    # 必须能在删掉工单、清掉轨迹之后仍然回答
+    approved_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    executed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class CsInvoice(Base):
+    """发票申请。低风险写操作的代表（文档 Phase 2），所以它要有自己的表，
+    而不是和退款挤在一起——两者的权限档位完全不同。"""
+
+    __tablename__ = "cs_invoices"
+    __table_args__ = (
+        Index("ix_cs_invoices_order", "order_id"),
+        Index("ix_cs_invoices_ws_status", "workspace_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    workspace_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    order_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    customer_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    ticket_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    # 发票抬头与税号。税号可空：个人抬头的发票就没有它
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    tax_no: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # requested / issued / rejected。issued 由财务系统回填，本仓库的工具只到 requested
+    status: Mapped[str] = mapped_column(String(16), default="requested", nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class CsOperation(Base):
+    """业务系统写操作的账本：幂等的落点、限额的聚合源、审计的原始材料。
+
+    这张表回答三个各自都需要独立答案的问题：
+      - **做过没有**（幂等）：``idempotency_key`` 上有唯一约束，撞了就返回首次结果，
+        状态记成 ``replayed`` 而不是再执行一遍。工具层的幂等检查之所以能跨进程、
+        跨重启，靠的是这行记录，不是内存字典。
+      - **今天用了多少**（预算）：``amount`` 按自然日聚合就是当日退款额度。
+      - **是谁、按什么参数做的**（审计）：digest + preview 与 ``AuditLog`` 同一套
+        摘要策略，但这里是业务视角（工具名 + 目标 + 结果），``AuditLog`` 是防篡改链。
+
+    ``status`` 里 ``blocked`` 是治理拦截（限额、暂停、权限不足），``pending_approval``
+    是人审挂起——两者都必须留痕，否则"Agent 想退但被拦了"和"Agent 压根没提"在
+    复盘时看不出来，而这两个恰恰是不同的故障。
+    """
+
+    __tablename__ = "cs_operations"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "idempotency_key", name="uq_cs_operations_ws_idem"),
+        Index("ix_cs_operations_ticket", "ticket_id"),
+        Index("ix_cs_operations_ws_created", "workspace_id", "created_at"),
+        # 当日资金额度聚合
+        Index("ix_cs_operations_ws_kind_time", "workspace_id", "permission", "created_at"),
+        # 错误操作率的聚合：窗口内已复盘的执行操作里有多少被判 wrong
+        Index("ix_cs_operations_ws_verdict", "workspace_id", "verdict", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    workspace_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    ticket_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+    tool_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    # order.update_address / refund.create / order.cancel / invoice.request …
+    operation: Mapped[str] = mapped_column(String(40), nullable=False)
+    # read / mutate / fund —— 权限档位记在账上，事后才能证明"这一笔当时是高权限"
+    permission: Mapped[str] = mapped_column(String(8), nullable=False)
+
+    idempotency_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    args_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    args_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # executed / replayed / blocked / failed / pending_approval
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    blocked_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+    # 资金类操作的金额，用于当日额度聚合。非资金类为 NULL（不是 0——0 会被算进额度）
+    amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    actor: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # ---- 人工复盘：这一笔到底办对没有 ----
+    #
+    # 文档把"错误操作率（尤其是退款、改订单）"列为核心指标，而它的定义是
+    # **"执行了，但不该执行"**——这个数没法从系统内部算出来。运行时的每一道检查
+    # 只能证明"这一笔通过了当时的权限档位、阈值、余额与幂等"；"当时就不该退"
+    # 是人对业务后果的判断。没有下面这几列，能给的只有被拒率和被拦率这两个代理值
+    # ——``/tickets/metrics`` 里那个 ``rejectedAttemptRate`` 之所以不敢叫错误操作率，
+    # 就是这个原因。
+    #
+    # 只有真的执行过的才值得复盘：给一次被拦下的操作打"错了"会污染分母，
+    # 让率值忽高忽低却什么都没说。
+    reviewed_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # ok / wrong。NULL = 还没人看过。不用枚举类型，同本文件开头那条约定
+    verdict: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    corrected_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 判成 wrong 之后人实际怎么补救的（refunded_less / contacted_customer …）。
+    # 档位是自由文本：补救动作的清单归运营，而这一列存在的理由是
+    # "错了之后做了什么"比"错了"本身更能指导下一步该收紧哪条阈值。
+    corrected_action: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    review_note: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class TicketOutbox(Base):
+    """要发给客户的东西：回话、邀评。持久化的发送队列。
+
+    为什么必须有这张表而不是在办结那一刻直接发：文档§2 的闭环是"生成回复 →
+    更新 CRM → 关闭工单"，而现在它实际是"生成回复 → 写进库"。中间那一步需要
+    一个能失败、能重试、能被看见的地方。直接发会带来两个具体的坏结果——
+
+    1. 发送失败就没人再发。工单已经标成 resolved 了，客户却从来没收到过回话，
+       而所有指标都显示这一单办得又快又好。
+    2. 一次外发失败会把已经办完的工单整个回滚，那件事的后果比"晚一点再发"重得多。
+
+    所以状态在库里，发送是幂等的重试（形态照搬 ``document_jobs`` 的
+    lease/reaper：认领时自增 attempts、租约过期会被别人捡走）。
+
+    ``suppressed`` 是一个**必须有人明确选择**的状态（渠道没接通、客户拒收），
+    不是"发不出去就标一下"的默认归宿——被抑制的消息不会自己再发出去，
+    写错这一状态就等于替客户决定了"不用回他"。
+
+    没有接通道时 ``deliver`` 什么都不做、也不改状态：那些行留在 pending 里，
+    是"欠客户一个回复"的可见证据。把 pending 悄悄变成 sent 是这一层最坏的一种
+    撒谎，所以宁可队列长。
+    """
+
+    __tablename__ = "ticket_outbox"
+    __table_args__ = (
+        # 认领扫描：按 (status, available_at) 取最老的待发送
+        Index("ix_ticket_outbox_status_available", "status", "available_at"),
+        Index("ix_ticket_outbox_ticket", "ticket_id"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    workspace_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    # 线索，非外键：工单被清理不该带走一条没发出去的话
+    ticket_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    # reply（给客户的回话）/ csat_invite（邀评）
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    # 回投到工单原来的渠道。发不出去的时候要知道"该走哪条路"
+    channel: Mapped[str] = mapped_column(String(20), nullable=False)
+    # 归一化之后的收件人（邮箱小写、电话只留数字）。NULL = 渠道没给可寻址的收件人
+    recipient: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # pending / sending / sent / failed / suppressed
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    # 最早可发送时刻（退避的载体）
+    available_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    error: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

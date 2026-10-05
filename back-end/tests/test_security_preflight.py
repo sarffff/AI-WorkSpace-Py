@@ -1,4 +1,4 @@
-"""security_preflight 的测试：audit_settings 纯函数 + enforce 的生产/dev 行为。
+"""security_preflight 的测试：audit_settings / audit_refund_limits 纯函数 + enforce 的环境行为。
 
 纯函数、不触库——用一个 SimpleNamespace 冒充 settings，各不安全值单独验。
 """
@@ -21,11 +21,27 @@ def _settings(**over):
         QDRANT_API_KEY="",
         QDRANT_URL="http://localhost:6333",
         ENV="dev",
+        # 默认不开 Agent：这样"干净配置"那条测的确实是默认状态
+        TICKET_AGENT_ENABLED=False,
+        TICKET_DAILY_REFUND_LIMIT=0,
     )
     base.update(over)
     ns = types.SimpleNamespace(**base)
     ns.is_production = ns.ENV == "production"
     return ns
+
+
+class _RecordingLogger:
+    """替 caplog 收 warning——这里要断言的是"告警文案里有没有那个配置名"。"""
+
+    def __init__(self) -> None:
+        self.warnings: list[str] = []
+
+    def warning(self, message, *args) -> None:
+        self.warnings.append(message % args if args else str(message))
+
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
 
 
 def test_clean_config_has_no_issues():
@@ -95,3 +111,43 @@ def test_enforce_raises_in_production_warns_in_dev():
         _settings(JWT_SECRET_KEY=placeholder, ENV="dev"),
         logger=logging.getLogger("t"),
     )
+
+
+# ========== 治理护栏：开着 Agent 却没有资金上限 ==========
+
+
+def test_agent_关掉时不要求退款上限():
+    """没有资金通道的时候，不设上限是正确配置而不是漏洞。"""
+    assert security_preflight.audit_refund_limits(_settings()) == []
+
+
+def test_开着_agent_却没有当日退款上限时报一条():
+    issues = security_preflight.audit_refund_limits(
+        _settings(TICKET_AGENT_ENABLED=True, TICKET_DAILY_REFUND_LIMIT=0)
+    )
+    assert len(issues) == 1
+    assert "TICKET_DAILY_REFUND_LIMIT" in issues[0]
+
+
+def test_上限为正数时通过():
+    assert security_preflight.audit_refund_limits(
+        _settings(TICKET_AGENT_ENABLED=True, TICKET_DAILY_REFUND_LIMIT=5000)
+    ) == []
+
+
+def test_enforce_在_dev_告警在生产拒绝():
+    """同一条缺护栏，两种环境两种处置——判据只写一遍。"""
+    logger = _RecordingLogger()
+    security_preflight.enforce(
+        _settings(ENV="dev", TICKET_AGENT_ENABLED=True, TICKET_DAILY_REFUND_LIMIT=0),
+        logger=logger,
+    )
+    assert any("TICKET_DAILY_REFUND_LIMIT" in m for m in logger.warnings)
+
+    with pytest.raises(RuntimeError, match="TICKET_DAILY_REFUND_LIMIT"):
+        security_preflight.enforce(
+            _settings(
+                ENV="production", TICKET_AGENT_ENABLED=True, TICKET_DAILY_REFUND_LIMIT=0
+            ),
+            logger=logging.getLogger("t"),
+        )

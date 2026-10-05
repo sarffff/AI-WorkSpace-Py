@@ -1,25 +1,35 @@
 # 离线评估
 
-回答一个之前无法回答的问题：**改了检索配置，到底变好了还是变坏了。**
+现在有两个评估面，各自回答一个问题：
 
-阶段二加了十几个开关（混合检索、邻域扩展、查询改写、重排、分块大小），
-但没有任何度量手段，等于凭感觉调参。这套 harness 就是那把尺子。
+| 面 | 回答的问题 | 是否花钱 |
+| --- | --- | --- |
+| `eval/ticket_guardrail.py` | **工单处置的护栏漏没漏**：该挂审的挂了吗、退款重复/超额了吗、幂等破了吗 | 不花钱（脚本化替身，只看落库事实） |
+| `eval/run.py` | 改了检索配置，政策库的召回**变好了还是变坏了** | 花钱（真实调用模型与 embedding） |
 
-## 快速开始
+CI 里应当跑前者：`python -m eval.ticket_guardrail --fail-on-breach`，它没有网络依赖，
+漏一次审批就非零退出。后者按窗口手工跑。
 
 ```bash
 cd back-end
-python -m eval.run --limit 5                    # 小样本试跑，先确认链路通
-python -m eval.run                              # baseline 跑全量
+python -m eval.ticket_guardrail --fail-on-breach    # 工单护栏门禁（离线、零成本）
+
+python -m eval.run --limit 5                        # 小样本试跑，先确认链路通
+python -m eval.run                                  # baseline 跑全量
 python -m eval.run --variants baseline,dense-only,rerank
-python -m eval.run --variants all                # 全部变体对照
+python -m eval.run --variants all                   # 全部变体对照
 ```
 
-报告写到 `eval/reports/`：`.md` 是对照表，`.json` 是逐题明细（含裁判理由与完整回答）。
+RAG 报告写到 `eval/reports/`：`.md` 是对照表，`.json` 是逐题明细（含裁判理由与完整回答）。
 
-会真实调用模型与 embedding 接口，**产生费用**。开销约为
+`eval.run` 会真实调用模型与 embedding 接口，**产生费用**。开销约为
 `问题数 × 变体数 × (1 次生成 + 1 次裁判)`，加上检索本身的 embedding 调用。
 先用 `--limit` 估算。
+
+> 本文后半部分有几节讲的是**对话工作台的 Agent 评估**（`run_agent.py` /
+> `agent_runner.py` / `datasets/agent_tasks.jsonl`）。那套模块已随通用对话能力一起
+> 删除，章节保留是为了让"当初为什么这么测、测出了什么"这件事有据可查；
+> 现在等价物是 `ticket_guardrail.py`，测法上的关键区别写在下一节。
 
 ## 组成
 
@@ -29,16 +39,14 @@ python -m eval.run --variants all                # 全部变体对照
 | `corpus_degrade.py` | 具名、确定性的语料降级（脏数据），见下面「清洗值多少」 |
 | `datasets/rag_golden.jsonl` | 30 条问答与来源标注 |
 | `metrics.py` | recall@k / precision@k / MRR / nDCG@k，纯函数零成本 |
-| `judge.py` | LLM-as-judge：`AnswerJudge` 评单轮 RAG，`TaskJudge` 评多轮 Agent 任务 |
+| `judge.py` | LLM-as-judge：`AnswerJudge` 评单轮 RAG，`TaskJudge` 评"依据工具实据的任务完成度"（裁判一致性校准要用后者） |
 | `variants.py` | RAG 配置变体定义 |
 | `runner.py` | RAG 链路的执行与汇总 |
 | `run.py` | RAG 评估 CLI 与报告渲染 |
-| `datasets/agent_tasks.jsonl` | 11 个多轮 Agent 任务（13 轮） |
-| `agent_metrics.py` | 工具召回/精度、轮次效率、重复调用，纯函数零成本 |
-| `agent_stubs.py` | 搜索通道替身与附件夹具 |
-| `agent_variants.py` | Agent 配置变体定义 |
-| `agent_runner.py` | 驱动真实 Agent 循环并汇总 |
-| `run_agent.py` | Agent 评估 CLI 与报告渲染 |
+| `gate.py` + `gate_thresholds.json` | 阈值化的回归判定，区分"模型变差"与"测量坏了" |
+| `calibration.py` | 裁判一致性：同一批答案换裁判会不会给出不同结论 |
+| `datasets/ticket_guardrails.jsonl` | 11 张工单：该挂审的、该挡的、该幂等的、该拒答的 |
+| `ticket_guardrail.py` | 工单处置的护栏评估：在通道边界打桩，判据只取落库事实 |
 | `../prompts/eval_rag_answer/` | 回答提示词的各个版本（提示词也是被扫的维度之一） |
 
 语料是自造的，不含任何真实数据，因此可以提交进仓库、结果可复现。

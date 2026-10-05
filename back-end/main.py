@@ -16,41 +16,31 @@ from rate_limit import limiter
 
 from config import settings
 from database import init_db, SessionLocal
-from models import Prompt
 from redis_service import redis_service
 from routers import (
-    chat_router,
     knowledge_router,
     auth_router,
-    prompt_router,
-    settings_router,
     attachment_router,
     metrics_router,
-    feedback_router,
-    memory_router,
-    workspace_router,
-    fs_router,
-    skill_router,
-    review_router,
-    audit_router,
     notification_router,
+    audit_router,
+    workspace_router,
+    skill_router,
+    ticket_router,
 )
-from services import approval
-from services import security_preflight
 from services import prompt_library
+from services import security_preflight
 from services import skill_library
 from services import ingest_clean
 from services import retriever
-from services import subagent
 from services import vector_store
-from services import workspace_tools
 from services.rerank import rerank_client
 
 logger = logging.getLogger("main")
 
 app = FastAPI(
-    title="AI Workspace API",
-    description="AI 助手桌面应用的后端 API",
+    title="Customer Service Ticket Agent API",
+    description="客服工单解决 Agent 的后端 API：接入、编排、治理、审计、指标",
     version="1.0.0",
     # 生产环境关闭文档接口
     docs_url=None if settings.is_production else "/docs",
@@ -86,20 +76,14 @@ app.add_middleware(
 
 # 注册路由
 app.include_router(auth_router.router)
-app.include_router(chat_router.router)
+app.include_router(ticket_router.router)
 app.include_router(knowledge_router.router)
-app.include_router(prompt_router.router)
-app.include_router(settings_router.router)
+app.include_router(skill_router.router)
 app.include_router(attachment_router.router)
 app.include_router(metrics_router.router)
-app.include_router(feedback_router.router)
-app.include_router(memory_router.router)
-app.include_router(workspace_router.router)
-app.include_router(fs_router.router)
-app.include_router(skill_router.router)
-app.include_router(review_router.router)
-app.include_router(audit_router.router)
 app.include_router(notification_router.router)
+app.include_router(audit_router.router)
+app.include_router(workspace_router.router)
 
 # 静态文件服务：附件上传后的访问入口
 os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
@@ -114,7 +98,7 @@ async def root():
     它回答的是"端口通不通";而"这个实例现在能不能干活"要真的去连数据库。
     """
     return {
-        "message": "AI Workspace API",
+        "message": "Customer Service Ticket Agent API",
         "version": "1.0.0",
         "status": "running",
         "health": "/health",
@@ -184,109 +168,6 @@ async def health(response: Response):
     }
 
 
-def _seed_prompts():
-    """首次启动时写入内置提示词模板（若表中无数据）"""
-    db = SessionLocal()
-    try:
-        if db.query(Prompt).count() == 0:
-            seeds = [
-                Prompt(
-                    title="代码重构专家",
-                    description="审查代码的性能、可读性与 TypeScript 最佳实践，并给出具体重构建议。",
-                    category="Engineering",
-                    content="你是一名资深的代码重构专家，精通 TypeScript/React/Python。请审查以下代码，从性能、可读性、类型安全、可维护性四个维度给出改进建议，并给出重构后的代码示例。\n\n用户输入：{input}",
-                    is_public=True,
-                ),
-                Prompt(
-                    title="架构设计规划师",
-                    description="设计可扩展的 monorepo 工作区与后端架构。",
-                    category="Architecture",
-                    content="你是一名系统架构师，擅长 monorepo（pnpm workspaces / Turborepo）与 NestJS/FastAPI 后端。请基于以下需求，给出模块划分、依赖关系、目录结构与关键接口设计。\n\n需求：{input}",
-                    is_public=True,
-                ),
-                Prompt(
-                    title="SQL 查询优化器",
-                    description="优化慢 SQL 查询并设计高效的 Prisma / SQLAlchemy 关系。",
-                    category="Database",
-                    content="你是数据库性能优化专家。请分析以下 SQL/ORM 查询，指出索引、连接、N+1 等问题，给出优化后的查询和必要的索引建议。\n\n查询：{input}",
-                    is_public=True,
-                ),
-                Prompt(
-                    title="技术文档撰写助手",
-                    description="把零散笔记整理为结构清晰的 API / 产品文档。",
-                    category="Writing",
-                    content="你是一名技术文档工程师。请把以下零散笔记整理成结构清晰的文档，包含概述、接口表、参数说明和示例。\n\n笔记：{input}",
-                    is_public=True,
-                ),
-            ]
-            db.add_all(seeds)
-            db.commit()
-            print(f"Seeded {len(seeds)} built-in prompts.")
-    finally:
-        db.close()
-
-
-def _check_prompt_matches_config() -> None:
-    """校验系统提示词版本与运行时配置是否匹配。
-
-    此前这件事只写在模板的 notes 里（"开启委派时必须切到这一版"）和一条启动
-    警告里。两者都拦不住任何人：配置和提示词不一致时程序照跑，表现是模型能从
-    schema 看到 delegate、却不知道任务描述必须自包含，于是把简单问题也派出去，
-    看起来像"多代理没用"——一个配置错误伪装成了功能缺陷。
-
-    委派错配直接拒绝启动，因为它不是"次优"而是"错"：supervisor 模式下用
-    augment 的提示词，主代理会按"我自己能查知识库"去规划，然后发现没有那个
-    工具。workspace 工具错配只警告——那时工具本身可用，模型只是少了几条策略，
-    而且 eval 的 prompt-v2 变体故意要跑这个组合来量化 v4 的价值。
-    """
-    # 走 resolve_version 而不是直接读 settings。取到的模板本来就是对的（get()
-    # 内部也会 resolve，空串会照样落到契约默认版本），问题在下面那几条报错和
-    # 警告里的 {version}：配置项留空时——现在的默认状态——它们会印成
-    # "PROMPT_CHAT_SYSTEM_VERSION=" 后面什么都没有，而这几条消息的全部作用
-    # 就是告诉人"你现在用的是哪一版、该换成哪一版"。
-    version = prompt_library.resolve_version("chat_system_rag")
-    template = prompt_library.get("chat_system_rag", version)
-    mode = settings.AGENT_DELEGATION_MODE
-
-    if mode in ("augment", "supervisor"):
-        required = ("delegation", "supervisor") if mode == "supervisor" else ("delegation",)
-        if not template.expects_all(*required):
-            raise RuntimeError(
-                f"AGENT_DELEGATION_MODE={mode} 与 PROMPT_CHAT_SYSTEM_VERSION="
-                f"{version} 不匹配：该版本没有声明 expects: {', '.join(required)}，"
-                "也就是没有讲这种模式下该怎么委派。请改用 "
-                f"{'v6-supervisor' if mode == 'supervisor' else 'v5-augment'}，"
-                "或把 AGENT_DELEGATION_MODE 设回 off。"
-            )
-        # supervisor 的提示词讲的是"你没有检索工具，必须委派"，在 augment 模式下
-        # 这是假的——那时主代理手上有全部工具，照它规划会白绕一圈。
-        if mode == "augment" and "supervisor" in template.expects:
-            raise RuntimeError(
-                f"AGENT_DELEGATION_MODE=augment 但 PROMPT_CHAT_SYSTEM_VERSION="
-                f"{version} 是为 supervisor 模式写的（它告诉模型自己没有检索、"
-                "计算等工具，而 augment 模式下主代理保留全部工具）。"
-                "请改用 v5-augment，或把模式设为 supervisor。"
-            )
-
-    elif "delegation" in template.expects:
-        # 反向错配：提示词讲的是怎么委派，但 delegate 根本没注册。模型会按
-        # "我可以派人"去规划；v6 更进一步，它还告诉模型自己没有检索工具——
-        # 那在单代理模式下是假的。提示词承诺了一个不存在的工具，同一类错误。
-        raise RuntimeError(
-            f"PROMPT_CHAT_SYSTEM_VERSION={version} 是为委派模式写的"
-            f"（expects: {', '.join(template.expects)}），但 AGENT_DELEGATION_MODE=off"
-            " 时 delegate 不会注册。请把模式设为 augment/supervisor，"
-            "或改用不讲委派的版本（v2 / v3-lean / v4-workspace）。"
-        )
-
-    if workspace_tools.enabled_names() and "workspace-tools" not in template.expects:
-        print(
-            f"  警告：已启用 workspace 工具，但 chat_system_rag/{version} "
-            "没有讲它们的使用策略（expects 里没有 workspace-tools）。"
-            "模型只能从 schema 看到工具名，建议切到 v4-workspace 或更高版本。"
-        )
-
-
 def _check_ingest_backend() -> None:
     """校验 PDF 结构恢复的依赖装上了。
 
@@ -298,7 +179,6 @@ def _check_ingest_backend() -> None:
     这正是把它定成必需依赖而不是可选降级的理由；只做成一条警告等于把那个决定
     又变回可选。
     """
-    _check_ocr_config()
     if not settings.INGEST_PDF_STRUCTURE:
         return
     if not ingest_clean.structure_backend_available():
@@ -308,31 +188,6 @@ def _check_ingest_backend() -> None:
             "而文档状态仍是 indexed——这种失败查不出来。"
             "请 pip install -r requirements.txt，或把 INGEST_PDF_STRUCTURE 设为 false。"
         )
-
-
-def _check_ocr_config() -> None:
-    """OCR 是默认关的可选项，所以这里**只警告不拒绝启动**（与 pdfplumber 不同）。
-
-    但半配置必须吼出来：开了 OCR 却没配模型 / 模型不在视觉白名单 / 渲染后端缺，
-    三种情况下扫描件都仍然进不了库，而界面上只表现为"传了没反应"。启动日志是
-    排查这类静默失效的第一现场——和审批开着但快照关着那条警告同一个道理。
-    """
-    if not settings.INGEST_OCR_ENABLED:
-        return
-    from services import ocr, vision
-
-    model = settings.INGEST_OCR_MODEL
-    if not model:
-        print("  ⚠ INGEST_OCR_ENABLED=true 但 INGEST_OCR_MODEL 未配置 —— 扫描件不会被 OCR。")
-    elif not vision.supports_vision(model):
-        print(
-            f"  ⚠ INGEST_OCR_MODEL={model} 不在 VISION_MODELS 白名单里 —— "
-            "给非视觉模型发图会换来 400，OCR 不会生效。"
-        )
-    elif not ocr.render_backend_available():
-        print("  ⚠ OCR 渲染后端（pdfplumber / Pillow）缺失 —— 扫描件无法渲染成图片。")
-    else:
-        print(f"OCR: 扫描件兜底已启用（模型 {model}，≤{settings.INGEST_OCR_MAX_PAGES} 页/篇）")
 
 
 def _check_multiworker_vector_store() -> None:
@@ -440,14 +295,82 @@ def _recover_stalled_documents() -> None:
         )
 
 
+def _describe_ticket_agent() -> None:
+    """把工单域的实际生效状态打出来，尤其是**挂起状态写在哪里**。
+
+    检查点路径配成一个临时目录时，症状不是报错，而是"批到一半的单子凭空消失了"
+    ——那是这条能力最难查的一种失效：进程活着一切正常，重启之后那张工单从没存在过。
+    """
+    if not settings.TICKET_AGENT_ENABLED:
+        print("Ticket agent: off（/tickets 只读可看，提交与执行返回 409）")
+        return
+    path = settings.TICKET_CHECKPOINT_DB
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        if not os.path.isdir(parent):
+            raise OSError(f"目录不存在：{parent}")
+        probe = os.path.join(parent, ".ticket_write_probe")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        os.remove(probe)
+    except OSError as exc:
+        print(
+            f"  ⚠ Ticket agent: 检查点不可写（{path}：{exc}）。"
+            "挂在人工审批上的工单会在重启之后消失。"
+        )
+        return
+    print(f"Ticket agent: on，检查点 {path}，渠道 {settings.TICKET_CHANNELS}")
+    # 治理数字必须打出来：限额配成 0（= 不限）时，症状不是报错而是"这张单子跑了
+    # 四十轮 / 这个月退款没有闸"。界面上看不见这两个开关，它们只在出事时可见。
+    print(
+        "Ticket limits: 单工单工具调用 "
+        + (
+            f"≤{settings.TICKET_MAX_TOOL_CALLS} 次"
+            if int(settings.TICKET_MAX_TOOL_CALLS or 0) > 0
+            else "不限"
+        )
+        + "，当日退款 "
+        + (
+            f"≤{settings.TICKET_DAILY_REFUND_LIMIT} 元"
+            if int(settings.TICKET_DAILY_REFUND_LIMIT or 0) > 0
+            else "不限（生产请设上限）"
+        )
+        + "，单工单成本 "
+        + (
+            f"≤{settings.TICKET_MAX_COST_PER_TICKET}"
+            if float(settings.TICKET_MAX_COST_PER_TICKET or 0) > 0
+            else "不限"
+        )
+        + f"，SLA {settings.TICKET_SLA_HOURS}h"
+    )
+
+    # 多 worker + 本地 sqlite 检查点 = 每个 worker 各开一条连接写同一个文件。
+    # 挂起本身还能工作（文件在那儿），但两个 worker 同时恢复同一条线程会互相覆盖，
+    # 症状是"点了同意，图又回到挂起前"。和向量库那条一样按 WEB_CONCURRENCY 给 hint：
+    # 这个 env 不是每种起法都设，误报只多一条告警，漏报由部署文档兜。
+    try:
+        workers = int(os.environ.get("WEB_CONCURRENCY", "1"))
+    except ValueError:
+        workers = 1
+    if workers > 1:
+        print(
+            f"  ⚠ WEB_CONCURRENCY={workers}（多 worker）而工单检查点是本地文件 —— "
+            "多个进程写同一个 sqlite 会让挂起的工单在被恢复时互相覆盖。"
+            "多实例部署请换成共享存储上的检查点后端的（Postgres saver）。"
+        )
+
+
 @app.on_event("startup")
 async def startup():
-    """应用启动时执行"""
-    # 交付前最该拦的事故：拿示例配置（占位密钥 / 示例库口令 / 无鉴权向量库）上生产。
-    # 生产有问题即拒绝启动，dev 只告警。放在最前——不安全就别再往下做任何事。
+    """启动自检：配置、模板、依赖、滞留数据，然后把**实际生效**的开关打出来。
+
+    交付前最该拦的事故有两类：拿示例配置（占位密钥 / 示例库口令 / 无鉴权向量库）
+    上生产，以及**开着 Agent 却没有治理护栏**。前者由 security_preflight 拒绝启动，
+    后者在下面的工单行里必须看得见——限额数字没打出来，"当日退款上限其实没配"这种
+    配置就会一直活到第一笔超额退款。
+    """
     security_preflight.enforce(settings, logger=logger)
     init_db()
-    _seed_prompts()
     # 提示词模板有问题（占位符对不上、条件段没闭合、默认版本已归档）就在这里
     # 起不来，而不是等第一个用户提问时才在 500 里暴露。
     prompt_library.validate()
@@ -459,30 +382,26 @@ async def startup():
     _check_multiworker_vector_store()
     _adopt_orphaned_documents()
     _recover_stalled_documents()
-    # 工具是按开关注册的，而"开关开了但没配 key 的 web_search 根本不注册"这类
-    # 静默行为在界面上只表现为"模型不用那个工具"——分不清是没注册还是模型不想用。
-    # 所以启动时把实际注册了哪些打出来，这是排查工具类问题的第一现场。
-    print(f"Workspace tools: {', '.join(workspace_tools.enabled_names()) or '(全部关闭)'}")
-    print(f"Vision models: {settings.VISION_MODELS or '(未启用，图片只会以链接形式留在提示词里)'}")
-    # 同样走 resolve_version：这一行是排查提示词问题的第一现场，打出来的必须是
+    _describe_ticket_agent()
+    # 走 resolve_version：这一行是排查提示词问题的第一现场，打出来的必须是
     # 真正生效的版本，而不是配置项的字面值（留空时那是空串）。
     print(
-        "Chat system prompt: chat_system_rag/"
-        f"{prompt_library.resolve_version('chat_system_rag')}"
+        "Ticket prompts: understand/"
+        + prompt_library.resolve_version("ticket_understand")
+        + f", agent/{prompt_library.resolve_version('ticket_agent')}"
+        + f", plan/{prompt_library.resolve_version('ticket_plan')}"
     )
-    print(f"Agent delegation: {subagent.describe_mode()}")
-    print(f"Agent approval: {approval.describe_mode()}")
-    # 审批模式开着但快照关着 = 审批静默失效。两个开关分开是对的(快照本身有用,
-    # 重放和 agent_runs 都靠它),但这个组合永远是配置错误,不该只能靠"点了同意
-    # 没反应"发现。
-    if settings.AGENT_APPROVAL_MODE != "off" and not settings.AGENT_CHECKPOINT_ENABLED:
-        print(
-            "  ⚠ AGENT_APPROVAL_MODE 已开启，但 AGENT_CHECKPOINT_ENABLED=false —— "
-            "审批要跨请求恢复，没有快照就无从恢复，因此当前不会生效。"
+    print(
+        "SOP skills: "
+        + (
+            f"{len(skill_library.builtin())} 份内置"
+            if skill_library.enabled()
+            else "off（模型看不到任何作业指导）"
         )
-    # 这三个都会改变循环行为或提示词正文,而它们的效果在界面上都看不见:
-    # 缓存命中只体现在账单上,重复拦截只体现在少跑一次工具。启动时打出来,
-    # 排查"为什么这次和上次不一样"时不用去翻 .env。
+    )
+    # 这几项都会改变循环行为，而它们的效果在界面上看不见：缓存命中只体现在账单上，
+    # 重复拦截只体现在少跑一次工具。启动时打出来，排查"为什么这次和上次不一样"
+    # 时不用去翻 .env。
     print(
         "Prompt cache: stable prefix "
         + ("on" if settings.PROMPT_CACHE_STABLE_PREFIX else "off（对照组）")
@@ -521,10 +440,7 @@ async def startup():
                 )
             )
         )
-    # 提示词与配置的匹配校验。必须在 prompt_library.validate() 之后——它要按
-    # 版本名取模板，版本不存在时应当由 validate 那边给出更清楚的报错。
-    _check_prompt_matches_config()
-    print(f"AI Workspace Server (Python) is running on: http://localhost:{settings.PORT}")
+    print(f"Ticket Agent API is running on: http://localhost:{settings.PORT}")
 
 
 def _print_rerank_mode() -> None:

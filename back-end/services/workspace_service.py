@@ -316,15 +316,6 @@ def remove_member(db: Session, user: User, member_id: str) -> dict:
     member.role = ROLE_USER
     db.commit()
 
-    # 延迟导入,理由同 adopt_orphaned_documents:两个模块都 import 到 models,
-    # 顶层导入会绕成环。
-    from services.semantic_cache import semantic_cache
-
-    try:
-        semantic_cache.invalidate_user(workspace.id)
-    except Exception:  # noqa: BLE001 - 缓存清理失败不该让移除失败
-        logger.warning("移除成员后清理语义缓存失败", exc_info=True)
-
     return {"id": member_id, "name": label}
 
 
@@ -428,20 +419,16 @@ def adopt_orphaned_documents(db: Session) -> int:
         document.visibility = VISIBILITY_WORKSPACE
     db.commit()
 
-    # 索引与缓存必须跟着失效,否则收编只在数据库里生效:向量/BM25 索引按
-    # scope 的 chunk_id 签名判断新鲜度,而这些块此前**不在任何 scope 的签名里**
+    # 索引必须跟着失效,否则收编只在数据库里生效:向量/BM25 索引按 scope 的
+    # chunk_id 签名判断新鲜度,而这些块此前**不在任何 scope 的签名里**
     # (谁都检索不到),所以签名对每个受影响的工作区都变了,不主动清就要等下一次
-    # 别的写操作碰巧把它清掉。语义缓存同理:收编前问过的问题不含这些内容。
-    # 延迟导入:retrieval_index 与 semantic_cache 都会 import 到 models,
-    # 顶层导入会绕成环。这个函数一次启动只调一遍,导入开销无所谓。
+    # 别的写操作碰巧把它清掉。
+    # 延迟导入:retrieval_index 会 import 到 models,顶层导入会绕成环。
+    # 这个函数一次启动只调一遍,导入开销无所谓。
     from services.retrieval_index import invalidate_scope_indexes
-    from services.semantic_cache import semantic_cache
 
     for workspace_id in {d.workspace_id for d in orphans if d.workspace_id}:
         invalidate_scope_indexes(workspace_id)
-        # invalidate_user 这个名字有历史误导:它做的是按 scope 前缀清桶,
-        # 而所有调用点传进去的都是 workspace_id(见 knowledge_service 那四处)。
-        semantic_cache.invalidate_user(workspace_id)
     return len(orphans)
 
 

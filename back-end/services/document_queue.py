@@ -167,7 +167,7 @@ def reap_expired_leases(db: Session, limit: int = 100) -> int:
 
     attempts 不在这里加——它在认领时就加过了，所以一个每次都把进程拖垮的任务，
     被回收几次就会撞到 max_attempts 落 failed，而不是无限复活。惰性挂在知识库读
-    路径与启动（同 expire_stale_runs 的做法）。
+    路径与启动（同 ticket_sla.reap_overdue 的做法）。
     """
     now = naive_now()
     try:

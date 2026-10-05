@@ -6,11 +6,10 @@
 
 普通成员能看（他们需要知道 agent 会按什么规程办事），不能改。
 
-## 为什么改完要清语义缓存
+## 改完不需要清任何东西
 
-改 SOP 的目的就是让之后的回答不一样。缓存不清的话同一个问题会继续返回按旧规程
-生成的答案，而用户刚刚才改过它——那是"改了没生效"的典型形状，且无从发现。
-和知识库变更走同一个入口（``semantic_cache.invalidate_user``）。
+SOP 正文在每个回合按名字从数据库/目录现取，没有跨回合的缓存副本，所以"改了没
+生效"这一类失效在这里结构性地不存在。
 """
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -20,7 +19,6 @@ from auth import get_current_user
 from database import get_db
 from models import User
 from services import skill_service, workspace_service
-from services.semantic_cache import semantic_cache
 from services.skill_library import SkillError
 
 router = APIRouter(prefix="/skills", tags=["作业指导"])
@@ -95,8 +93,6 @@ async def upsert_skill(
         )
     except SkillError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    # 改 SOP 的目的就是让之后的回答不一样。不清缓存的话同一个问题会继续按旧规程答。
-    semantic_cache.invalidate_user(current_user.id)
     return {
         "id": row.id,
         "name": row.name,
@@ -120,5 +116,4 @@ async def delete_skill(
         db, current_user.workspace_id or "", skill_id
     ):
         raise HTTPException(status_code=404, detail="该作业指导不存在")
-    semantic_cache.invalidate_user(current_user.id)
     return {"ok": True}

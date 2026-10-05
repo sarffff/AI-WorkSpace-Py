@@ -127,8 +127,7 @@ class NoopSpan:
 class Trace:
     trace_id: str
     user_id: str | None = None
-    chat_id: str | None = None
-    message_id: str | None = None
+    ticket_id: str | None = None
     spans: list[Span] = field(default_factory=list)
     # 作用域为整条 trace 的默认属性，会合并进之后创建的每个 span。
     # 类似 OTel 的 baggage：调用方不必把「第几轮」一层层传进适配器。
@@ -167,8 +166,7 @@ class Tracer:
         self,
         *,
         user_id: str | None = None,
-        chat_id: str | None = None,
-        message_id: str | None = None,
+        ticket_id: str | None = None,
     ) -> AsyncIterator[Trace | None]:
         """开启一次 trace，退出时把整棵树批量落库。"""
         if not self.enabled:
@@ -178,8 +176,7 @@ class Tracer:
         trace = Trace(
             trace_id=uuid.uuid4().hex,
             user_id=user_id,
-            chat_id=chat_id,
-            message_id=message_id,
+            ticket_id=ticket_id,
         )
         trace_token = _current_trace.set(trace)
         span_token = _current_span.set(None)
@@ -257,8 +254,7 @@ def _persist(trace: Trace) -> None:
                     name=span.name,
                     kind=span.kind.value,
                     user_id=trace.user_id,
-                    chat_id=trace.chat_id,
-                    message_id=trace.message_id,
+                    ticket_id=trace.ticket_id,
                     started_at=span.started_at.replace(tzinfo=None),
                     duration_ms=span.duration_ms,
                     status=span.status,

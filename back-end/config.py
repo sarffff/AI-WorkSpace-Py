@@ -87,39 +87,7 @@ class Settings(BaseSettings):
     EMBEDDING_BATCH_SIZE: int = 32
     RAG_MIN_SCORE: float = 0.3
     RAG_TOP_K: int = 5
-    # 开启时在模型首轮之前先做一次检索并注入结果(可靠但每轮固定消耗一次检索);
-    # 关闭则为纯 agentic RAG,完全由模型自主决定何时、以什么查询检索。
-    RAG_PREFETCH: bool = True
-    # 预检索前先把本轮问题结合近期历史改写成自包含问题(指代消解)。
-    # "那它的赔偿标准呢?"这类省略式追问,拿原文去检索会结构性召回漂移;
-    # 而系统提示词又告诉模型"预检索过了,够用就直接答",等于把弱检索的结果
-    # 包装成"已查过"。仅在存在历史消息时才发起,首轮不额外花钱。
-    RAG_CONDENSE_QUERY: bool = True
 
-    # ========== Agent 循环配置 ==========
-    # 单次回答中允许的最大模型轮次。最后一轮不再提供工具,强制模型给出最终回答,
-    # 因此实际可用的工具轮次为 AGENT_MAX_TOOL_ROUNDS - 1。
-    # 2026-09-05: 6 → 10。打开文件工具之后 6 是硬天花板:一次最小的改文件任务
-    # (search_files 定位 → read_file 看当前内容 → edit_file 改 → read_file 复核)
-    # 就用掉 4 个可用工具轮(末轮不下发 schema,所以可用轮是 max-1),而 edit_file
-    # 因 old_text 对不上失败一次就没有余量了——那是最常见的失败,不是边缘情况。
-    #
-    # 提上限必须和预算回收一起做(见 chat_service._compact_stale_tool_results):
-    # 预算原来只减不增,光提轮次的话多出来的四轮没有字符可花,等于白给。
-    AGENT_MAX_TOOL_ROUNDS: int = 10
-    # 单个工具结果注入上下文的字符上限
-    TOOL_RESULT_MAX_CHARS: int = 4000
-    # 一次回答中所有工具结果的总字符预算,防止多轮累积撑爆上下文窗口。
-    #
-    # 2026-09-05: 12000 → 20000。这个数原本是按 6 轮定的通用护栏,轮次提到 10 之后
-    # 它成了新的瓶颈:实测一个九轮的文件任务(列目录 ×2 → 搜索 → 读 ×2 → 改 → 读
-    # → 搜索 → 读)在第 9 轮恰好把 12000 用尽,而 read_file 那几次每次 2920 字、
-    # 合计就占掉 11680——文件正文是刻意不回收的(它是模型推理的依据本身,
-    # 见 _compact_stale_tool_results)。
-    #
-    # 20000 字符 ≈ 7000-10000 token(中文 2-3 字/token),相对 HISTORY_TOKEN_BUDGET
-    # 的 4000 token 是同一量级,离常见的 128k 上下文窗口还很远。
-    TOOL_RESULT_TOTAL_CHARS: int = 20000
     # 同一个 (工具, 参数) 在一次回答里最多执行几次,第 N 次起不再执行,改为回灌
     # 一句纠正说明。轮次上限和字符预算都管不到这件事:重复调用每次都是合法调用、
     # 都在预算内,只是拿回来的东西一模一样。0 表示关闭检测(退回改动前的行为)。
@@ -139,224 +107,23 @@ class Settings(BaseSettings):
     # 完整的子代理循环),成本与延迟都随之上升。开之前应该先在 traces 里看清
     # 单代理模式下究竟是哪一步不够用。
     AGENT_DELEGATION_MODE: str = "off"
-    # 一次回答里最多委派几次。没有这个上限时主代理可以每一轮都派一次人,
-    # 而每一次都是一个完整的嵌套循环——AGENT_MAX_TOOL_ROUNDS 管不到它。
-    AGENT_MAX_DELEGATIONS: int = 3
 
-    # ========== 显式规划(plan-and-execute) ==========
-    # off          : 纯 ReAct,与加这个功能之前逐位相同(默认)
-    # plan_execute : 进循环之前先让辅助模型把问题拆成有序步骤,计划作为一条
-    #                指引注入,然后照常跑现在这个执行循环
-    #
-    # 为什么不换掉现在的循环:ReAct 的"边走边看"在工具结果不确定时是优势——
-    # 检索空了就换查询,这件事计划里写不出来。plan_execute 加的是**事前的全局
-    # 视野**,它该压住的是"一次只想一步、于是绕路"。两者不是替代关系,所以这里
-    # 是在同一个执行循环前面加一段,而不是另开一条代码路径。
-    #
-    # 已知失效模式写在提示词里(prompts/agent_plan/):给简单问题硬凑几步。所以
-    # 空计划是合法输出,而 planAdherence 这个指标专门盯"计划了却没照做"。
-    #
-    # 收益无法先验断定,只能量:规划本身是一次额外的辅助模型调用,而这个仓库里
-    # 已经有一半的"增强"被证明零收益甚至没执行过。所以 eval 里有 plan-execute
-    # 变体,和 delegation-* 一样,先量再说。
-    AGENT_PLAN_MODE: str = "off"
     # 计划最多几步。上限是**校验**不是截断:多出来的步骤砍掉等于把"模型没照
     # max_steps 做"翻译成"计划就这么长"(见 structured.Plan)。
     AGENT_PLAN_MAX_STEPS: int = 5
-    # 规划那次调用的输出预算。默认给到 2048 而不是"够输出五行 JSON 就行"——
-    # 本仓库 2026-08-22 实测七个辅助调用点有五个因为按输出长度定预算而 100%
-    # 返回空串(推理模型先花预算思考)。这里从第一天就按思考开销定,
-    # 而不是等它静默失效一次。判据见 scripts/probe_structured_budgets.py。
-    AGENT_PLAN_MAX_TOKENS: int = 2048
 
-    # ========== 状态快照与中断恢复 ==========
-    # 关掉即退回"一个回合的状态只活在 SSE 生成器的局部变量里":连接一断就没了,
-    # 也就没有人工审批(它要跨请求)、没有重放、没有 agent_runs 记录。
-    #
-    # 打开的代价是实打实的:每轮工具执行前写一份快照,而快照就是整个 messages
-    # 列表。六轮下来几十 KB,所以有 AGENT_CHECKPOINT_KEEP 兜着。
-    AGENT_CHECKPOINT_ENABLED: bool = False
-    # 每个 run 保留最近几份快照,0 表示不清理。留多份是为了重放("回到第 3 轮
-    # 再跑一次"),只留最新一份的话恢复就只有"继续"一个方向。
-    AGENT_CHECKPOINT_KEEP: int = 8
-    # 等待审批的执行多久算废弃(小时)。超时的 run 不会自动执行也不会自动拒绝,
-    # 只是从"待审批"列表里消失——自动裁决比一直挂着更危险。
-    AGENT_APPROVAL_TIMEOUT_HOURS: int = 24
 
-    # ========== 人工审批 ==========
-    # off    : 不审批(默认)。破坏性操作仍受确认令牌约束(见 workspace_tools)
-    # write  : 写操作要人点一下同意(save_to_knowledge_base / delete_knowledge_document)
-    # listed : 完全由 AGENT_APPROVAL_TOOLS 决定,一个都不隐含
-    #
-    # 依赖 AGENT_CHECKPOINT_ENABLED:审批要等用户在**另一个请求**里点同意,
-    # 没有快照就没有东西可恢复。两个都开才生效。
-    AGENT_APPROVAL_MODE: str = "off"
-    # listed 模式下的工具名,逗号分隔。给 web_search 加审批能立刻看出
-    # "每一步都要点同意"的体验代价——这件事讲道理讲不清,试一次就清楚了。
-    AGENT_APPROVAL_TOOLS: str = ""
 
-    # ========== 工具轨迹（跨回合记忆） ==========
-    # 回合内工具结果是靠 messages 回灌的,回合结束那个列表就没了,落库的只有
-    # 最终回答。开启后把每步工具执行存进 message_tool_steps,下一回合按预算
-    # 回灌成一段记录,模型才知道自己上一回合读过什么。
-    # 关掉即退回"每个回合从零开始",可作为对照。
-    TOOL_HISTORY_ENABLED: bool = True
-    # 回灌的 token 预算,超出的部分从最旧的步骤开始丢
-    TOOL_HISTORY_TOKEN_BUDGET: int = 600
-    # 单步摘要的字符上限。给得太小就只剩工具名,给得太大不如让模型重新调一次工具
-    TOOL_HISTORY_STEP_CHARS: int = 240
-    # 每回合从数据库取回多少条备选步骤,再由 token 预算决定留几条
-    TOOL_HISTORY_FETCH_LIMIT: int = 20
-    # 单步结果落库的字符上限。存的是原始正文,不是摘要
-    TOOL_HISTORY_STORE_MAX_CHARS: int = 4000
 
-    # ========== Workspace 工具 ==========
-    # 知识库那三个工具由界面上的「知识库」开关(use_rag)控制,这里几个各自独立:
-    # 查网页、算数、读附件都不需要知识库,绑在同一个开关上等于关掉知识库就没了
-    # 计算器。默认全部关闭——打开一个工具就是把它的失败模式和攻击面一起打开。
-    #
-    # 打开之后建议把 PROMPT_CHAT_SYSTEM_VERSION 切到 v4-workspace:默认的 v2
-    # 只讲了知识库那三个工具,新工具全靠 schema 里的 description 自己撑着。
-    TOOL_CALCULATE_ENABLED: bool = False
-    TOOL_READ_ATTACHMENT_ENABLED: bool = False
-    TOOL_WEB_SEARCH_ENABLED: bool = False
-    # 唯一的写操作。默认关闭不是保守:内容可能是模型转述的网页,写进知识库就等于
-    # 让注入内容获得持久化,并在之后每一轮 RAG 里被复用。
-    TOOL_WRITE_KNOWLEDGE_ENABLED: bool = False
-    AGENT_WRITE_MAX_CHARS: int = 20000
 
-    # 读附件:单个文件的字节上限与注入上下文的字符上限
-    ATTACHMENT_READ_MAX_BYTES: int = 5 * 1024 * 1024
-    ATTACHMENT_READ_MAX_CHARS: int = 8000
 
-    # web 搜索。provider 为空或缺 API key 时这个工具**根本不注册**
-    WEB_SEARCH_PROVIDER: str = ""  # tavily | serper
-    WEB_SEARCH_API_KEY: str = ""
     # 留空则用提供商默认端点;填了可指向自建代理或区域端点
     WEB_SEARCH_BASE_URL: str = ""
-    WEB_SEARCH_RESULTS: int = 5
-    WEB_SEARCH_SNIPPET_CHARS: int = 300
-    WEB_SEARCH_TIMEOUT_SECONDS: float = 10.0
 
-    # ========== 工具调用外围约束 ==========
-    # 单个工具在一次回答里连续失败（参数错误或通道故障）多少次后，从本轮 schema
-    # 里移除，之后模型再调它只会得到一句"已熔断"。0 表示关闭。
-    #
-    # 连续而不是累计：偶尔一次参数写错很常见，熔断针对的是"同一个工具反复失败"——
-    # 那才是幻觉或通道故障的信号，继续让它试只会把剩下的轮次烧光。而它的处置是
-    # **移除 schema** 而不是拒绝执行：模型根本看不到这个工具，就不会再发起调用，
-    # 比"每轮都试一次、每次都拿回一句拒绝"更省轮次，也更好观测。
-    TOOL_CIRCUIT_BREAKER_FAILURES: int = 2
-    # 删除知识库文档。破坏性写操作，默认关闭；打开后还要求用户在对话里明确说过
-    # 要删（确认令牌，见 workspace_tools._ToolApprovals），缺一不执行。
-    TOOL_DELETE_KNOWLEDGE_ENABLED: bool = False
-    # 澄清工具：模型拿不准用户意图或关键参数缺失时，把问题抛回给用户，而不是
-    # 硬猜一个参数去调工具。代价是每个澄清问题要等用户回话，回合在此终止。
-    TOOL_ASK_USER_ENABLED: bool = False
-    # 把回答正文里那句问题**收编**成一次真的澄清中断。
-    #
-    # 为什么需要它：ask_user 那条链（挂起 → 快照 → /answer → 接着同一轮跑）从做完
-    # 起没有被走进去过一次。三次实测（2026-08-30/31，baseline 与 no-prefetch 两种
-    # 配置、改过一轮用例设计、补过一版专门讲策略的提示词 v7-clarify），
-    # clarificationAsked 始终是 0。模型不是不知道有这个工具（闸门内实测
-    # ask_user in enabled_names() 为 True），而是**认出了缺前提、也把问题问了出来，
-    # 但问在正文里**。往提示词里加更强的措辞是同一条死路，走过两次，第二次还把
-    # 任务成功从 3.0 压到 2.0。所以改由框架收编，而不是指望模型自愿选一个对它
-    # 更贵的交互形态。
-    #
-    # 收编换来的是：messages 连同**完整的工具结果**（每条上限
-    # TOOL_RESULT_MAX_CHARS，默认 4000 字）落进快照，答案回来接着这一轮跑。
-    # 不收编则退回轨迹回灌，那是压成 240 字/步、总预算 600 token 的摘要
-    # （见 tool_history.render_block），模型据摘要判断细节不够时会重新检索一次。
-    #
-    # 默认关闭，因为判据是启发式的（见 services/prose_question.py），而误判的代价
-    # 不对称：漏判只是退回今天的行为，误判会把一个已经答完的回合挂成 waiting_input，
-    # 用户看到一个莫名其妙的输入框。要打开它得先有 CHECKPOINT_ENABLED——没有快照
-    # 就没有"接着这一轮跑"，收编只会让回合白白终止一次。
-    CLARIFY_ADOPT_PROSE_QUESTION: bool = False
-    # 网页抓取：把模型给出的 URL 抓成纯文本再过护栏。和 web_search 的区别是
-    # 抓正文而不是看摘要，SSRF 面也因此更大，默认关闭。
-    TOOL_WEB_FETCH_ENABLED: bool = False
     # 单个页面允许读取的字节上限（超出即判失败）与注入上下文的字符上限
     WEB_FETCH_MAX_BYTES: int = 200 * 1024
-    WEB_FETCH_MAX_CHARS: int = 8000
     WEB_FETCH_TIMEOUT_SECONDS: float = 10.0
 
-    # ========== 本机文件系统工具 ==========
-    # 让 agent 在**用户授权过的本机文件夹**里列目录、读文件、按内容搜索,
-    # 以及(各自另有开关)写、改、删。
-    #
-    # 授权不在这里配:它是 per-user 的一张表(workspace_roots,迁移 0013),由用户在
-    # 界面上点系统对话框选目录。原因是这个后端的数据模型是多租户的(邀请码 +
-    # admin/member),而"读哪个文件夹"是本机行为——写死一个根目录的话,一旦这个
-    # 后端被部署给团队,所有成员读到的就是**服务器**的磁盘,不是自己的电脑。
-    #
-    # 所以主开关打开、但某个用户没授权任何目录时,这些工具对他**一个都不注册**。
-    #
-    # 全部安全性压在 fs_roots.resolve_within_roots 的路径沙箱上:路径是模型写的,
-    # 而模型可能在复述它刚读到的文件或网页里夹带的字符串。逃逸测试见
-    # tests/test_fs_roots.py。
-    TOOL_FS_ENABLED: bool = False
-    # 写与改。读的失败模式是拿到错的内容,写的失败模式是改坏用户的东西,
-    # 不该由同一个开关控制。需要审批闸门(AGENT_APPROVAL_MODE)一起开。
-    TOOL_FS_WRITE_ENABLED: bool = False
-    # 删除单个文件。不删目录——递归删除的爆炸半径和删一个文件不是一个量级,
-    # 而模型少写一层路径的代价是整个子树没了。
-    # 打开后还要求确认令牌(用户原话里说过要删)+ 审批闸门,缺一不执行。
-    TOOL_FS_DELETE_ENABLED: bool = False
-    # 列目录一次最多返回几项。一个几千个文件的目录会把整轮预算吃光
-    FS_LIST_MAX_ENTRIES: int = 200
-    # 单个文件允许读取的字节上限。超过即拒,并建议改用 search_files 定位
-    FS_READ_MAX_BYTES: int = 2 * 1024 * 1024
-    # 一次 read_file 最多返回多少行 / 多少字符。
-    #
-    # 两个上限都要:行数管住"文件很长",字符数管住"某几行极长"(压缩过的 JS
-    # 一行能有几十万字符)。TOOL_RESULT_MAX_CHARS 默认 4000,给到 3500 是留出
-    # 行号前缀与那句"还有多少行未读"的余量。
-    FS_READ_MAX_LINES: int = 400
-    FS_READ_MAX_CHARS: int = 3500
-    # read_file 一次最多读几个文件。
-    #
-    # 2026-09-10 加。实测 GLM-4.6v **每轮只发一次工具调用**:254 个有调用的轮次里
-    # 主模型批量调用零次(那些多调用的轮全都含 delegate,是子代理的调用被折进了
-    # 同一个轮号)。显式告诉它"可以同一轮发多次"也没用。于是每个独立的读都要吃掉
-    # 一整轮,读 3 个文件用 6 轮,10 轮天花板下七八个文件就撞墙。
-    #
-    # 所以让**一次调用带多个路径**——顺着模型的限制走,而不是逆着劝它。
-    # 上限取 8:再多的话即使分摊后每个文件也只剩几十行,读回来的是一堆碎片。
-    FS_READ_MAX_FILES: int = 8
-    # ---- 写操作的旧版本留存 ----
-    #
-    # write_file 是 open(path, "w")，旧内容当场消失。审批闸门挡的是"模型偷偷写"，
-    # 挡不住"用户点了同意然后后悔"——而审批卡片上只看得到 diff 的前 60 行。
-    #
-    # 备份落在**授权目录外面**：放在用户工作目录里的话 list_directory/search_files
-    # 会列出来、模型会把自己写坏的旧版本当资料读、而且 delete_file 能把回收站本身删掉。
-    FS_BACKUP_DIR: str = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "fs_backups"
-    )
-    # 每个文件留几份旧版本。给 5 而不是 1:连续改三次之后想回到最早那版是常见需求
-    FS_BACKUP_MAX_PER_FILE: int = 5
-    # 单份备份的上限。超过就不备份,而且要**如实告诉用户**——静默跳过会让人
-    # 以为有后路。和 FS_READ_MAX_BYTES 同量级
-    FS_BACKUP_MAX_BYTES: int = 2 * 1024 * 1024
-    # ---- 凭据文件保护 ----
-    #
-    # 沙箱回答的是"路径在授权目录里吗",不回答"这个文件该不该给模型看"。而实测
-    # 一个普通项目目录里的 .env 会被 read_file 原样读出来(DB_PASSWORD=hunter2),
-    # search_files 还能按关键词把它找出来——那些内容随下一次调用发给模型提供商。
-    #
-    # 默认**开**。这是三个文件开关里唯一默认开的:另两个(写、删)默认关是因为
-    # 它们扩大能力,而这个是收窄能力,默认关等于默认不设防。
-    FS_PROTECT_SECRETS: bool = True
-    # 组织自有的凭据文件名,逗号分隔,fnmatch 语法(如 ``*.corp-key,vault-*.json``)。
-    # 只能加不能减:没有例外名单——例外名单里写一个 *.pem 就能静默打开整条防线。
-    # 要放开就把 FS_PROTECT_SECRETS 整个关掉,那是个看得见的决定。
-    FS_SECRET_EXTRA_PATTERNS: str = ""
-    # 按内容搜索:最多返回几处命中、最多扫几个文件、每处摘要多少字符
-    FS_SEARCH_MAX_MATCHES: int = 40
-    FS_SEARCH_MAX_FILES: int = 400
-    FS_SEARCH_SNIPPET_CHARS: int = 160
 
     # ========== Skill（作业指导） ==========
     # 一份 skill 回答"这件事在本组织该怎么做"——报销怎么审、季度报告怎么写。
@@ -381,101 +148,8 @@ class Settings(BaseSettings):
     # 附带文件注入上下文的字符上限。比 FS_READ_MAX_CHARS 略大:
     # 模板类文件通常要完整看,截一半的模板不如不给
     SKILL_ATTACHMENT_MAX_CHARS: int = 4000
-    # 命中 skill 的那一轮跳过预检索。
-    #
-    # 2026-09-06 加,起因是实测:索引注入了、工具也注册了,但 45 条用例跑完
-    # ``load_skill`` 一次都没被调。原因是预检索先把一份"看起来够用"的资料塞进了
-    # 用户消息,模型据此判断"我已经有资料了"就直接作答——把同一条用例的
-    # ``use_rag`` 关掉之后,``load_skill`` 与 ``read_skill_file`` 立刻都调了、
-    # 两条都从 1.0/假阳变成真 5.0。
-    #
-    # 改措辞的路已经试过并失败(见 chat_service 里预检索那段注释),所以这里动的是
-    # 机制:相关时**本轮不做预检索**,让模型面对一个没有现成答案的局面,自己决定
-    # 是检索还是加载。挑哪一份始终由模型决定,框架只决定要不要让路。
-    #
-    # 代价是判错时白丢一次有价值的预检索。但那不是错答案,只是多一轮——
-    # ``search_knowledge_base`` 作为工具一直在,模型随时能自己去检索。
-    SKILL_PREEMPTS_PREFETCH: bool = False
-    # 相似度阈值。
-    #
-    # 2026-09-09 从 0.45 提到 0.58。0.45 是拍的,实测在 33 条真实问题上**误判 5 条**
-    # ——包括「生产环境怎么申请权限」(0.4522)和「把『报销』翻译成英文」(0.5095),
-    # 两者都跟报销流程无关,却把它们那一轮的预检索毁掉了。
-    #
-    # 0.58 是误判归零的最低点。代价是漏掉三条真话题(`calc-expense` 0.5816、
-    # 两条「住宿能报多少」0.52)。这个方向是刻意的:**漏判等于退回原来的行为**
-    # (照常预检索,skill 可能不加载),**误判是主动毁掉一次有用的检索**。
-    #
-    # ## 这把尺子本身是钝的
-    #
-    # 同一批实测里,「接口返回这个报错帮我解释一下」拿到 0.5489,而
-    # 「我出差两天,住宿一共能报多少」只有 0.5211——**排序本身就是错的**。
-    # 也就是说不存在"正确的阈值",只有"错得少一些的"。一句话描述上的余弦
-    # 在中文短句上动态范围被压得很窄(真实问题几乎全落在 0.45~0.69)。
-    #
-    # 所以这个数**只在当前这一份 skill 上验证过**。SOP 多起来之后描述之间会开始
-    # 互相竞争,那时候该换的是机制(比如比最佳与次佳的间距),不是继续调这个数。
-    SKILL_PREEMPT_SIMILARITY: float = 0.58
 
-    # ========== 审核结论的一致性 ==========
-    # 同一份材料生成几次结论。>1 时不一致就转人工(见 services/review_consensus)。
-    #
-    # 为什么需要它:2026-09-12 实测同一条用例跑三轮,**工具调用序列逐次相同**而
-    # 裁判分 5/5/3 与 5/3/5,对照组三轮全 5.0。温度是 0.0——贪心解码本该可复现,
-    # 而它没有(MoE / 批处理推理常见)。所以这不是配置能修的,只能在产品层兜。
-    #
-    # 为什么只重跑结论生成、不重跑整条工具链:同一个实验说明摆动在结论层。
-    # 重跑工具链让每份材料贵 N 倍,而实测那 N 倍买不到任何东西。
-    #
-    # 默认 1(关):它让每次审核的结论生成贵 N 倍,该由部署方按材料的重要性决定。
-    # 审核类场景建议 2——复审是这类工作的基本要求。
-    REVIEW_CONSENSUS_RUNS: int = 1
-    # 结论生成的温度。**不是 0.0**,这一条反直觉但重要:
-    #
-    # 自洽性检查要的是"独立采样两次看看会不会分歧",而 0.0 是在请求同一条贪心
-    # 路径。实测 0.0 也照样摆(5/5/3),所以它既拿不到复现性、又拿不到独立性,
-    # 两头都不占。调高之后分歧会变多,那正是该做的事——把本来就不稳的判断暴露
-    # 出来转人工,而不是靠采样一次碰运气。
-    #
-    # REVIEW_CONSENSUS_RUNS=1 时它同样生效(只采一次),所以关着一致性检查的部署
-    # 也会走这个温度。0.3 是保守值:够采出分歧,又不至于让单次结论本身变差。
-    REVIEW_CONSENSUS_TEMPERATURE: float = 0.3
-    # 依据原文的字符上限。模型调 submit_review 时要把它据以判断的材料一起交上来
-    # （见迁移 0017 里为什么不走"把 messages 传进工具边界"那条路）。
-    #
-    # 给得宽是刻意的:抄不全的后果是复审看到的材料比第一次少,于是更容易给出
-    # needs_human——方向安全(多转人工不是少转),但会让一致性检查的假阳性变多。
-    # 8000 约等于一份合同的关键条款 + 一张单子的全部字段。
-    #
-    # 超限在**入参那侧**明确报错,而不是入库时静默截断:截掉的正好是尾部,
-    # 而尾部常常是签字与日期。
-    REVIEW_EVIDENCE_MAX_CHARS: int = 8000
-    # 独立复审用哪个模型。留空回退 utility_model。
-    #
-    # 为什么可以用小模型:复审要的不是"更聪明的判断",是**独立的一次采样**。
-    # 用同一个模型同一份提示词重采一次就够——分歧本身是信号,而不是要靠更强的
-    # 模型去裁决谁对。真要裁决就该转人工,那正是 needs_human 的含义。
-    REVIEW_JUDGE_MODEL: str = ""
-    # 审核台账:submit_review 工具 + review_verdicts 表。
-    #
-    # 默认关,和其它会改变状态的能力一致(TOOL_FS_* / SKILL_ENABLED 都是关的)。
-    # 开着它的部署才需要迁移 0016。
-    #
-    # 注意它**不进审批闸门**:闸门问"能不能做这个动作",而这里人要判断的是
-    # **结论对不对**,那件事发生在读台账的时候。挂进闸门会让用户被问
-    # "允许我记下这条结论吗"——一个他据此判断不了任何东西的问题,而点三次之后
-    # 就变成无脑点确认,顺带训练他对真正的写文件审批也无脑点。
-    REVIEW_LEDGER_ENABLED: bool = False
 
-    # ========== 视觉 ==========
-    # 能接收 image_url 内容块的模型白名单(逗号分隔)。留空即关闭多模态,
-    # 图片仍以 Markdown 链接留在提示词里(也就是模型看不见)。
-    # 用白名单而不是猜名字:模型命名毫无规律,猜错的代价是每个带图请求都拿到 400。
-    VISION_MODELS: str = ""
-    # 单张图片的字节上限。base64 会把体积放大三分之一,直接决定请求体大小
-    VISION_MAX_IMAGE_BYTES: int = 4 * 1024 * 1024
-    # 一轮最多带几张。图片按面积折算 token,一张高清图能顶几千字
-    VISION_MAX_IMAGES: int = 4
 
     # ========== 摄取层清洗 ==========
     # 脏输入不是"质量差一点",它会让召回通道整条失效:GBK 文档被 errors="replace"
@@ -522,30 +196,6 @@ class Settings(BaseSettings):
     # (空文本、乱码、维度不匹配)全都不抛异常。代价是每篇文档多一次 embedding 调用。
     INGEST_SELF_CHECK: bool = True
 
-    # ---- 扫描件 OCR 兜底 ----
-    # 上面那道 no_chunks 自检只能把"扫描件抽不到字"从静默失败变成一条 failed,
-    # 它兜不住的是"让这篇文档真的进库"。扫描件 PDF(只有图像层、没有文本层)在
-    # extract_pdf 里落 no_text_layer、正文为空,而企业知识库里合同、证照、历史
-    # 存档恰恰大量是扫描件——RAG 的价值上限卡在这里。
-    #
-    # 打开后:create_document 解析出 no_text_layer / no_extractable_text 时,把每页
-    # 渲染成图片交给视觉模型转写,转写结果当作正文走后续正常的分块/自检链路。
-    # 默认关闭,理由与 VISION_MODELS / 工具开关一致——打开一个入口就是把它的失败
-    # 模式和成本一起打开:每页一次模型调用,成本随页数线性涨(所以有下面的页数上限)。
-    INGEST_OCR_ENABLED: bool = False
-    # OCR 用的视觉模型名。必须显式配,且必须在 VISION_MODELS 白名单里——给非视觉
-    # 模型发图只换来一个 400。留空 = 即便 INGEST_OCR_ENABLED=true 也不生效(启动告警),
-    # 这是刻意的:静默退回"没 OCR"会让"为什么扫描件还是没进库"变成查不出的问题。
-    INGEST_OCR_MODEL: str = ""
-    # 单篇最多 OCR 几页。扫描件动辄上百页,不封顶一次上传就能打爆配额。超出的页
-    # 不转写,落一条 ocr_page_limit 告警(入库的是前 N 页,不是整篇失败)。
-    INGEST_OCR_MAX_PAGES: int = 20
-    # 页面渲染分辨率(DPI)。太低字糊、OCR 质量掉;太高请求体和 token 都涨。
-    # 150 是实测够清楚又不至于让 base64 过大的折中。
-    INGEST_OCR_DPI: int = 150
-    # 单页转写结果低于这么多字符就当这页没抽到东西(空白页/插图页),跳过并计数。
-    # 不设的话模型对空白页返回的"这页没有文字"之类说明会被当成正文混进库。
-    INGEST_OCR_MIN_CHARS: int = 8
 
     # ---- 入库任务队列（持久化，替代进程内 fire-and-forget）----
     # 改动前上传后的索引是 FastAPI BackgroundTasks：同事件循环、不落盘、无并发上限、
@@ -765,10 +415,6 @@ class Settings(BaseSettings):
     # 之后要重新跑一遍 scripts/sweep_worst_case_budgets.py,并盯住运行日志里
     # 有没有 "llm.rerank returned empty content"。
     RAG_RERANK_MAX_TOKENS: int = 12288
-    # 指代消解。这一项是唯一**默认开启**的受害者(RAG_CONDENSE_QUERY=True),
-    # 也就是说真实链路上每一次追问都在拿原文检索,而系统提示词还告诉模型
-    # "已经预检索过了,够用就直接答"。最低 2048。
-    RAG_CONDENSE_MAX_TOKENS: int = 4096
 
     # ========== 向量存储 ==========
     # memory | qdrant
@@ -804,34 +450,7 @@ class Settings(BaseSettings):
     QDRANT_COLLECTION: str = "ai_workspace_chunks"
     QDRANT_TIMEOUT_SECONDS: float = 5.0
 
-    # ========== 对话历史 ==========
-    # 历史消息的 token 预算(不含系统提示词、当前问题与预留的输出空间)
-    HISTORY_TOKEN_BUDGET: int = 4000
-    # 每轮从数据库取回多少条历史备选,再由 token 预算决定保留几条
-    HISTORY_FETCH_LIMIT: int = 80
-    # 超出预算的早期历史是否压成滚动摘要(关闭则直接丢弃)
-    HISTORY_SUMMARY: bool = True
-    # 这一项是七个调用点里输入**没有硬截断**的那个:滑出预算的历史有多少就压多少。
-    # 按 HISTORY_TOKEN_BUDGET 量级构造(提示词 15945 字)实测最低 2048,给一倍余量。
-    #
-    # 这个数同时管两件互相冲突的事:给思考的余地,以及摘要本身的长度上限
-    # (摘要要进 HISTORY_TOKEN_BUDGET,长了就挤掉真实历史)。API 只给一个旋钮,
-    # 所以分工是:**这里给够思考**,长度由提示词那句"压缩成要点摘要"约束。
-    # 代价要说清楚:2048 下最坏情况摘要是 530 字(约 350 token,占 4000 预算的 9%),
-    # 4096 下可能更长。如果哪天摘要开始又长又啰嗦,该改的是
-    # prompts/history_summary/ 里加一句字数上限,**不是把这个数调回去**——
-    # 调小它只会让摘要重新变成空串(实测 400 和 1024 都失败)。
-    HISTORY_SUMMARY_MAX_TOKENS: int = 4096
 
-    # ========== 语义缓存 ==========
-    # 默认关闭:嵌入向量对时间、否定这类"改变答案"的差异不敏感,
-    # 命中一条相似但不同的问题会直接答错。开启即接受这个取舍。
-    SEMANTIC_CACHE_ENABLED: bool = False
-    # 余弦相似度阈值。这个数应该由评估集扫出来,不是拍脑袋定的
-    SEMANTIC_CACHE_THRESHOLD: float = 0.95
-    SEMANTIC_CACHE_TTL_SECONDS: int = 86400
-    # 每个用户最多缓存多少条(进程内存储,超量丢最旧)
-    SEMANTIC_CACHE_MAX_ENTRIES: int = 200
 
     # ========== 安全护栏 ==========
     # 关闭后检索内容原样拼进提示词(只建议在排查护栏误报时临时关闭)
@@ -855,47 +474,9 @@ class Settings(BaseSettings):
     # 想让联网抓取只能碰几个可信域时设它。
     EGRESS_ALLOWLIST: str = ""
 
-    # ========== 跨会话长期记忆 ==========
-    # 每轮回答结束后用辅助模型从对话里抽取"值得跨会话记住"的用户事实与偏好,
-    # 存进 user_memories 表,并在之后的每一轮作为系统上下文注入。
-    # 这是"同一个用户每次都要重新自我介绍"和真正的个人助手之间的分水岭。
-    MEMORY_ENABLED: bool = True
-    # 每个用户最多保留多少条记忆,超量丢最旧
-    MEMORY_MAX_ITEMS: int = 100
-    # 每轮注入上下文的记忆条数上限(按最新优先)
-    MEMORY_INJECT_LIMIT: int = 20
     # 单条记忆的字符上限,超长的"记忆"多半是把整段对话抄了一遍
     MEMORY_ITEM_MAX_CHARS: int = 200
-    # 抽取那次辅助模型调用的输出上限。
-    #
-    # 这个数给小了会让整个记忆功能静默失效,而且完全看不出来:推理型模型
-    # (glm-4.5-air 这类)会先花掉一部分预算做思考,预算不够时返回的 content 是
-    # **空串**——于是 request_structured 连着两次拿到 no_json、返回 None,而
-    # extract 对 None 的处理是"这轮不记"(抽取是增强不是依赖)。三层加起来的结果
-    # 是:抽取 100% 不工作,日志干净,报告上只表现为"用户没有任何长期记忆"。
-    # 原来写死的 512 正好落在失效那一侧,实测 1024 才刚够。
-    #
-    # 留出余量而不是贴着 1024:提示词里的 question/answer 各截到 2000/4000 字,
-    # 长对话的思考开销更大。抽取每轮只跑一次,多给点输出预算比静默失效便宜。
-    MEMORY_EXTRACT_MAX_TOKENS: int = 2048
 
-    # ========== 提示词版本 ==========
-    # 实际正文在 back-end/prompts/<key>/<version>.md,这里只选用哪一版。
-    # 之所以做成配置项:提示词是改动最频繁的那部分"代码",而"换一版提示词"
-    # 必须能像换检索开关一样被 eval/variants.py 扫,否则只能靠感觉调词。
-    #
-    # **默认值一律留空,它们是覆盖项而不是默认项。** 每一版的默认版本写在
-    # prompt_library.SPECS 的 default_version 里——那儿紧挨着该 key 的占位符契约
-    # 和用途说明,是唯一的事实来源。
-    #
-    # 这里曾经写死过具体版本号(比如 "v2"),后果是 resolve_version 那条
-    # "显式传入 > settings > 契约默认值"的三层顺序里,第三层对**所有**带 setting
-    # 的 key 都永远走不到:配置项非空,它就总是赢。于是 default_version 成了死字段,
-    # 而同一个版本号在两个文件里各写一遍,改一处不改另一处不会有任何报错。
-    #
-    # 留空之后 .env 里写 PROMPT_CHAT_SYSTEM_VERSION= 也等于"用契约默认值",
-    # 这个语义正是想要的。
-    PROMPT_CHAT_SYSTEM_VERSION: str = ""
     PROMPT_EVAL_ANSWER_VERSION: str = ""
     # 子代理提示词的版本。三个角色各自一项——共享一个开关就没法单独 A/B 某个
     # 角色,动一个会让另两个的结果一起失效。
@@ -931,6 +512,102 @@ class Settings(BaseSettings):
     # 默认只给 1 次:这些都是辅助任务(改写/重排/记忆抽取),失败的代价是"这次
     # 增强没生效",而不是回答出错。重试三次的钱花在主回答上更划算。
     STRUCTURED_OUTPUT_RETRIES: int = 1
+
+    # ========== 工单域（客服 + 工单解决 Agent）==========
+    # 整个工单域的总开关。默认关，与一切会改变状态的能力一致
+    # （REVIEW_LEDGER_ENABLED / TOOL_FS_* / SKILL_ENABLED 都是关的）。
+    #
+    # 关着的时候工单路由不注册、业务工具不注册，对话与知识库的行为逐位等价于
+    # 加这套东西之前——这是本仓库每一个新能力的通式，不是形式主义：它让
+    # "上线出问题时把开关拨回去"成为一条不需要回滚部署的动作。
+    TICKET_AGENT_ENABLED: bool = False
+    # 受理哪些渠道。逗号分隔，与 intake.CHANNELS 取交集（交集而不是直接采信配置：
+    # 一个手抄成 ``emial`` 的值如果照单全收，工单会以一个不存在的渠道名建进库，
+    # 之后所有按渠道筛选的指标都看不见它）。
+    #
+    # 默认只放已经有入口适配器的四个。wecom / phone 需要转写与企微回调，接上之后
+    # 加进这里才有意义——在此之前列上它们也不会自己收到流量，但队列里会出现一个
+    # "配置说支持、实际没人能提交"的渠道，而那种差别只有等到有人试了才发现。
+    TICKET_CHANNELS: str = "web_chat,email,app,api"
+    # 工单正文的字符上限。**超限明确报错，不静默截断**：被截掉的尾部往往是
+    # 订单号与真正的诉求，而一张缺了订单号的工单会走到"查不到订单"的分支上，
+    # 最后转人工——看起来安全，实际是我们把信息扔了。
+    # 6000 约等于一封带完整历史引述的邮件投诉正文。
+    TICKET_INTAKE_MAX_CHARS: int = 6000
+    # 附件条数上限。真正的解析在摄取层，这里只挡量：正文里的文件名列表如果
+    # 长到几百条，多半是转发邮件把整条线程拖进来了
+    TICKET_INTAKE_MAX_ATTACHMENTS: int = 8
+    # SLA 时限（小时），建单时据此写 sla_due_at。0 表示不设 SLA（列留空）。
+    #
+    # 为什么要有这一列：文档把"首次响应时间"和"平均处理时长"列为核心指标，
+    # 而它们只有在**当时**记下的时限上才有意义——事后用一个统一标准去倒推，
+    # 等于用今天的口径审判历史。
+    TICKET_SLA_HOURS: int = 24
+    # 退款金额的人审阈值（元）。达到它就把这张工单送进人审，不管是模型说"很确定"
+    # 还是规则说"这就是个小额退款"。
+    #
+    # 为什么是钱而不是意图：意图判错顶多白跑一轮，退款判错是**真金白银打错账户**，
+    # 而文档把"错误操作率（尤其是退款、改订单）"列为核心指标——那这个阈值就是
+    # 指标的定义本身，不是一个可调的小数点。设 0 表示任何退款都要人批。
+    TICKET_REFUND_REVIEW_THRESHOLD: float = 200.0
+    # 法律与投诉关键词（逗号分隔）。命中即视为高风险：这类工单的错误代价不是钱，
+    # 是法务与舆情，而那两样都不在 Agent 的判断范围里。
+    #
+    # 用关键词而不是让模型判断"有没有法律风险"：这一条要的是**宁可多转**。
+    # 漏判一条律师函的代价远大于多一次人工过目，而模型对措辞的敏感度取决于
+    # 它当天心情，关键词表是可以被 review、被追责的东西。
+    TICKET_LEGAL_KEYWORDS: str = "律师,起诉,法院,仲裁,315,消协,工商,市场监管,曝光,媒体,维权"
+    # 强负面情绪词（逗号分隔）。命中两条以上算"情绪极负面"，转人工——不是因为它
+    # 高风险，而是因为这种客户这时候最不需要机器人回话。
+    TICKET_NEGATIVE_KEYWORDS: str = "垃圾,太差,骗子,欺诈,愤怒,气死,无语,崩溃,投诉,差评,离谱"
+    # 抽取走不走模型。关掉只留规则层（订单号/金额/意图/关键词），
+    # 商品名与情绪判定就没有了——那是一个明确的降级面，而不是悄悄变笨。
+    #
+    # 它是"增强不是依赖"的那一类：调用失败会打 warning 并退回规则层结果，
+    # 而规则层已经足够把工单正确地分到人手上。
+    TICKET_UNDERSTAND_LLM: bool = True
+    # 办单之前要不要先规划几步（文档§4 第 5 步）。
+    #
+    # 默认开：这份计划的主要读者不是模型（执行循环本来就能随机应变），
+    # 而是审批收件箱和轨迹回放里的人——"它打算先查单再退款"写在工单上，
+    # 人批那笔退款时才知道自己批的是第几步。
+    TICKET_PLAN_ENABLED: bool = True
+    # 计划步数上限。工单不是研究课题，超过 5 步的计划基本是在给简单问题硬凑步骤，
+    # 白花一次调用的钱还不改变结果。
+    TICKET_PLAN_MAX_STEPS: int = 5
+    # 单张工单的默认工具调用次数上界（治理层与熔断用）。
+    # 放在这里而不是只留在 governor 里：governor 行是可选的运营覆盖，
+    # 而"没配过治理的工作区"也要有一个数。0 = 不限。
+    TICKET_MAX_TOOL_CALLS: int = 12
+    # 每个工作区每日退款总额上限（元）。按应用时区的自然日聚合，不是滚动 24 小时。
+    #
+    # 默认给一个很小的数是有意的：这套系统刚接上真实支付通道时，正确的姿态是
+    # "几乎一切都过人审"，然后按观测到的错误操作率逐步放宽。默认值放宽等于
+    # 在没有任何数据的时候假定 Agent 是对的。0 = 一律不许自动退。
+    TICKET_DAILY_REFUND_LIMIT: float = 1000.0
+    # 单工单的模型成本上限（元）。超了就地收尾并转人工——一张工单烧掉多少钱
+    # 与它该不该被自动解决是两件不相干的事，不该让前者绑架后者。0 = 不限。
+    TICKET_MAX_COST_PER_TICKET: float = 0.0
+    # LangGraph 检查点文件的位置：挂在人审上的那张工单，状态就存在这里。
+    #
+    # 它是**运行数据**而不是配置，所以进 .gitignore；但它必须是一个活得比进程长的
+    # 路径——放到临时目录上，等于把"跨天恢复"这条能力悄悄换成"重启即失忆"。
+    # 多实例部署要换成共享存储（或 Postgres saver）：两个进程各写一份 sqlite，
+    # 会得到两条互不知情的挂起线程。
+    TICKET_CHECKPOINT_DB: str = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "ticket_checkpoints.db"
+    )
+    # 回复出口的重试形状（见 services/ticket/outbox.py）。租约秒数要明显长于一次
+    # 外发调用的超时：比它短就会出现"进程还在发、租约到期、第二条进程又发一遍"，
+    # 而那对客户端就是一条重复的邮件。
+    TICKET_OUTBOX_LEASE_SECONDS: int = 120
+    TICKET_OUTBOX_MAX_ATTEMPTS: int = 3
+    # 退避基数，实际间隔是 基数 × 已尝试次数
+    TICKET_OUTBOX_BACKOFF_SECONDS: int = 60
+    # 办结后顺带排一条邀评。默认开：CSAT 是文档§1 列的核心指标，而没人被邀请过
+    # 的话这个指标永远只能等客户自己上门骂一句时才有一条数据。
+    # 没有接任何发送通道时它只是往队列里多放一行，不会真发出什么。
+    TICKET_CSAT_INVITE_ENABLED: bool = True
 
     # ========== 时区 ==========
     # 应用写入 naive DATETIME 列时使用的时区偏移(小时)。必须与数据库服务器的
@@ -1022,25 +699,25 @@ class Settings(BaseSettings):
     MONITOR_ENABLED: bool = False
     # 聚合窗口(小时)。滑动窗口,与 usage 的自然日对齐无关。
     MONITOR_WINDOW_HOURS: float = 24.0
-    # 样本不足时不告警:窗口内主代理 run 数低于此值直接跳过。
-    # 三五个 run 里挂一个就是 20%+ 错误率,那是噪声不是信号(同 calibration 的 MIN_N)。
-    MONITOR_MIN_RUNS: int = 20
+    # 样本不足时不告警:窗口内**新建工单**数低于此值直接跳过。
+    # 三五个工单里挂一个就是 20%+ 失败率,那是噪声不是信号(同 calibration 的 MIN_N)。
+    MONITOR_MIN_TICKETS: int = 20
     # 两次真正评估之间的最小间隔(分钟)。评估挂在高频读路径上,靠它节流:
     # 间隔内的调用是一次时间戳比较就返回,只有跨过间隔的那一次付聚合查询的钱。
     MONITOR_INTERVAL_MINUTES: float = 15.0
     # 四条阈值,各自独立,0 = 关掉这一条(同 usage_guard 的约定)。
-    # 错误率 / 人工介入率是比例(0–1);成本是"单次回答"的币值;延迟是毫秒。
+    # 失败率 / 人工介入率是比例(0–1);成本是"单张工单"的币值;处理时长是毫秒。
     #
-    # 错误率 = 失败的主代理 run / 全部主代理 run。
+    # 失败率 = status=failed 的工单 / 窗口内新建工单。
     MONITOR_MAX_ERROR_RATE: float = 0.0
-    # 人工介入率 = (被审批打断过 或 无人裁决而废弃)的 run / 全部 run。
-    # 它爬升意味着"自动闭环"在变成"事事要人"——HITL 是卖点,但全靠人就不是自动化了。
+    # 人工介入率 = (挂在审批上 或 已转人工)的工单 / 全部工单。
+    # 它爬升意味着"自动闭环"在变成"事事要人"——人在回路是卖点,但全靠人就不是自动化了。
     MONITOR_MAX_INTERVENTION_RATE: float = 0.0
-    # 单次回答平均成本上限。混币种时按相加算(有汇率问题),所以默认 0:
+    # 单张工单平均成本上限。混币种时按相加算(有汇率问题),所以默认 0:
     # 生产模型未进价目表时成本是 NULL,配非零只会得到永不触发的假闸门(同 USAGE_QUOTA_MAX_COST)。
-    MONITOR_MAX_COST_PER_RUN: float = 0.0
-    # 端到端延迟的 p95(毫秒)。0 = 不看。按 agent_runs 的 finished-started 算。
-    MONITOR_MAX_P95_LATENCY_MS: float = 0.0
+    MONITOR_MAX_COST_PER_TICKET: float = 0.0
+    # 处理时长(created→resolved)的 p95(毫秒)。0 = 不看。就是文档里那个"平均处理时长"。
+    MONITOR_MAX_P95_HANDLE_MS: float = 0.0
 
     @property
     def embedding_api_key(self) -> str:
@@ -1053,14 +730,6 @@ class Settings(BaseSettings):
         return self.LLM_UTILITY_MODEL or self.LLM_MODEL
 
     @property
-    def review_judge_model(self) -> str:
-        """独立复审实际使用的模型。留空回退辅助模型,再回退主模型。
-
-        和 ``judge_model`` 分开是刻意的:那个是**评估**用的裁判(给答案打分),
-        这个是**线上**审核链路的一环。同一个配置项会让"调评估"和"改线上行为"
-        变成一件事,而它们的取舍完全不同——评估要稳定可比,线上要便宜够用。
-        """
-        return self.REVIEW_JUDGE_MODEL or self.utility_model
 
     @property
     def judge_model(self) -> str:
@@ -1078,7 +747,6 @@ class Settings(BaseSettings):
     # ========== JWT 认证配置 ==========
     JWT_SECRET_KEY: str = _DEFAULT_JWT_KEY
     JWT_ALGORITHM: str = "HS256"
-    JWT_EXPIRE_MINUTES: int = 10080  # 兼容旧配置,实际使用下面的分项
     JWT_ACCESS_EXPIRE_MINUTES: int = 30
     JWT_REFRESH_EXPIRE_DAYS: int = 7
 

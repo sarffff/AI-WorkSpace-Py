@@ -96,8 +96,8 @@ def test_列表分两层且带内置(client):
     body = client.get("/skills", headers=_headers(client)).json()
 
     assert body["workspace"] == []
-    # 仓库里那份 expense-review 应当出现在内置层
-    assert any(item["name"] == "expense-review" for item in body["builtin"])
+    # 仓库里那份退款规程应当出现在内置层
+    assert any(item["name"] == "refund-playbook" for item in body["builtin"])
     assert body["canEdit"] is True
 
 
@@ -205,8 +205,8 @@ def test_同名内置被盖时列表里标出来(client):
     """不标的话 admin 会以为自己写的那份没生效。"""
     headers = _headers(client)
     client.put(
-        "/skills", json=_payload(name="expense-review"), headers=headers
+        "/skills", json=_payload(name="refund-playbook"), headers=headers
     )
     body = client.get("/skills", headers=headers).json()
     builtin = {item["name"]: item for item in body["builtin"]}
-    assert builtin["expense-review"]["overridden"] is True
+    assert builtin["refund-playbook"]["overridden"] is True

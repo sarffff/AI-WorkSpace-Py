@@ -53,12 +53,9 @@ STATUSES = ("active", "candidate", "archived")
 # 为什么是模板自己声明，而不是在 main.py 里列一张版本名表：加新版本时那张表
 # 一定会漏掉，而漏掉的表现是"配置错了但程序照跑"，正是这个机制要消灭的东西。
 EXPECTATIONS = (
-    # 讲了 workspace 那几个工具（calculate / web_search / read_attachment /
-    # save_to_knowledge_base）的策略，不只是让模型从 schema 里看到名字
-    "workspace-tools",
     # 讲了 delegate 怎么用：任务描述必须自包含、什么时候不该委派
     "delegation",
-    # 为 supervisor 模式写的：主代理的专用工具已被角色收走，只能委派
+    # 为 supervisor 模式写的：主代理把查询类工具收进子代理，自己只保留写操作
     "supervisor",
 )
 
@@ -86,29 +83,6 @@ class PromptSpec:
 
 
 SPECS: dict[str, PromptSpec] = {
-    "chat_system_plain": PromptSpec(
-        key="chat_system_plain",
-        purpose="关闭知识库时的对话系统提示词",
-        default_version="v1",
-    ),
-    "chat_system_rag": PromptSpec(
-        key="chat_system_rag",
-        purpose="开启知识库时的对话系统提示词（工具说明 + 注入防线）",
-        # 为什么默认仍是 v2 而不是更全的 v4-workspace：产品默认把四个 workspace
-        # 工具全部关掉（见 config.py 那段注释），此时 v4 多出来的三段策略讲的是
-        # 网页可信度分层、写操作确认、图片直接可见——全是当下不存在的工具，而它
-        # 的固定成本每轮都要付。
-        #
-        # 所以「v2 还是 v4」不是一个能单独回答的问题，它取决于开了哪些工具：
-        # 工具全关时 v2 正确，工具打开时应当跟着切到 v4（main.py 会就此给出警告）。
-        # eval 的 prompt-v2 变体量的是后一种情形——它的 _BASE 把四个工具全打开了,
-        # 所以那组数字回答的是"开了工具之后 v4 值不值这笔 token",
-        # 不是"产品默认该用哪一版"。
-        default_version="v2",
-        setting="PROMPT_CHAT_SYSTEM_VERSION",
-        flags=("prefetched",),
-        request_overridable=True,
-    ),
     "eval_rag_answer": PromptSpec(
         key="eval_rag_answer",
         purpose="离线评估里生成回答用的单轮提示词",
@@ -116,51 +90,29 @@ SPECS: dict[str, PromptSpec] = {
         setting="PROMPT_EVAL_ANSWER_VERSION",
         required=("context", "question"),
     ),
-    "rag_query_condense": PromptSpec(
-        key="rag_query_condense",
-        purpose="预检索前把追问改写成自包含问题（指代消解）",
+    # 工单理解。刻意**不问模型"该不该转人工"**：风险等级是阈值与关键词的确定性
+    # 函数（见 services/ticket/understand.assess_risk），让模型参与那个判断，
+    # 就等于把"错误操作率"这个指标交给它的措辞同情心决定，而那种东西既不能
+    # review 也不能追责。等真有第二版再开 setting，理由同 agent_plan。
+    "ticket_understand": PromptSpec(
+        key="ticket_understand",
+        purpose="读一张客服工单，归出意图、商品、情绪与原文里的结构化事实",
         default_version="v1",
-        required=("recent_turns", "question"),
+        required=("ticket_text",),
     ),
-    # 这两个原来是源码里的多行字符串。搬出来的理由和其它提示词一样：它们同样
-    # 发给模型、同样影响结果、同样该被 review 和 A/B。记忆抽取尤其重要——
-    # 它的排除段是注入防线的一部分（见 memory_service 模块文档）。
-    "history_summary": PromptSpec(
-        key="history_summary",
-        purpose="把滑出 token 预算的早期对话压成滚动摘要",
+    # 工单 Agent 的操作说明。没有占位符是刻意的：它在每条消息的最前面，
+    # 动一个字就等于把整段提示词缓存作废（见 prompts/ticket_agent/v1.md 的 notes）。
+    # 等它真的需要按渠道/风险分支时再开版本，而不是先塞一个用不上的开关。
+    "ticket_agent": PromptSpec(
+        key="ticket_agent",
+        purpose="工单解决 Agent 的操作说明：先查后动、写操作要依据、拿不准就交人",
         default_version="v1",
-        required=("previous", "transcript"),
-        flags=("has_previous",),
     ),
-    "memory_extract": PromptSpec(
-        key="memory_extract",
-        purpose="从一轮对话里抽取值得跨会话记住的用户事实与偏好",
+    "ticket_plan": PromptSpec(
+        key="ticket_plan",
+        purpose="办一张工单之前的分步计划：写操作前先查，资金步骤标明要人审",
         default_version="v1",
-        required=("question", "answer"),
-    ),
-    # 显式规划(plan-and-execute)。不给 setting:规划模式本身由
-    # AGENT_PLAN_MODE 控制,而"用哪一版规划提示词"目前没有第二版可选——
-    # 等真有 v2 再加覆盖项,提前加一个永远填不满的开关只是噪声。
-    "agent_plan": PromptSpec(
-        key="agent_plan",
-        purpose="回答之前先把问题拆成有序步骤，交给执行循环",
-        default_version="v1",
-        required=("question", "context", "tools", "max_steps"),
-    ),
-    # 独立复审。不开 setting：这份提示词的版本由谁定，和主对话提示词的版本
-    # 应当解耦——它是审核链路的一环，改它影响的是"复审严不严"，
-    # 而那和"对话怎么答"是两件不相干的事。等真有 v2 再加。
-    "review_verdict": PromptSpec(
-        key="review_verdict",
-        purpose="拿同一份材料独立重判一次，用来和模型自己提交的结论比对",
-        default_version="v1",
-        required=(
-            "instructions",
-            "materials",
-            "required",
-            "sop_name",
-            "sop_version",
-        ),
+        required=("ticket_text", "intent", "risk", "tools", "max_steps"),
     ),
     # 子代理各自一个 key,而不是共用一个带 [[if role]] 分支的模板:三个角色的
     # 约束几乎不重叠(researcher 要讲出处分层,analyst 要讲"缺输入就停",
