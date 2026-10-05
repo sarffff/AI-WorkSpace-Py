@@ -1,22 +1,7 @@
-export type {
-  // Auth types
-  User,
-  LoginRequest,
-  RegisterRequest,
-  AuthResponse,
-  TokenResponse,
-  // Chat types
-  Message,
-  Chat,
-  ChatSession,
-  // Knowledge types
-  KnowledgeDocument,
-  // Request/Response types
-  CompletionResponse,
-  ChatRequest,
-  CreateChatRequest,
-  StreamChunk,
-  // UI types
-  NavTab,
-  UIMessage,
-} from "./api.types";
+/**
+ * 类型出口。组件也可以直接从 `@/shared/types/api.types` 引——两条路都行，
+ * 但**不要再往这里逐个列名字做二次导出**：那份清单曾经列着 40 个已经没有主人
+ * 的类型（对话工作台、本机文件、报销审核随模块一起删了），删模块时漏删它，
+ * 于是界面上还留着"那些能力似乎在"的痕迹。整模块再导出就不会有这个问题。
+ */
+export * from "./api.types";

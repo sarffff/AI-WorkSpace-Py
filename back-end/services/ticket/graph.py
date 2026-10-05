@@ -45,7 +45,8 @@ from sqlalchemy.orm import Session
 
 from config import settings
 from models import CsOperation, Ticket
-from services import approval, pricing, prompt_library, structured
+from services import agent_roles, approval, pricing, prompt_library, skill_service
+from services import skill_tools, structured, subagent
 from services.clock import naive_now
 from services.guardrails import ScanReport, guard
 from services.model_adapter import ToolCall
@@ -57,7 +58,7 @@ from services.ticket import tools as cs
 from services.ticket import understand as understand_module
 from services.ticket.governor import effective_limits
 from services.ticket.trace import append_event
-from services.tool_runtime import CircuitBreaker, ToolRuntime, ToolStatus
+from services.tool_runtime import CircuitBreaker, ToolDefinition, ToolRuntime, ToolStatus
 
 logger = logging.getLogger("ticket.graph")
 
@@ -88,6 +89,15 @@ class TicketState(TypedDict, total=False):
     blocked_writes: int
     # 规划节点产出的步骤（文档§4 第 5 步）。空是合法值："一步就能办完"是正确答案
     plan: list[dict[str, str]]
+    # 这个回合已经加载过哪几份作业指导（SOP 正文）。必须在状态里而不是只在工具
+    # 处理器的内存里：``load_skill`` 的防重复注入靠的就是这份名单，而审批挂起可能
+    # 几天之后才恢复——名单丢了，同一份几千字的 SOP 会被再注入一遍正文。
+    loaded_skills: list[str]
+    # 已经委派出去几次（文档§3 的子 Agent）。和 ``calls_used`` 分开记是因为它们
+    # 管的是两件事：那条限"调了几个工具"，这条限"另起了几个独立上下文"——
+    # 每次委派是一整个 3~5 轮的子循环，只按调用次数封顶的话，一次委派和一次
+    # ``lookup_order`` 在账上等价，而它的实际开销是后者的十倍。
+    delegations: int
     # 这次运行累计的模型成本与它的上界。``cost_known`` 分开记是有原因的：
     # 提供商没回传用量、模型不在价目表里、遥测关着，这几种情况 cost 都是 None，
     # 把它们当成 0 会让"成本熔断"永远不触发——而它恰恰在最贵的时候最该触发
@@ -130,25 +140,32 @@ class TicketRuntime:
     def model_name(self) -> str:
         return self.model or settings.LLM_MODEL
 
-    def tool_runtime(self, risk_level: str) -> ToolRuntime:
-        """按当前风险档位装配工具面。
+    def breaker(self) -> CircuitBreaker:
+        """这张工单这次运行共享的熔断器。
 
-        熔断器按档位缓存：工单在一次运行里会反复执行工具，而"连续失败就撤下这个
-        工具"的作用域应当是这次运行，不是某一次节点调用。
+        作用域是"这次运行"而不是"这一次节点调用"：工单会在 reason ↔ execute 之间
+        反复执行工具，而"连续失败几次就撤下这个工具"针对的是那条链。上一次运行
+        失败的通道，这一次可能已经恢复。
         """
-        cached = getattr(self, "_cached_surface", None)
-        if cached and cached[0] == risk_level:
-            return cached[1]
-        definitions = cs.build(
-            self.db,
-            workspace_id=self.workspace_id,
-            user_id=self.user_id,
-            ticket_id=self.ticket.id,
-            max_risk=risk_level,
-        )
-        runtime = ToolRuntime(definitions, breaker=CircuitBreaker(_FAILURE_STREAK))
-        self._cached_surface = (risk_level, runtime)
-        return runtime
+        cached = getattr(self, "_cached_breaker", None)
+        if cached is None:
+            cached = CircuitBreaker(_FAILURE_STREAK)
+            self._cached_breaker = cached
+        return cached
+
+    # ---- 委派的记账 ----
+    # 子代理烧掉的成本与它内部的工具调用次数。主循环看到的"delegate"只是一次工具
+    # 调用，而它内部是一整个子代理循环：不把这两笔并回工单的账，
+    # 文档§6.3 的"单工单成本上限"和"单工单工具调用 ≤N 次"在开委派之后都会被
+    # 悄悄绕过——委派越多次，真实开销越大，而 state 里的数字看起来完全正常。
+    #
+    # 放在 runtime 而不是 state 里，是因为写它的是工具处理器（拿不到 state），
+    # 读它的是 ``execute`` 节点（那里把它并进 state）。
+    delegated_cost: float = 0.0
+    delegated_calls: int = 0
+    # 委派那边有没有真的算出过钱。有的话这张工单就"知道成本"了，
+    # 成本熔断从此可以触发（见 ``_cost_over`` 为什么要单独记这一位）。
+    delegated_cost_known: bool = False
 
 
 def thread_config(ticket_id: str) -> dict[str, Any]:
@@ -288,28 +305,29 @@ def _sanitize_plain(text: str, *, kind: str) -> tuple[str, ScanReport]:
 def _span_cost(span: Any, fallback_model: str) -> tuple[Decimal | None, bool]:
     """把一个模型调用 span 的用量换算成成本。
 
-    返回 ``(成本或 None, 这次是否知道了成本)``。第二个分量是必需的：
-    价目表命中不了、提供商没回传用量、遥测关着，这三种情况都给不出数——
-    把它们折算成 0 就等于宣布"这张工单没花钱"，而成本熔断的正面就是这句话。
-
-    缓存命中的那部分是 ``prompt_tokens`` 的子集，必须减掉再按打折价单算，
-    否则一份输入会被计成两遍钱（见 ``telemetry.Span.cached_tokens`` 的说明）。
+    实现搬到 ``pricing.cost_of_span``：子代理每一轮要做同一道换算，两处各写一遍
+    迟早会不一样，而"缓存命中要先减掉再打折"这种细节不一致时，差出来的那点正好
+    落在熔断阈值附近。这里留一个名字只为不动 reason 节点的读法，
+    取舍（未知不折成 0、缓存 token 是子集）见 pricing 那段说明。
     """
-    prompt_tokens = getattr(span, "prompt_tokens", None)
-    completion_tokens = getattr(span, "completion_tokens", None)
-    if prompt_tokens is None and completion_tokens is None:
-        return None, False
-    cached = getattr(span, "cached_tokens", None)
-    cost = pricing.estimate_cost(
-        getattr(span, "model", None) or fallback_model,
-        prompt_tokens,
-        completion_tokens,
-        cached,
-    )
-    if cost is None:
-        # 有用量但没价目：知道花了多少 token，但不知道值多少钱
-        return None, True
-    return cost.amount, True
+    return pricing.cost_of_span(span, fallback_model)
+
+
+@dataclass(slots=True)
+class _Surface:
+    """本轮下发给模型的工具面，加上只有编排层需要的两份附带状态。
+
+    ``loaded`` 是 ``skill_tools`` 的加载计数器：``load_skill`` 的处理器往里写名字，
+    ``execute`` 节点结束时把名单写回工单状态——挂起几天之后恢复回来，"这份 SOP 已经
+    注入过正文"这件事还得成立，否则同一份几千字的规程会被再灌一遍。
+
+    ``roles`` 是这一轮真正注册进 ``delegate`` 枚举的角色。通知文本用同一个列表，
+    于是"清单里说能派谁"和"enum 里允许填谁"不可能对不上。
+    """
+
+    runtime: ToolRuntime
+    loaded: Any
+    roles: list[Any]
 
 
 def build_graph(runtime: TicketRuntime) -> StateGraph:
@@ -340,6 +358,207 @@ def build_graph(runtime: TicketRuntime) -> StateGraph:
             .scalar()
             or 0
         )
+
+    def _sub_budget(text: str) -> str:
+        """子代理每次工具结果回灌给它的字符上限。
+
+        主代理的工具结果整条进 messages（轨迹那边有截断，上下文没有），而子代理的
+        那些会连同它的报告一起回到主代理的上下文里。一次委派查三张单，不把住这道口，
+        回来的就是三张单的全文，而主代理要的只是那一句结论。
+        """
+        limit = max(0, int(settings.AGENT_SUBAGENT_RESULT_MAX_CHARS))
+        if not limit or len(text) <= limit:
+            return text
+        return text[:limit] + f"\n\n[工具结果过长已截断，原文 {len(text)} 字符]"
+
+    def _policy_definition() -> ToolDefinition:
+        """把政策检索也开放成工具（文档§3 能力层的「知识库 / 政策 Skill」）。
+
+        retrieve 节点已经预检索过一次，但那一次的检索词是在**还没读完工单**时拼出来
+        的（意图 + 订单号 + 原文前 200 字）。执行到一半问题收窄成"退货运费谁承担"，
+        那一次检索多半没命中——而没有第二个入口的话模型只能拿政策片段的上位概念作答，
+        或者直接转人工，而文档§4 第 4 步要的正是"知识检索"能服务于第 6 步的执行循环。
+
+        进上下文之前过的是和 retrieve **完全同一道**处理（``_shield`` + 同一个
+        ``_POLICY_NOTICE``）：同一个来源的东西走两条通道，一条洗过一条没洗，
+        等于让"这句话有没有被定界保护"取决于它是在哪一步查的。
+        """
+        search = runtime.policy_search
+
+        async def handler(arguments: dict[str, Any]) -> str:
+            query = str(arguments.get("query") or "").strip()
+            if not query:
+                return "检索失败：query 不能为空。把想核实的那一条规则写成一个具体问题。"
+            context = await search(query) if search is not None else ""
+            if not context or "未找到" in context:
+                # 空手回来必须说空手。回一段空文本会让模型把"没查到"读成"没有规定"，
+                # 而它下一步可能就是按"没有规定"发起退款
+                return (
+                    f"知识库里没有检索到与「{query[:80]}」相关的政策。"
+                    "这不等于没有规定——先如实说明查不到依据，"
+                    "不要按「没有相关条款」推定客户可以退。"
+                )
+            return _shield(
+                context, label="政策资料", notice=_POLICY_NOTICE, kind="ticket_policy"
+            )
+
+        return ToolDefinition(
+            name="search_policy",
+            description=(
+                "在政策知识库里检索退换货政策、服务条款与费用规则。"
+                "上下文里那份政策片段没覆盖当前问题时用它再查一次，"
+                "检索词写成一个具体问题（「退货的运费由谁承担」而不是「退货」）。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "要核实的那一条规则，写成具体问题",
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            handler=handler,
+        )
+
+    def _delegate_definition(
+        roles: list[agent_roles.AgentRole], inner: ToolRuntime
+    ) -> ToolDefinition:
+        schema, description = subagent.build_delegate_schema(roles)
+
+        async def handler(arguments: dict[str, Any]) -> str:
+            wanted = str(arguments.get("role") or "").strip()
+            role = next((item for item in roles if item.name == wanted), None)
+            if role is None:
+                # 到这里说明模型编了一个 enum 之外的角色名（提供商不校验 enum 时）。
+                # 列出可用的是为了让它下一轮改对，而不是同样白烧一轮
+                listed = "、".join(item.name for item in roles)
+                return f"委派失败：没有 {wanted!r} 这个子代理。可用的只有：{listed}"
+            task = str(arguments.get("task") or "").strip()
+            if not task:
+                return (
+                    "委派失败：task 不能为空。子代理看不到这张工单，"
+                    "它只能从这一段里知道要查什么。"
+                )
+            limit = max(0, int(settings.AGENT_MAX_DELEGATIONS))
+            if limit and runtime.delegations_used >= limit:
+                return (
+                    f"委派失败：这张工单已经委派 {runtime.delegations_used} 次，"
+                    f"上限 {limit} 次。请基于已有的材料继续，"
+                    "缺的部分如实写进给客户的答复，或者转人工。"
+                )
+            runtime.delegations_used += 1
+
+            runner = subagent.SubAgentRunner(
+                runtime.adapter,
+                inner,
+                generation={"model": runtime.model_name(), "temperature": 0.2},
+                take_budget=_sub_budget,
+                # 子代理的工具结果不经过 execute 节点，所以那道中和必须在这里补
+                # （见 SubAgentRunner 的 sanitize_result 说明）
+                sanitize_result=lambda text: _sanitize_plain(
+                    text, kind="ticket_sub_tool_result"
+                )[0],
+            )
+            outcome = await runner.run(role, task)
+
+            # 委派内部的每一笔都并进工单的账：调用次数与成本。
+            # 不并的话"单工单工具调用 ≤N 次"和"单工单成本 ≤X"两条上限
+            # 在开委派之后只是主代理自己那一圈的上限，派几次就乘几倍。
+            runtime.delegated_calls += len(outcome.steps)
+            if outcome.cost is not None:
+                runtime.delegated_cost += float(outcome.cost)
+                runtime.delegated_cost_known = True
+            for step in outcome.steps:
+                _trace(
+                    "act",
+                    kind="tool_result",
+                    status="ok" if step.status == ToolStatus.OK.value else "error",
+                    tool_name=step.tool,
+                    # 前缀标明是子代理那一层的调用 id：主循环的 tool_call_id 要和
+                    # proposals 对得上，混进一批同名的会让回放里"哪次提议对应哪次执行"失配
+                    tool_call_id=f"{role.name}:{step.tool_call_id}"
+                    if step.tool_call_id
+                    else None,
+                    arguments=step.arguments,
+                    result_excerpt=step.result[:2000],
+                    round_index=step.round_index,
+                    message=f"子代理 {role.name} 的第 {step.round_index} 轮",
+                )
+            return subagent.format_report(outcome)
+
+        return ToolDefinition(
+            name="delegate",
+            description=description,
+            parameters=schema,
+            handler=handler,
+        )
+
+    def _surface(risk: str, loaded: list[str]) -> _Surface:
+        """本轮下发给模型的工具面 = 业务工具 + 政策检索 + SOP 加载 + 委派。
+
+        缓存键带上"已加载哪几份 SOP"：``load_skill`` 的处理器持有这份名单，名单变了
+        还端出旧的运行时，模型会拿到一个以为自己什么都没加载过的工具，于是同一份
+        正文被注入两遍。
+
+        熔断器跨节点、跨主子代理共享同一个实例（``TicketRuntime.breaker``）。所以一个
+        工具在子代理里连挂两次，主代理这边也看不到它了——那是对的：工具坏了就是坏了，
+        不看调用它的是谁。
+        """
+        key = (risk, tuple(loaded))
+        cached = getattr(runtime, "_cached_surface", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
+        definitions = cs.build(
+            db,
+            workspace_id=runtime.workspace_id,
+            user_id=runtime.user_id,
+            ticket_id=ticket.id,
+            max_risk=risk,
+        )
+        mode = settings.AGENT_DELEGATION_MODE
+        if mode == "supervisor":
+            # 查询类工具从主代理手里收走（文档§3 的「子 Agent（查询）」）。
+            # 判据用档位而不是再点一份角色工具名的名单：两处各列一份，
+            # 以后加一个查询工具时迟早对不上——而对不上的表现是主代理手里
+            # 还剩着一个本该收走的工具，或者角色拿不到它该有的工具。
+            definitions = [
+                item for item in definitions if cs.tier_of(item.name) != cs.READ
+            ]
+
+        auxiliary: list[ToolDefinition] = []
+        if runtime.policy_search is not None:
+            auxiliary.append(_policy_definition())
+        skill_definitions, tracker = skill_tools.build(
+            db, runtime.workspace_id, already_loaded=list(loaded)
+        )
+        auxiliary += skill_definitions
+
+        breaker = runtime.breaker()
+        inner = ToolRuntime(definitions + auxiliary, breaker=breaker)
+        # 判据用 ``schemas`` 而不是 ``names``：已被熔断的工具不再下发，那个角色
+        # 此刻确实没有这个工具可用——按"模型现在看得见什么"筛，才和实际行为一致。
+        visible = {
+            schema.get("function", {}).get("name") for schema in inner.schemas
+        }
+        roles: list[agent_roles.AgentRole] = []
+        if subagent.enabled():
+            roles = agent_roles.available(visible)
+        surface = inner
+        if roles:
+            # delegate 不进 ``inner``：子代理的执行面用它，而角色工具面里永远没有
+            # delegate 这一项——递归委派的成本没有上界，第二层往下也几乎不带新信息
+            # （见 subagent 模块文档的约束 3）。模型看到的那一份才有 delegate。
+            surface = ToolRuntime(
+                definitions + auxiliary + [_delegate_definition(roles, inner)],
+                breaker=breaker,
+            )
+        result = _Surface(runtime=surface, loaded=tracker, roles=roles)
+        runtime._cached_surface = (key, result)
+        return result
 
     async def understand(state: TicketState) -> dict[str, Any]:
         customer = ticket_history.load_customer(db, runtime.workspace_id, ticket)
@@ -379,6 +598,23 @@ def build_graph(runtime: TicketRuntime) -> StateGraph:
                 "legal_risk" if "legal_keywords" in risk.triggers else "hostile_contact",
             )
         db.commit()
+        # 本轮的工具面。建它不是为了拿 runtime——是为了让下面两段注入说的是**这一轮
+        # 真的注册了哪些工具**：索引承诺 load_skill 存在、通知列出可派的角色，
+        # 两句都可能在配置与工具面不匹配时落空，而那两种落空都是静默的
+        # （模型试一次、拿回一句"没有这个工具"，白付一轮）。
+        surface = _surface(risk.level, [])
+        blocks = [prompt_library.render("ticket_agent")]
+        # SOP 索引（名字 + 一句描述，正文由模型自己调 load_skill 取）。
+        # 位置在主提示词之后、工单原文之前：它是"本工作区有哪些规程"，与工单内容无关，
+        # 留在 system 那一侧就不会打断按工单变化的那段前缀缓存
+        index = skill_service.build_index_block(db, runtime.workspace_id)
+        if index:
+            blocks.append(index)
+        notice = subagent.delegation_notice(
+            surface.roles, settings.AGENT_DELEGATION_MODE
+        )
+        if notice:
+            blocks.append(notice)
         return {
             "ticket_id": ticket.id,
             "workspace_id": ticket.workspace_id,
@@ -394,8 +630,10 @@ def build_graph(runtime: TicketRuntime) -> StateGraph:
             "cost_known": False,
             "failures_streak": 0,
             "blocked_writes": 0,
+            "loaded_skills": [],
+            "delegations": 0,
             "messages": [
-                {"role": "system", "content": prompt_library.render("ticket_agent")},
+                *[{"role": "system", "content": block} for block in blocks],
                 {"role": "user", "content": _brief(ticket, profile_text, safe_text)},
             ],
         }
@@ -477,7 +715,9 @@ def build_graph(runtime: TicketRuntime) -> StateGraph:
         """
         if not settings.TICKET_PLAN_ENABLED:
             return {"plan": []}
-        tool_names = runtime.tool_runtime(state.get("risk_level") or "low").names
+        tool_names = _surface(
+            state.get("risk_level") or "low", list(state.get("loaded_skills") or [])
+        ).runtime.names
         prompt = prompt_library.render(
             "ticket_plan",
             ticket_text=(state.get("safe_text") or ticket.request_text)[:1500],
@@ -537,7 +777,7 @@ def build_graph(runtime: TicketRuntime) -> StateGraph:
         而它恰恰在该停手的时候最该触发。
         """
         risk = state.get("risk_level") or "low"
-        rt = runtime.tool_runtime(risk)
+        rt = _surface(risk, state.get("loaded_skills") or []).runtime
         round_index = state.get("round_index", 0) + 1
         completion = None
         channel_failure: str | None = None
@@ -619,7 +859,7 @@ def build_graph(runtime: TicketRuntime) -> StateGraph:
             item
             for item in proposals
             if cs.requires_approval(item["name"])
-            or (state.get("must_escalate") and cs.TIER_BY_TOOL[item["name"]] != cs.READ)
+            or (state.get("must_escalate") and cs.tier_of(item["name"]) != cs.READ)
         ]
         _trace(
             "act",
@@ -647,7 +887,7 @@ def build_graph(runtime: TicketRuntime) -> StateGraph:
             "intent": state.get("intent"),
             "risk_level": state.get("risk_level"),
             "reason": "资金类操作必须人工确认"
-            if any(cs.TIER_BY_TOOL[item["name"]] == cs.FUND for item in state["gated"])
+            if any(cs.tier_of(item["name"]) == cs.FUND for item in state["gated"])
             else "这张工单已被判定需要人工把关",
             "calls": [
                 {"id": item["id"], "name": item["name"], "arguments": item["arguments"]}
@@ -712,11 +952,20 @@ def build_graph(runtime: TicketRuntime) -> StateGraph:
         }
 
     async def execute(state: TicketState) -> dict[str, Any]:
-        rt = runtime.tool_runtime(state.get("risk_level") or "low")
+        risk = state.get("risk_level") or "low"
+        surface = _surface(risk, list(state.get("loaded_skills") or []))
+        rt = surface.runtime
         new_messages: list[dict[str, Any]] = []
         calls_used = state.get("calls_used", 0)
         failures = state.get("failures_streak", 0)
         round_index = state.get("round_index", 0)
+
+        # 委派那几笔账记在 runtime 上，因为写它的是工具处理器，那里拿不到 state。
+        # 每次进这个节点先用状态里的持久值校准：挂起恢复之后 runtime 是新建的
+        # （计数器归零），而状态里那份才是"这张工单到目前为止委派了几次"的真值。
+        runtime.delegations_used = int(state.get("delegations") or 0)
+        calls_before = runtime.delegated_calls
+        cost_before = runtime.delegated_cost
 
         for call_spec in state.get("proposals", []):
             result = await rt.execute(
@@ -748,15 +997,33 @@ def build_graph(runtime: TicketRuntime) -> StateGraph:
                 result_excerpt=result.content[:2000],
                 round_index=round_index,
             )
+        # 子代理内部的工具调用并进这张工单的调用数。委派对主循环只是"一次工具调用"，
+        # 而它内部是一个 3~5 轮的循环——不并的话 ``TICKET_MAX_TOOL_CALLS`` 这条
+        # 治理上限在开委派之后会被成倍绕过，而 state 里的数字看起来完全正常。
+        calls_used += runtime.delegated_calls - calls_before
+        spent_by_subagents = runtime.delegated_cost - cost_before
+
         db.commit()
-        return {
+        updates: dict[str, Any] = {
             "calls_used": calls_used,
             "failures_streak": failures,
             "blocked_writes": blocked_writes_now(),
             "proposals": [],
             "gated": [],
             "messages": new_messages,
+            # SOP 名单写回状态：几天之后恢复回来，"这份正文已经注入过了"还得成立，
+            # 否则同一份几千字的规程会被再灌一遍
+            "loaded_skills": list(surface.loaded.names),
+            "delegations": runtime.delegations_used,
         }
+        if spent_by_subagents or runtime.delegated_cost_known:
+            # 和主循环那侧同一套取舍：委派那边算得出钱才并进金额，只"知道花了钱但
+            # 不知道多少"时只置 cost_known——把未知折成 0 等于宣布这张单没花钱，
+            # 而成本熔断的正面就是这句话。
+            updates["cost_used"] = float(state.get("cost_used") or 0.0) + spent_by_subagents
+            updates["cost_known"] = True
+            runtime.delegated_cost_known = False
+        return updates
 
     def _settle(state: TicketState) -> None:
         """把这张工单累计的成本落到工单上。未知就留 NULL，不写 0。"""
@@ -1015,6 +1282,8 @@ async def run_ticket(
         "cost_used": 0.0,
         "cost_known": False,
         "plan": [],
+        "loaded_skills": [],
+        "delegations": 0,
     }
 
     # 整次运行开一个 trace：模型调用往里写 span，退出时批量落 trace_spans。

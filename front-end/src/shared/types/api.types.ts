@@ -1,6 +1,21 @@
-// 基于Python后端的数据模型定义TypeScript类型
+/**
+ * 后端数据模型的 TypeScript 对照。
+ *
+ * 三条规矩，每条都对应一个曾经真实发生过的 bug：
+ *
+ * 1. **响应一律 camelCase，请求体一律 snake_case。** 后端 router 手工拼 camelCase
+ *    的 dict，而 Pydantic 请求模型没有 alias 生成器。照着旧字段名写会静默拿到
+ *    `undefined`，而 `undefined` 在 JSX 里渲染成空白，看起来像"这条没有数据"。
+ * 2. **速率与成本类字段的 `null` 是"不知道"，不是 0。** 后端刻意在样本不足时回
+ *    null（否则"错误操作率 0%"会被读成"零错误"），界面必须显示"未知"而不是 0。
+ * 3. **一个接口没有活的调用方就删掉。** 上一版这里躺着 60 个接口，其中 40 个的
+ *    主人（对话工作台、本机文件、报销审核、长期记忆、消息反馈）已经和后端模块
+ *    一起删了——留着它们不会报错，只会让人以为那些能力还在。
+ *
+ * 枚举值全部对着 router 与 services 的字面量抄，不要凭语义猜。
+ */
 
-// ========== Auth认证相关类型 ==========
+// ========== Auth ==========
 
 export interface User {
   id: string;
@@ -41,35 +56,356 @@ export interface TokenResponse {
   expires_in: number;
 }
 
-// ========== Chat相关类型 ==========
+// ========== 工单 ==========
 
-export interface Message {
+/**
+ * 工单状态机取值（对齐 models.Ticket.status 与 graph 的落库点）。
+ *
+ * `awaiting_approval` 与 `escalated` 是"有人在等"的两档，界面上必须跳在最前面；
+ * 其余按处理时序排列。用宽松联合 + string 兜底：后端加了新状态时界面该照常渲染，
+ * 而不是编译期就红掉。
+ */
+export type TicketStatus =
+  | "new"
+  | "understanding"
+  | "planning"
+  | "acting"
+  | "awaiting_approval"
+  | "escalated"
+  | "resolved"
+  | "closed"
+  | "failed"
+  | (string & {});
+
+export type TicketRisk = "low" | "mid" | "high";
+
+/** 渠道取值来自 TICKET_CHANNELS 配置，默认这六个（phone/wecom 尚无入站适配器） */
+export type TicketChannel =
+  | "web_chat"
+  | "email"
+  | "app"
+  | "wecom"
+  | "phone"
+  | "api";
+
+/**
+ * 工具权限档位。资金类必过人审——这条是治理的唯一判据（后端 TIER_BY_TOOL），
+ * 界面用它决定一条调用要不要盖"待批准"的章。
+ */
+export type ToolTier = "read" | "mutate" | "fund";
+
+/** GET /tickets 列表项（后端 brief 形状） */
+export interface TicketSummary {
   id: string;
+  channel: TicketChannel;
+  status: TicketStatus;
+  riskLevel: TicketRisk | null;
+  intent: string | null;
+  subject: string | null;
+  summary: string | null;
+  customerId: string | null;
+  assigneeId: string | null;
+  resolution: string | null;
+  escalationReason: string | null;
+  csatScore: number | null;
+  toolRounds: number | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  resolvedAt: string | null;
+  /** SLA 到点时间。超期未结的后端会在队列响应里单独给计数 */
+  slaDueAt: string | null;
+  firstResponseAt: string | null;
+}
+
+/** GET /tickets/{id} 的完整工单：在 brief 之上多出来的都是回放与处置要用的原文 */
+export interface TicketDetail extends TicketSummary {
+  requestText: string;
+  /**
+   * 理解层抽出的事实。**后端已经把 JSON 列解析过了**（`_loads`），所以这里是对象
+   * 而不是字符串——把它当字符串再 `JSON.parse` 会得到一个对象，然后
+   * "objects are not valid as a React child" 在页面上炸掉整棵树。
+   * 解析失败时后端回 null，界面按"还没有抽取结果"处理。
+   *
+   * 值可能是嵌套的（`identity`、`channel_metadata`），渲染前必须逐层摊平成字符串。
+   */
+  entities: Record<string, unknown> | null;
+  attachments: unknown[] | null;
+  resolutionNote: string | null;
+  csatComment: string | null;
+  /** 这张工单累计的模型成本。null = 未知，不是免费 */
+  llmCost: string | null;
+  closedAt: string | null;
+}
+
+export interface TicketQueueResponse {
+  /** 工单域总开关。关着时列表为空，而"关着"和"没有工单"必须分开说 */
+  enabled: boolean;
+  total: number;
+  tickets: TicketSummary[];
+  reapedOverdue: number;
+  overdueStillOpen: number;
+  /** 工具名 → 档位。界面用它给每一次调用上色，不再自己维护一份名单 */
+  toolTiers: Record<string, ToolTier>;
+}
+
+/** POST /tickets 的请求体。后端字段是 snake_case，这里保持同名以免逐字翻译出错 */
+export interface SubmitTicketRequest {
+  channel: TicketChannel;
   content: string;
-  role: "user" | "assistant" | "system";
-  model?: string;
-  chatId: string;
-  createdAt: string;
+  subject?: string;
+  external_ref?: string;
+  customer_email?: string;
+  customer_phone?: string;
+  customer_ref?: string;
+  attachments?: string[];
+  metadata?: Record<string, unknown>;
 }
 
-export interface Chat {
+export interface SubmitTicketResponse {
+  ticketId: string;
+  created: boolean;
+  /** 命中已有工单时那张单的 id：同一渠道+内容重复提交不该产生第二张 */
+  dedupedAgainst: string | null;
+  customerId: string | null;
+  status: TicketStatus;
+}
+
+/**
+ * 挂在人身上的那份待批内容，即 graph 的 ``interrupt()`` 载荷。
+ *
+ * **这个对象是 snake_case**——它不是 router 拼的 dict，而是编排层的中断载荷被
+ * 检查点原样存下来后透出来的。按 camelCase 读会拿到 undefined，而表现是审批
+ * 卡片上一片空白：标题、原因、参数全不见，只剩两个按钮——那是一张"看不清就点了"
+ * 的卡片，正是人在回路最不该变成的样子。
+ */
+export interface PendingCall {
   id: string;
-  title: string;
-  userId: string;
-  createdAt: string;
-  updatedAt: string;
+  name: string;
+  arguments: string;
 }
 
-export interface ChatSession {
+export interface PendingInterrupt {
+  ticket_id: string;
+  workspace_id: string | null;
+  intent: string | null;
+  risk_level: TicketRisk | null;
+  reason: string;
+  calls: PendingCall[];
+  round_index: number;
+}
+
+export interface PendingTicket {
+  /** 解析失败时为 null：工单还在等人，但检查点里读不出待批内容 */
+  pending: PendingInterrupt | null;
+}
+
+export interface PendingApprovalListResponse {
+  count: number;
+  items: (TicketSummary & PendingTicket)[];
+}
+
+/** POST /tickets/{id}/decision 的请求体 */
+export interface DecisionRequest {
+  approved: boolean;
+  /** 给人看的理由，也是审计里那一条的说明 */
+  note?: string;
+  /**
+   * 改过的参数：{被批准的 call_id: {已有键名: 新值}}。
+   * 后端只允许改**已有的键**（approval.validate_edit），新增键整份被拒——
+   * 要求的是"看到什么就批什么"。
+   */
+  edited?: Record<string, Record<string, unknown>>;
+}
+
+/** POST /tickets/{id}/run 的返回（一次运行的观察结果） */
+export interface TicketRunResult {
+  outcome: "resolved" | "escalated" | "awaiting_approval" | "failed" | string;
+  reply: string | null;
+  escalationReason: string | null;
+  plan: { goal: string; tool?: string }[];
+  pending: PendingInterrupt | null;
+  rounds: number;
+  /** 这一趟有没有拿到过用量。false 时 costUsed 的 0 读作"不知道" */
+  costKnown: boolean;
+  costUsed: number;
+}
+
+export interface CsatResponse {
+  ticketId: string;
+  csatScore: number;
+}
+
+export interface CloseTicketResponse {
+  ticketId: string;
+  status: TicketStatus;
+  resolution: string;
+}
+
+/** GET /tickets/{id}/events 的一步。node/kind 是自由文本，界面按"有就显示"处理 */
+export interface TicketTraceEvent {
+  seq: number;
+  node: string;
+  kind: string;
+  status: string | null;
+  tool: string | null;
+  /** 参数的 sha256 摘要。和审批记录里的是同一个算法，因此可以直接对账 */
+  argumentsDigest: string | null;
+  argumentsPreview: string | null;
+  result: string | null;
+  message: string | null;
+  roundIndex: number | null;
+  createdAt: string | null;
+}
+
+export interface TicketEventsResponse {
+  ticketId: string;
+  events: TicketTraceEvent[];
+}
+
+/** GET /tickets/metrics。所有 rate 都可能为 null，含义是"样本不足" */
+export interface TicketMetrics {
+  windowDays: number;
+  total: number;
+  terminal: number;
+  deflectionRate: number | null;
+  humanHandoffRate: number | null;
+  avgHandleMinutes: number | null;
+  avgFirstResponseMinutes: number | null;
+  csatAverage: number | null;
+  csatResponses: number;
+  llmCostTotal: number | null;
+  /** 价目表没命中的工单数：它们花了钱，只是算不出多少 */
+  unpricedTickets: number;
+  slaOverdueStillOpen: number;
+  rejectedAttemptRate: number | null;
+  errorActionRate: number | null;
+  reviewedOperations: number;
+  unreviewedOperations: number;
+  wrongByCorrectiveAction: Record<string, number>;
+  operations: {
+    executed: number;
+    replayed: number;
+    failed: number;
+    blocked: number;
+    pendingApproval: number;
+  };
+}
+
+/** GET /tickets/governor/state */
+export interface GovernorState {
+  paused: boolean;
+  pauseReason: string | null;
+  /** 金额一律字符串：JSON 数字走 float，在钱的算术上迟早咬人 */
+  dailyRefundLimit: string;
+  refundUsedToday: string;
+  maxCostPerTicket: string | null;
+  perTicketToolCalls: number | null;
+  refundReviewThreshold: string | null;
+}
+
+export interface GovernorPauseResponse {
+  paused: boolean;
+  pauseReason: string | null;
+}
+
+/** GET /tickets/outbox：欠客户的话，以及它排在队列里的哪一段 */
+export interface OutboxItem {
   id: string;
-  title: string;
-  date: string;
-  pinned: boolean;
+  ticketId: string;
+  kind: "reply" | "csat_invite" | string;
+  channel: TicketChannel;
+  recipient: string | null;
+  status: "pending" | "sending" | "sent" | "failed" | "suppressed";
+  attempts: number;
+  error: string | null;
+  /** 正文前 500 字。抑制一条时该看得见自己按什么按的 */
+  body: string | null;
+  createdAt: string | null;
+  sentAt: string | null;
 }
 
-// ========== Knowledge相关类型 ==========
+export interface OutboxResponse {
+  /** 没有接任何真实发送通道时为 false：这时发不出去不是故障，是没有出口 */
+  senderConnected: boolean;
+  pending: number;
+  items: OutboxItem[];
+}
 
-/** 文档可见性。workspace = 工作区共享（仅 admin 可增删），private = 仅上传者可见 */
+export interface OutboxDrainResult {
+  sent: number;
+  failed: number;
+  suppressed: number;
+  [key: string]: unknown;
+}
+
+/** 操作台账里的一条写操作。错误操作率的真数据源就是它的 verdict/action */
+export interface OperationRow {
+  id: string;
+  ticketId: string | null;
+  tool: string | null;
+  operation: string | null;
+  permission: ToolTier | string | null;
+  status: string;
+  amount: string | null;
+  currency: string | null;
+  argumentsPreview: string | null;
+  resultPreview: string | null;
+  /** 人工复核结论。null = 还没人看过 */
+  verdict: string | null;
+  correctedAction: string | null;
+  reviewNote: string | null;
+  reviewedBy: string | null;
+  createdAt: string | null;
+}
+
+export interface OperationListResponse {
+  count: number;
+  items: OperationRow[];
+}
+
+export interface OperationReviewRequest {
+  verdict: string;
+  /** 处置动作，≤40 字。错误操作率按这一列分桶 */
+  action?: string;
+  note?: string;
+}
+
+// ========== 线上健康 ==========
+
+export interface HealthBreach {
+  metric: string;
+  value: number;
+  threshold: number;
+}
+
+export interface HealthReport {
+  windowHours: number;
+  totalTickets: number;
+  /** 样本够不够判阈值。不够时 breaches 为空，但那不代表"健康" */
+  sufficient: boolean;
+  metrics: {
+    errorRate?: number;
+    interventionRate?: number;
+    failedTickets?: number;
+    intervenedTickets?: number;
+    avgCostPerTicket?: number | null;
+    p95CostPerTicket?: number | null;
+    p95HandleMs?: number | null;
+    ticketsWithKnownCost?: number;
+    [key: string]: unknown;
+  };
+  breaches: HealthBreach[];
+}
+
+export interface HealthResponse {
+  enabled: boolean;
+  report: HealthReport;
+  alertsCreated: number;
+}
+
+// ========== 知识库 ==========
+
+/** workspace = 团队共享（仅 admin 可增删），private = 只进上传者自己的检索 */
 export type DocumentVisibility = "workspace" | "private";
 
 export interface KnowledgeDocument {
@@ -79,93 +415,80 @@ export interface KnowledgeDocument {
   chunks: number;
   status: "indexed" | "processing" | "failed";
   createdAt: string;
-  /** 旧版后端不返回，缺省按共享处理（那是这一列加上去之前的语义） */
   visibility?: DocumentVisibility;
-  /**
-   * 是不是当前用户自己上传的。**由后端算**而不是前端比 user_id：
-   * 前端手上不一定有当前用户 id，而这个判断错了就是一个能点但会 403 的删除按钮。
-   */
+  /** 由后端算：前端比 user_id 会做出一个"能点但 403"的删除按钮 */
   isOwn?: boolean;
-  /**
-   * 上传者显示名。列表里出现别人的个人文档时（只有 admin 会）用来说明"该找谁"，
-   * 因为那些文档 admin 看得见但删不掉。
-   */
   ownerName?: string | null;
-  /**
-   * 原上传者的账号已被删除，这一篇是被收编成共享文档的。
-   *
-   * 后端判据是"共享但没有上传者"——正常上传总会带 uploader_id。
-   * 界面要标出来：这不是团队有意发布的资料，而是某个离开的人留下的，
-   * 值得看一眼再决定删或留。
-   */
+  /** 上传者账号已删除、被收编成共享文档 */
   inherited?: boolean;
   /**
-   * 这一篇会不会进**当前用户**的检索。
-   *
-   * admin 的列表里包含全体成员的个人文档，而那些**不参与他的检索**
-   * （后端 `HybridRetriever._retrievable_by` 不认角色）。所以"可见"和"会被引用"
-   * 是两件事，界面必须分开说——否则 admin 看到一份文档却问不出内容，
-   * 只会以为检索坏了。
-   *
-   * 旧版后端不返回时缺省 true，那时两者本来就是一回事。
+   * 会不会进**当前用户**的检索。admin 看得见成员的个人文档但检索不到它们，
+   * 所以"可见"与"会被引用"是两件事，界面要分开说。
    */
   retrievable?: boolean;
+  parseBackend?: string | null;
+  parseWarnings?: string[];
+  /** 非终态文档带上的队列进度 */
+  jobStatus?: string | null;
+  jobProgress?: number | null;
+  jobAttempts?: number | null;
 }
 
 export interface UploadDocumentResponse extends KnowledgeDocument {
-  /** true 表示内容哈希命中已有文档,本次没有重复索引 */
+  /** true 表示内容哈希命中已有文档，本次没有重复索引 */
   duplicate: boolean;
 }
 
-// ========== Workspace相关类型 ==========
+export interface KnowledgeQueryChunk {
+  document_id: string;
+  document_name: string;
+  chunk_index: number;
+  chunk_range?: [number, number] | null;
+  content: string;
+  /** 稠密通道得分；null 表示只被 BM25 命中 */
+  score: number | null;
+  fusion_score?: number | null;
+  channels?: string[];
+}
+
+export interface KnowledgeQueryResult {
+  query: string;
+  results: KnowledgeQueryChunk[];
+  total: number;
+}
+
+/** 引用点击看原文：命中块 + 邻域 */
+export interface DocumentChunkView {
+  documentId: string;
+  documentName: string;
+  chunks: { chunkIndex: number; content: string }[];
+}
+
+// ========== 工作区 ==========
 
 export interface WorkspaceMember {
   id: string;
   name: string;
-  /** `member` 是历史值，语义等同 `user`（见 WorkspaceInfo.role） */
+  /** `member` 是历史值，语义等同 `user`；权限一律看 isAdmin */
   role: "admin" | "user" | "member";
-  /**
-   * 下面三个是**管理字段**，只有 admin 拿得到（后端按 is_admin 决定发不发）。
-   * 普通成员看到的成员项里它们完全不存在——名册本身全员可见（同一个空间里
-   * 知道彼此是谁不是特权），但 email 是 PII。
-   *
-   * 所以它们都是可选的，而界面上要按 `isAdmin` 判断该不该渲染管理列，
-   * 不要靠"email 有没有值"去推断权限。
-   */
+  /** 管理字段，只有 admin 拿得到。渲染时按 isAdmin 判断，不要靠"有没有 email"推断权限 */
   email?: string;
   isActive?: boolean;
-  /** 这一行是不是当前登录的人。自己那行的移除按钮要禁掉 */
   isSelf?: boolean;
 }
 
 export interface WorkspaceInfo {
   id: string;
   name: string;
-  /**
-   * ``admin`` 管共享文档与邀请码；``user`` 只管自己的私有文档。
-   * ``member`` 是历史值（语义等同 ``user``），存量账号上还可能出现，
-   * 所以判断权限一律用 ``isAdmin`` 而不是比这个字段。
-   */
   role: "admin" | "user" | "member";
-  /** 唯一的权限判据。后端算好，前端不要自己比 role */
   isAdmin?: boolean;
   memberCount: number;
   members: WorkspaceMember[];
-  /**
-   * 还剩几个管理员。界面靠它决定"最后一个管理员"那两个动作要不要禁掉。
-   *
-   * 后端直接给，而不是让前端数 `members` 里的 admin：那是把一条不变量抄到
-   * 第二个地方，而它在后端是拒绝的依据。两处算法漂移的表现是按钮可点、
-   * 点了报错。
-   *
-   * 可选是为了兼容旧后端。
-   */
+  /** 后端直接给最后一个管理员的计数，前端不要再数一遍成员列表 */
   adminCount?: number;
-  /** 邀请码只发给 admin；user 拿到的是 null，界面上就不该出现它 */
   inviteCode?: string | null;
 }
 
-/** PATCH/DELETE /workspace/members/... 的返回。带整份 info，省一次 GET */
 export interface WorkspaceMemberMutationResponse {
   success: boolean;
   workspace: WorkspaceInfo;
@@ -177,747 +500,108 @@ export interface JoinWorkspaceResponse {
   success: boolean;
   workspace: WorkspaceInfo;
   /**
-   * 原空间里这个人能看到的文档数。加入是**换空间**不是多一个空间
-   * （后端 ``User.workspace_id`` 是单值外键），这些文档不会被删，
-   * 但加入后不再出现在任何检索里——必须提示，静默切换会让人以为资料丢了。
+   * 原空间里这个人能看到的文档数。加入是**换空间**不是多一个空间，
+   * 这些文档不会被删但也不会再出现在检索里——必须提示，否则像丢了资料。
    */
   leftBehindDocuments: number;
 }
 
-// ========== Prompt相关类型 ==========
+// ========== SOP 作业指导 ==========
 
-export interface Prompt {
+export interface BuiltinSkill {
+  name: string;
+  description: string;
+  /** 附带文件名，模型用 read_skill_file 取 */
+  attachments: string[];
+  /** 逗号分隔。Agent 必须先拿齐这些才能下结论 */
+  requiredInputs: string;
+  /** 被同名的工作区 SOP 盖掉了。不显示的话 admin 会以为自己写的那份没生效 */
+  overridden: boolean;
+}
+
+export interface WorkspaceSkill {
   id: string;
-  title: string;
-  description: string | null;
-  category: string;
-  content: string;
-  isPublic: boolean;
-  userId: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface PromptCreateRequest {
-  title: string;
-  description?: string;
-  category?: string;
-  content: string;
-  isPublic?: boolean;
-}
-
-// ========== 系统提示词注册表 ==========
-
-/** archived 的版本只作对照，不建议启用 */
-export type PromptStatus = "active" | "candidate" | "archived";
-
-export interface PromptLibraryVersion {
-  version: string;
-  label: string;
-  status: PromptStatus;
-  notes: string;
-  body: string;
-  chars: number;
-  isActive: boolean;
-}
-
-/** 一类系统提示词及其全部版本。只读——版本是仓库里的文件，不能在线改 */
-export interface PromptLibraryEntry {
-  key: string;
-  purpose: string;
-  activeVersion: string;
-  /** 为 false 说明这类提示词没接版本开关，界面上不提供切换 */
-  switchable: boolean;
-  /** 为 true 才能通过 ChatRequest.prompt_version 单次覆盖（只有对话系统提示词开放） */
-  requestOverridable: boolean;
-  setting: string | null;
-  placeholders: string[];
-  flags: string[];
-  versions: PromptLibraryVersion[];
-}
-
-// ========== Settings相关类型 ==========
-
-export interface AvailableModel {
-  id: string;
-  label: string;
-  provider: string;
-}
-
-export interface ServerSettings {
-  llmBaseUrl: string;
-  configuredModel: string;
-  embeddingModel: string;
-  redisEnabled: boolean;
-  databaseUrl: string;
-}
-
-/**
- * 后端实际注册了哪些能力。不是"开关值"而是"能不能用"——
- * web_search 开关打开但没配 API key 时那个工具根本不注册，这里报 false。
- *
- * 前端据此改变行为而不只是显示状态：`readAttachment` 为 false 时文本附件必须
- * 继续内联全文，否则模型只会拿到一个它读不了的路径。
- */
-export interface ServerCapabilities {
-  calculate: boolean;
-  readAttachment: boolean;
-  webSearch: boolean;
-  writeKnowledge: boolean;
-  toolHistory: boolean;
-  /** 旧版后端不返回这一块 */
-  delegation?: DelegationCapability;
-  /** 旧版后端不返回这一块 */
-  approval?: ApprovalCapability;
-  /** 旧版后端不返回这一块 */
-  fileTypes?: FileTypesCapability;
-  /** 旧版后端不返回这一块 */
-  fs?: FsCapability;
-  /** 完整 Agent 能力档案。旧版后端不返回这一块 */
-  agent?: AgentCapability;
-}
-
-/**
- * 完整 Agent 能力档案：把散在 .env 里、决定"这个 Agent 到底能做什么"的开关
- * 集中报出来。全部只读——改这些要改 .env 重启（进程级配置），所以这里报的是
- * "当前生效值"，给运营方一个"到底开了什么"的单一视图。
- */
-export interface AgentCapability {
-  /** off | plan_execute */
-  planMode: string;
-  guardrails: boolean;
-  memory: boolean;
-  webFetch: boolean;
-  askUser: boolean;
-  deleteKnowledge: boolean;
-  /** 能收图的视觉模型白名单。空 = 视觉关闭（图片只以链接形式留在提示词里） */
-  visionModels: string[];
-  /** memory | qdrant。memory 是多 worker 不能用的那个 */
-  vectorStore: string;
-  /** 主模型备用链。空 = 没有降级路径 */
-  fallbackModels: string[];
-  /** 生效的提示词版本（resolve 后的，不是配置项的字面空串） */
-  promptVersion: string;
-}
-
-/**
- * 本机文件能力。
- *
- * `enabled` 报的是**工具真的注册了吗**，不是单个开关值——和 `webSearch` 同一个
- * 道理。而 `hasRoots` 单独给，是因为这两种"没有文件能力"该给用户相反的下一步：
- *
- * - `enabled=false`：后端没开。授权文件夹也没用，别引导他去点。
- * - `enabled=true` 且 `hasRoots=false`：开着但没授权。这时该引导去设置里选一个，
- *   而不是摆出一个点开是空的文件树。
- */
-export interface FsCapability {
+  name: string;
+  description: string;
+  instructions: string;
   enabled: boolean;
-  hasRoots: boolean;
-  writeEnabled: boolean;
-  deleteEnabled: boolean;
+  requiredInputs: string;
+  /** 正文/描述/前置材料变了才 +1。SOP 是给人读的规程，没有版本号的修改无法追溯 */
+  version: number;
+  updatedAt: string | null;
 }
 
-/**
- * 能上传哪些文件。**这里是唯一来源，前端不要再各自维护扩展名清单。**
- *
- * 改动之前这份清单在前后端共有六处副本且已经互相矛盾：`.html` 三处前端都收、
- * 两处后端都不收（知识库上传直接 400）；`.svg` 前端当图片收、后端出于安全
- * 故意排除，而图片分支没有兜底，所以必然报"图片上传失败"。
- * 判据与排除理由见后端 `services/file_types.py`。
- */
-export interface FileTypesCapability {
-  /** 能按纯文本读取、内联进 prompt 的 */
-  text: string[];
-  /** 用 <img> 渲染的。不含 svg（可内嵌 script） */
-  image: string[];
-  /** 要专门解析器的二进制文档，走知识库链路 */
-  document: string[];
-  /** 知识库上传用的 accept：text + document，不含图片 */
-  knowledgeAccept: string;
-  /** 对话附件用的 accept：text + image + document */
-  attachmentAccept: string;
-}
-
-/**
- * 人工审批的配置。``mode`` 为 "off" 时后端不会发出 approval_required，
- * 界面上就不该出现审批卡片，也不该去查待审批列表。
- */
-export interface ApprovalCapability {
-  /** off = 不审批；write = 写操作要人点同意；listed = 由服务端白名单决定 */
-  mode: "off" | "write" | "listed";
-  /** 实际受审批的工具名 */
-  tools: string[];
-  /** 快照是否开启。关着的话审批不可能生效（恢复要跨请求） */
-  checkpoints: boolean;
-}
-
-/**
- * 多代理委派的配置。``mode`` 为 "off" 时后端根本不注册 delegate 工具，
- * 界面上不该出现任何和子代理有关的东西。
- */
-export interface DelegationCapability {
-  /** off = 单代理；augment = 主代理保留全部工具并多一个 delegate；supervisor = 专用工具归子代理 */
-  mode: "off" | "augment" | "supervisor";
-  roles: string[];
-  maxDelegations: number;
-}
-
-export interface UserPreferences {
-  defaultModel: string;
-  temperature: number;
-  maxTokens: number;
-  topP: number;
-}
-
-export interface AppSettings {
-  server: ServerSettings;
-  preferences: UserPreferences;
-  availableModels: AvailableModel[];
-  /** 旧版后端不返回这一块，调用方必须容忍它缺失 */
-  capabilities?: ServerCapabilities;
-}
-
-// ========== API请求类型 ==========
-
-export interface ChatRequest {
-  prompt: string;
-  model?: string;
-  chat_id?: string;
-  use_rag?: boolean;
-  message_id?: string;
-  /** 只对这一次请求生效的系统提示词版本；不传则用服务端默认版本 */
-  prompt_version?: string;
-}
-
-export interface CreateChatRequest {
-  title?: string;
-}
-
-export interface CompletionResponse {
-  success: boolean;
-  data: string;
-  chat_id: string;
-  message_id: string;
-}
-
-// ========== SSE流式响应类型 ==========
-
-/** 一条 RAG 引用。chunk_range 覆盖邻域扩展后的分块区间 */
-export interface Citation {
-  document_id: string;
-  document_name: string;
-  chunk_index: number;
-  chunk_range?: [number, number] | number[];
-  content?: string;
-  /** 稠密通道的余弦相似度；仅稀疏命中时为 null */
-  score?: number | null;
-  fusion_score?: number;
-  /** 命中来源通道：dense / sparse */
-  channels?: string[];
-}
-
-/**
- * 事前规划里的一步。
- *
- * `goal` 是"要得到什么"，`tool` 是手段且**允许为空**：纯推理的步骤（比较两处
- * 规定、汇总、下结论）没有对应工具，后端提示词里明确要求这类步骤把 tool 留空，
- * 硬安一个工具等于鼓励模型乱调（prompts/agent_plan/v1.md）。
- *
- * 没有"已完成"字段，因为后端不跟踪进度：一轮里可能并行调三个工具，也可能一轮
- * 什么都没做完，没有可靠信号说明"这一步完成了"。按轮次推游标是个看起来精确的
- * 假数字（理由写在 services/planner.py 的模块文档）。所以这张卡片显示的是
- * **计划**，不是进度条。
- */
-export interface PlanStep {
-  goal: string;
-  tool?: string;
-}
-
-export interface StreamChunk {
-  type?:
-    | "message_delta"
-    /**
-     * 回合开始，携带 runId。在**任何东西可能断掉之前**就发出——断线之后
-     * runId 是唯一的接续凭证，而 approval_required / clarification 那两类
-     * 事件恰好只在"没断线"的情形下才会到。
-     */
-    | "run_started"
-    /** 接续成功，携带从第几轮接上 */
-    | "run_resumed"
-    /**
-     * 事前规划产出的步骤（AGENT_PLAN_MODE=plan_execute）。
-     *
-     * 只在计划非空时到达：模型判断"直接答就行"是正确输出，那时后端不发这个事件，
-     * 给一张空计划卡片纯属噪声。
-     */
-    | "plan"
-    | "tool_start"
-    | "tool_result"
-    | "tool_rounds_ended"
-    | "citations"
-    | "context_compacted"
-    | "guardrail"
-    | "cache_hit"
-    | "agent_step"
-    | "agent_state"
-    | "approval_required"
-    | "approval_resolved"
-    | "clarification"
-    | "clarification_answered"
-    /**
-     * 用户主动停止（POST /chats/runs/{runId}/cancel）后，循环在安全点收尾时发出。
-     * 与断线不同：这是终态，不会出现在可接续列表里。前端通常在 abort 后读不到它，
-     * 这个分支是跨标签取消 / abort 竞态时的防御性收尾。
-     */
-    | "cancelled"
-    | "done"
-    | "error";
-  content?: string;
-  chat_id?: string;
-  tool?: string;
-  input?: Record<string, unknown>;
-  /** 工具调用所在的 Agent 轮次，从 1 开始 */
-  round?: number;
-  /**
-   * agent_step / agent_state 携带：哪个子代理。
-   * 这两类事件都发生在主代理的一次 delegate 调用内部。
-   */
-  agent?: string;
-  /** agent_step 携带：这一步是开始还是结束。子代理的步骤是成批发出的，两者紧邻 */
-  phase?: "tool_start" | "tool_result";
-  /**
-   * agent_step 携带：子代理**自己**的轮次。
-   * 和 ``round``（主代理轮次）分开：混用会让 researcher 的第 1 轮排到主代理
-   * 第 1 轮旁边，看起来像并行调用。
-   */
-  agentRound?: number;
-  /** agent_state / tool_rounds_ended 携带：子代理或主代理已跑的轮次数 */
-  rounds?: number;
-  /** agent_state 携带：子代理做过的工具步骤数，以及是否因轮次用尽而截断 */
-  steps?: number;
-  truncated?: boolean;
-  /**
-   * plan 携带：事前规划的步骤列表。
-   *
-   * 键名不是 `steps`——那个已经被上面子代理的步骤**数**占了。同一个键在一处是
-   * number、另一处是对象数组，是等着被写错的形状，而写错的表现是计划步数显示成
-   * 工具步数，看起来像个正常数字。
-   */
-  planSteps?: PlanStep[];
-  /**
-   * approval_required / approval_resolved / agent_state 携带：执行记录 id。
-   * 审批要靠它调 POST /chats/runs/{runId}/resume——中断活在数据库里，
-   * 不活在那条已经断掉的 SSE 连接里，所以这个 id 是唯一的接续凭证。
-   */
-  runId?: string;
-  /**
-   * approval_required 携带：给人看的参数预览。
-   * 已在服务端过 mask_markup 并截断——这些值是模型写的，可能整段来自它刚抓的网页。
-   */
-  preview?: Record<string, unknown>;
-  /** approval_required 携带：批准之后会发生什么 */
-  reason?: string;
-  /** approval_resolved 携带：这次裁决是同意还是拒绝 */
-  approved?: boolean;
-  /** approval_required 携带：这份快照的 seq，调试用 */
-  checkpoint?: number | null;
-  /** clarification 携带：模型抛回给用户的问题 */
-  question?: string;
-  /**
-   * clarification 携带：这次澄清能不能**接着原来那一轮**继续。
-   *
-   * `true` 时该调 `POST /chats/runs/{runId}/answer` 把答案送回去——模型手里
-   * 还留着它问问题之前检索到的一切。缺这个键（没开 checkpoint）时只能退回旧
-   * 行为：把回答当成新一轮发出去，代价是前面几轮的工具结果全部丢掉。
-   */
-  resumable?: boolean;
-  /**
-   * clarification 携带：这句问题是**框架从回答正文里收编来的**，模型并没有调
-   * `ask_user`（后端 chat_service._maybe_adopt_prose_question，开关
-   * CLARIFY_ADOPT_PROSE_QUESTION）。
-   *
-   * 恢复端点和模型主动问的那种完全相同（`/answer`），差别只在卡片文案：收编来的
-   * 那句问题在上面那段回答的末尾已经出现过一次，卡片不该再重复渲染一遍。
-   */
-  adopted?: boolean;
-  /** approval_required 携带：这一回合最终回答将要落在哪条 assistant 消息上 */
-  message_id?: string;
-  /** SSE 的子代理状态会额外出现 started / completed / failed */
-  status?:
-    | "ok"
-    | "invalid_arguments"
-    | "unavailable"
-    | "error"
-    | "started"
-    | "completed"
-    | "failed";
-  /** citations 携带：本次检索命中的引用 */
-  items?: Citation[];
-  /** context_compacted 携带：被摘要压缩 / 原样保留的历史条数 */
-  summarized?: number;
-  kept?: number;
-  /** guardrail 携带：命中的注入规则名（只有规则名，不含命中原文） */
-  findings?: string[];
-  /** guardrail 携带：命中规则的累计分数 */
-  score?: number;
-  /** guardrail 携带：被改写掉的协议标记数量 */
-  masked?: number;
-  /** guardrail 携带：该段资料是否因分数超阈值而未注入 */
-  blocked?: boolean;
-  /** cache_hit 携带：与缓存问题的相似度、是否精确匹配、省下的 token */
-  similarity?: number;
-  exact?: boolean;
-  tokensSaved?: number;
-  done?: boolean;
-  error?: string;
-}
-
-/** 检索资料命中提示注入规则时的提示信息 */
-export interface GuardrailNotice {
-  findings: string[];
-  score: number;
-  masked: number;
-  blocked: boolean;
-}
-
-/**
- * 一步工具执行。两条来源共用这个形状（后端 tool_history.serialize 的字段名
- * 就是照 SSE 事件起的）：
- *
- * - 流式期间由 tool_start / tool_result 实时拼出来，没有 id 与结果摘要；
- * - 刷新之后从 GET /chats/:id/tool-steps 取回，字段齐全。
- *
- * 所以除了 round / callIndex / tool 之外都是可选的，渲染时要按"有就显示"处理。
- */
-export interface ToolStep {
-  /** 落库后的步骤 id；流式期间实时拼出来的步骤没有 */
-  id?: string;
-  /** 触发这一回合的**用户**消息 id，不是回答那条的 id */
-  messageId?: string | null;
-  /** Agent 轮次。0 = 系统预检索，不是模型自己决定要查的 */
-  round: number;
-  callIndex: number;
-  tool: string;
-  /** 子代理名称。无此字段表示主代理自己执行的步骤 */
-  agentRole?: string | null;
-  /** 子代理自己的工具轮次；``round`` 始终是外层主代理轮次 */
-  agentRound?: number;
-  /**
-   * 流式期间 tool_start 先到、tool_result 才带回状态，所以会短暂为空。
-   * ``repeated`` = 同参数调用被拦下；``rejected`` = 人工审批被拒，工具没执行。
-   */
-  status?:
-    | "ok"
-    | "invalid_arguments"
-    | "unavailable"
-    | "error"
-    | "repeated"
-    | "rejected";
-  /** 归属的执行记录 id。用来把一条轨迹关联回"这次执行被打断过吗" */
-  runId?: string | null;
-  input?: Record<string, unknown>;
-  citations?: Citation[];
-  /** 结果原文长度。只有落库的轨迹有 */
-  resultChars?: number;
-  /** 结果摘要，长度受后端 TOOL_HISTORY_STEP_CHARS 约束。只有落库的轨迹有 */
-  resultPreview?: string;
-  createdAt?: string | null;
-}
-
-// ========== Agent 线上指标 ==========
-
-/**
- * 委派 / 审批 / 子代理的线上指标。
- *
- * 与离线评估（eval/reports）的分工：这里是**真实流量**上发生的事，样本是用户
- * 真的问过的问题；那边是固定数据集上的可复现对比。前者回答"线上现在什么情况"，
- * 后者回答"改这一版有没有变好"。两者都需要，但不能互相替代。
- */
-export interface AgentMetrics {
-  rangeDays: number;
-  /**
-   * 快照开关。关着的时候 agent_runs 根本不写行，所有数字都是 0——
-   * 界面必须显示"未开启"而不是画一个全零面板，那两件事看起来一样、含义完全不同。
-   */
+export interface SkillsResponse {
+  builtin: BuiltinSkill[];
+  workspace: WorkspaceSkill[];
+  /** SKILL_ENABLED 关着时写了也不生效，要说清楚 */
   enabled: boolean;
-  delegationMode: string;
-  approvalMode: string;
-  totals: AgentMetricsTotals;
-  byRole: AgentRoleMetrics[];
-  /** 空数组表示埋点关闭（成本与延迟来自 trace_spans） */
-  comparison: DelegationComparison[];
+  canEdit: boolean;
 }
 
-export interface AgentMetricsTotals {
-  runs: number;
-  delegatedRuns: number;
-  delegations: number;
-  /** null = 窗口内没有任何执行。不能显示成 0%，那会被读成"从来不委派" */
-  delegationRate: number | null;
-  interrupts: number;
-  interruptedRuns: number;
-  failedRuns: number;
-  waitingApproval: number;
-  avgRounds: number | null;
-}
-
-export interface AgentRoleMetrics {
-  role: string | null;
-  runs: number;
-  failed: number;
-  failureRate: number | null;
-  avgRounds: number | null;
-}
+// ========== 通知 ==========
 
 /**
- * 委派 vs 未委派的对比。这是整个面板真正要看的东西——
- * 单看委派率什么都说明不了，得知道它多花了几倍的钱、慢了几倍。
- */
-export interface DelegationComparison {
-  delegated: boolean;
-  currency: string | null;
-  runs: number;
-  avgRounds: number | null;
-  cost: number | null;
-  avgCost: number | null;
-  promptTokens: number;
-  completionTokens: number;
-  /** 每次回答的平均总耗时（根 span），不是每个 span 的平均 */
-  avgTurnMs: number | null;
-}
-
-// ========== 人工审批与可恢复执行 ==========
-
-/**
- * 一个卡在审批上的执行。
+ * 通知类别决定图标与点击去向。宽松联合 + string 兜底：后端加了新类别时
+ * 界面按默认渲染，而不是整块红掉。
  *
- * 刷新页面之后 SSE 里的 approval_required 已经不存在了，这是唯一能把审批卡片
- * 找回来的地方——中断活在数据库里，不活在那条连接里。
- */
-export interface PendingApproval {
-  runId: string;
-  chatId: string;
-  messageId?: string | null;
-  round: number;
-  /** 这次执行被打断过几次。1 以上说明同一回合里有多个写操作 */
-  interrupts: number;
-  updatedAt?: string | null;
-  /** 等待批准的工具名 */
-  tool?: string | null;
-  /** 批准之后会发生什么 */
-  reason: string;
-  /** 参数预览，已在服务端脱敏截断 */
-  preview: Record<string, unknown>;
-  /**
-   * 哪一种中断。这个列表里现在有三种，**恢复端点不同**，分派错了会拿到 409：
-   *
-   * - `tool_approval`  等裁决 → `POST /chats/runs/{runId}/resume`
-   * - `user_input`     等回答（模型调了 ask_user）→ `POST .../answer`
-   * - `prose_question` 等回答（框架从回答正文里收编的）→ `POST .../answer`
-   *
-   * 可选 + 缺省按 `tool_approval` 处理：这个接口加入 waiting_input 之前只可能是
-   * 审批，老快照的 interrupt_request 里没有这个字段（后端同样这么缺省）。
-   */
-  kind?: "tool_approval" | "user_input" | "prose_question";
-  /** `user_input` / `prose_question` 时携带：要问用户的那句话 */
-  question?: string;
-}
-
-/**
- * 断线留下、可以接着跑的执行。
- *
- * 与 `PendingApproval` 是两种东西：那个在等人做决定，这个只是连接断了。
- * 所以这里没有 tool / reason / preview——没有什么要给人看、要人裁决的。
- */
-export interface ResumableRun {
-  runId: string;
-  chatId: string;
-  messageId?: string | null;
-  /** 断在第几轮。接续会从这一轮之后继续 */
-  round: number;
-  updatedAt?: string | null;
-}
-
-/** 一次执行的详情。子代理是它的 children */
-export interface AgentRunDetail {
-  runId: string;
-  chatId: string;
-  messageId?: string | null;
-  agentRole?: string | null;
-  /**
-   * 后端真实会返回的执行状态全集。之前只列了 5 个，漏了 waiting_input /
-   * interrupted / cancelled：这三个都会真实出现在 GET /chats/runs/{id} 的响应里
-   * （cancelled 是用户主动“停止生成”的终态，见 POST /chats/runs/{id}/cancel）。
-   * 缺一个就会让按状态分支的渲染漏掉那一档。
-   */
-  status:
-    | "running"
-    | "waiting_approval"
-    | "waiting_input"
-    | "interrupted"
-    | "done"
-    | "failed"
-    | "abandoned"
-    | "cancelled";
-  rounds: number;
-  delegations: number;
-  interrupts: number;
-  model?: string | null;
-  promptRef?: string | null;
-  traceId?: string | null;
-  errorType?: string | null;
-  startedAt?: string | null;
-  finishedAt?: string | null;
-  children: AgentRunChild[];
-  checkpoints: AgentCheckpointInfo[];
-}
-
-export interface AgentRunChild {
-  runId: string;
-  agentRole?: string | null;
-  status: string;
-  rounds: number;
-  errorType?: string | null;
-}
-
-/** 快照目录项。只有元信息——正文是整段 messages，调试接口没理由再吐一遍 */
-export interface AgentCheckpointInfo {
-  seq: number;
-  phase: "pre_tools" | "waiting_approval" | "post_tools";
-  round: number;
-  bytes: number;
-  interrupt?: Record<string, unknown> | null;
-  createdAt?: string | null;
-}
-
-/**
- * 一个快照的**只读**回放视图（GET /chats/runs/{runId}/checkpoints/{seq}）。
- *
- * 对齐后端 `checkpoint_store.state_view`：看的是"执行走到这一步时，模型手上有什么、
- * 想调哪些工具、预算还剩多少、哪些工具被熔断了"。正文已裁剪——每条消息截断、只留
- * 最近 N 条、工具参数截断、不含图片 base64。
- *
- * **只读**：回放不重跑（从第 N 轮真的重跑要 fork 新 run 并处理副作用工具的重放，
- * 是另一件事）。`AgentCheckpointInfo` 给目录，这个给某一格的正文。
- */
-export interface CheckpointStateView {
-  seq: number;
-  round: number;
-  phase: string;
-  status: string;
-  /** 裁剪前的消息总数；`messages` 可能只含最近若干条 */
-  messageCount: number;
-  messages: { role: string; content: string }[];
-  /** 这一步模型想调、但还没执行的工具 */
-  pendingCalls: { name: string | null; arguments: string }[];
-  pendingIndex: number;
-  /** 事前规划（AGENT_PLAN_MODE=plan_execute 时非空） */
-  plan: PlanStep[];
-  budgetRemaining: number;
-  /** 被重复调用检测拦下的次数 */
-  repeatBlocked: number;
-  /** 已熔断（本回合移出工具面）的工具名 */
-  breakerTripped: string[];
-  delegationsUsed: number;
-  loadedSkills: string[];
-}
-
-// ========== 通知收件箱 ==========
-
-/**
- * 通知类别。决定图标与点击去向：
- * - `approval_required` / `input_required` → 跳对话去裁决 / 回答（带 chatId）
- * - `run_abandoned` → 超时废弃，只作记录
- * - `health_alert` → 线上健康告警（发给管理员），跳设置
- *
- * 用宽松联合 + string 兜底：后端可能加新类别，前端不认时按默认图标渲染而不是崩。
+ * - `approval_required` → 跳审批收件箱
+ * - `ticket_handoff` → 跳那张工单（转人工，需要有人接手）
+ * - `health_alert` → 跳线上健康（发给管理员的越阈值告警）
  */
 export type NotificationKind =
   | "approval_required"
-  | "input_required"
-  | "run_abandoned"
+  | "ticket_handoff"
   | "health_alert"
   | (string & {});
 
-/**
- * 一条应用内通知（对齐后端 notification_service._to_dict）。
- *
- * 命名 `AppNotification` 而不是 `Notification`：后者是浏览器全局类型，撞名会让
- * 到处 import 的 DOM 类型被悄悄遮盖。
- */
+/** 命名加 App 前缀：`Notification` 是浏览器全局类型，撞名会遮盖 DOM 类型 */
 export interface AppNotification {
   id: string;
   kind: NotificationKind;
   title: string;
   body: string | null;
-  runId: string | null;
-  chatId: string | null;
+  /** 归属工单。null 表示这条不指向某张单（例如全局健康告警） */
+  ticketId: string | null;
   createdAt: string | null;
   readAt: string | null;
   read: boolean;
 }
 
-/** GET /notifications 的返回：当前页 + 总未读数（红点用总数，不是本页数） */
 export interface NotificationListResponse {
   notifications: AppNotification[];
+  /** 总未读数。红点用这个数，不用本页条数 */
   unreadCount: number;
 }
 
-/** 引用点击跳原文：命中块 + 邻域（GET /knowledge/documents/{id}/chunks/{idx}） */
-export interface DocumentChunkView {
-  documentId: string;
-  documentName: string;
-  chunks: { chunkIndex: number; content: string }[];
-}
+// ========== 审计 ==========
 
-// ========== 消息反馈 ==========
-
-/** 差评原因标签，与后端 services/feedback_service.py 的 REASONS 对齐 */
-export type FeedbackReason =
-  | "inaccurate"
-  | "no_citation"
-  | "off_topic"
-  | "bad_format"
-  | "other";
-
-export interface MessageFeedback {
-  messageId: string;
-  rating: "up" | "down";
-  reason?: FeedbackReason | null;
-  comment?: string | null;
-  expectedAnswer?: string | null;
-}
-
-export interface FeedbackSummary {
-  up: number;
-  down: number;
-  rated: number;
-  /** 没有任何反馈时为 null——区分「没人评价」和「评价全是差评」 */
-  satisfaction: number | null;
-  downReasons: { reason: string; count: number }[];
-  /** 还没导出成回归用例的差评数 */
-  pendingExport: number;
-}
-
-// ========== 长期记忆 ==========
-
-/**
- * 跨会话长期记忆。每轮回答结束后由辅助模型从对话里抽取事实与偏好，
- * 注入之后所有会话的系统上下文——删除即立即停止注入。
- */
-export interface UserMemory {
+export interface AuditEntry {
   id: string;
-  /** fact = 客观事实；preference = 用户偏好 */
-  kind: "fact" | "preference";
-  content: string;
-  /** 抽取来源的会话 id，用于追溯这句话是在哪次对话里说的 */
-  chatId: string | null;
-  createdAt: string;
+  /** 同一散列链内的序号。verify 报"第一个断掉的 seq"就靠它 */
+  seq: number;
+  action: string;
+  target: string | null;
+  ticketId: string | null;
+  argumentsPreview: string | null;
+  argumentsDigest: string | null;
+  createdAt: string | null;
 }
 
-// ========== 用量与追踪 ==========
+/** GET /audit 只给这一页，不给总数：审计链的长度不是界面上需要核对的量 */
+export interface AuditListResponse {
+  entries: AuditEntry[];
+}
 
-/** 按某个维度（span 名 / 模型 / kind）聚合出的一行用量 */
+export interface AuditVerifyResponse {
+  ok: boolean;
+  entries: number;
+  /** 链在哪一跳断掉；ok 为 true 时是 null */
+  firstBrokenSeq: number | null;
+}
+
+// ========== 用量与埋点 ==========
+
 export interface UsageGroup {
   name?: string | null;
   model?: string | null;
@@ -927,7 +611,7 @@ export interface UsageGroup {
   completionTokens: number;
   avgMs: number | null;
   totalMs: number;
-  /** null 表示价目表里没有这个模型，即成本未知（不是零成本） */
+  /** null = 价目表里没有这个模型，即成本未知（不是零成本） */
   cost: number | null;
   currency: string | null;
   failures: number;
@@ -941,41 +625,34 @@ export interface UsageSummary {
     turns: number;
     promptTokens: number;
     completionTokens: number;
-    failures: number;
-    /** promptTokens 中被提供商上下文缓存命中的部分（子集，不是增量） */
+    /** promptTokens 中被上下文缓存命中的部分，是子集不是增量 */
     cachedTokens: number;
-    /** 提供商侧上下文缓存命中率；没有回传缓存信息的调用时为 null */
+    /** 分母只算回传过缓存信息的调用；一类都没有时为 null，读作"未知" */
     promptCacheHitRate: number | null;
-    /** 本地估算的 token 占比，越高说明成本数字越只能当量级参考 */
     estimatedTokenShare: number | null;
+    failures: number;
   };
   costs: { currency: string | null; amount: number | null }[];
   byName: UsageGroup[];
   byModel: UsageGroup[];
   byKind: UsageGroup[];
-  /** 语义缓存统计。存在后端进程内存里，重启归零，也不受 rangeDays 约束 */
-  cache: CacheStats;
 }
 
-export interface CacheStats {
-  enabled: boolean;
-  hits: number;
-  misses: number;
-  /** 没查过时为 null——不要显示成 0% 命中率 */
-  hitRate: number | null;
-  tokensSaved: number;
-  threshold: number;
-}
-
+/**
+ * 一次编排运行的概览。
+ *
+ * 一次运行不等于一张工单：挂起等人批之后恢复会再开一条 trace，所以同一张单
+ * 通常有多条。业务轨迹看 /tickets/{id}/events，这里看的是埋点。
+ */
 export interface TraceSummary {
   traceId: string;
-  chatId: string | null;
-  messageId: string | null;
+  ticketId: string | null;
   startedAt: string | null;
   durationMs: number;
   spans: number;
   promptTokens: number;
   completionTokens: number;
+  cachedTokens: number;
   cost: number | null;
   currency: string | null;
   failures: number;
@@ -993,9 +670,11 @@ export interface TraceSpanNode {
   model: string | null;
   promptTokens: number | null;
   completionTokens: number | null;
+  cachedTokens: number | null;
   tokenSource: string | null;
   cost: number | null;
   currency: string | null;
+  /** JSON 字符串：属性只放元数据，不放提示词与用户文本 */
   attributes: string | null;
   children: TraceSpanNode[];
 }
@@ -1005,245 +684,27 @@ export interface TraceDetail {
   roots: TraceSpanNode[];
 }
 
-// ========== UI相关类型 ==========
+// ========== 附件 ==========
 
-export type NavTab =
-  | "dashboard"
-  | "chat"
-  | "traces"
-  | "knowledge"
-  | "prompts"
-  | "settings";
-
-export interface UIMessage extends Omit<Message, "chatId" | "createdAt"> {
-  sessionId: string;
-  timestamp: string;
-  /** RAG 引用来源，仅 assistant 消息可能有；本轮生成结束后不落库 */
-  citations?: Citation[];
-  /** 本轮检索资料命中的注入规则（护栏已中和，仅作提示） */
-  guardrail?: GuardrailNotice;
-  /** 服务端落库后的消息 id(流式 done 时回写),用于关联运行轨迹 */
-  messageId?: string;
-}
-
-/** 知识库检索调试结果(对齐后端 RetrievedChunk.as_dict) */
-export interface KnowledgeQueryChunk {
-  document_id: string;
-  document_name: string;
-  chunk_index: number;
-  chunk_range?: [number, number] | null;
-  content: string;
-  /** 稠密通道得分;null 表示仅稀疏命中 */
-  score: number | null;
-  /** RRF 融合得分 */
-  fusion_score?: number | null;
-  /** 命中通道,如 ["dense","sparse"] */
-  channels?: string[];
-}
-
-export interface KnowledgeQueryResult {
-  query: string;
-  results: KnowledgeQueryChunk[];
-  total: number;
-}
-
-/** 一个被授权给文件工具的本机文件夹。 */
-export interface FsRoot {
-  id: string;
-  /** 用户当初在系统对话框里选的绝对路径，原样存 */
-  path: string;
-  /** 界面上显示的名字，默认是目录名 */
-  label: string;
-}
-
-/**
- * GET /fs/roots 的返回。
- *
- * 开关状态和授权列表一起返回，因为"没有文件能力"有两种完全不同的原因，
- * 而给用户的下一步动作相反：
- *
- * - `enabled=false`：后端没开这个功能。选文件夹也没用，该说清楚而不是让用户
- *   点完发现什么都没变。
- * - `enabled=true` 且 `roots` 为空：功能开着但还没授权。这时该引导他去选一个。
- */
-export interface FsRootsResponse {
-  roots: FsRoot[];
-  enabled: boolean;
-  writeEnabled: boolean;
-  deleteEnabled: boolean;
-  /** 当前配置下会注册的文件工具名 */
-  tools: string[];
-}
-
-/**
- * 一份写操作留下的旧版本。
- *
- * 这是**给用户的撤销**，不是给模型的工具：要撤销的是用户自己批准过的那次写——
- * 审批卡片上只看得到 diff 的前 60 行，同意之后才发现覆盖掉的是别的东西。
- */
-export interface FsBackup {
-  id: string;
-  /** 被写/删的那个文件的绝对路径 */
-  path: string;
-  /** write / edit / delete / restore */
-  action: string;
+export interface AttachmentUploadResult {
+  /** /uploads/... 相对路径，调用方拼 baseUrl */
+  url: string;
+  filename: string;
   size: number;
-  createdAt: string;
-  /** 文件此刻还在不在。删除留下的备份这里是 false */
-  exists: boolean;
+  contentType: string;
+  isImage: boolean;
 }
 
-export interface FsBackupsResponse {
-  backups: FsBackup[];
-  /** 后端没开写工具时为 false：这时列表必然是空的，界面要能区分"没开"和"没写过" */
-  enabled: boolean;
-}
+// ========== UI 专用 ==========
 
-/** /fs/browse 里的一个条目。 */
-export interface FsEntry {
-  name: string;
-  /** 绝对路径，直接拿去请求下一层 */
-  path: string;
-  isDir: boolean;
-  /** 目录为 null；取不到大小时也是 null */
-  size: number | null;
-  /** 这一条是授权根本身，不是根里的内容 */
-  isRoot: boolean;
-  /**
-   * 受凭据保护：agent 读不到、也改删不了（`.env`、私钥、`.ssh/` 之类）。
-   *
-   * 后端只标记不隐藏——这是用户在浏览自己的文件夹，藏起来等于骗他。他要知道的
-   * 恰恰是「授权了这个文件夹，但助手看不到这几个文件」。
-   *
-   * 可选是为了兼容旧后端：缺这个字段时按 false 处理，而不是让整棵树渲染不出来。
-   */
-  protected?: boolean;
-}
-
-/**
- * GET /fs/browse 的返回。
- *
- * `parent` 只在上一级**还在沙箱内**时才有值。根目录的上一级在授权范围外，
- * 后端给 null，界面就不该显示"返回上级"——显示了点下去必然 400。
- */
-export interface FsBrowseResponse {
-  /** 省略 path 请求根列表时为 null */
-  path: string | null;
-  /** 相对授权根的显示名，如 `资料/sub` */
-  label: string | null;
-  parent: string | null;
-  entries: FsEntry[];
-  /** 条目超过 FS_LIST_MAX_ENTRIES 被截断 */
-  truncated: boolean;
-}
-
-/** 一份内置作业指导（仓库里的，只读）。 */
-export interface BuiltinSkill {
-  name: string;
-  description: string;
-  /** 附带文件名。模型用 read_skill_file 读它们 */
-  attachments: string[];
-  /**
-   * 下结论之前必须先拿到的材料，逗号分隔。内置的来自 SKILL.md 的 frontmatter。
-   *
-   * 它不是提示词，是给结论结构提供必填槽位：缺一项就只能是"需要人判断"，
-   * 由后端强制。空串表示这份指导不是审核型的（写作指导就没有）。
-   */
-  requiredInputs: string;
-  /**
-   * 是否被同名的工作区 skill 盖掉了。
-   *
-   * 必须显示出来：不显示的话 admin 写了一份同名的却看不出内置那份已经不生效，
-   * 反过来也会以为自己写的那份没被采用。
-   */
-  overridden: boolean;
-}
-
-/** 一份工作区作业指导（数据库里的，admin 可改）。 */
-export interface WorkspaceSkill {
-  id: string;
-  name: string;
-  description: string;
-  instructions: string;
-  enabled: boolean;
-  /** 同 BuiltinSkill.requiredInputs，逗号分隔 */
-  requiredInputs: string;
-  /**
-   * 规程版本号。正文、描述或前置材料声明变了才 +1（切启用开关不算）。
-   *
-   * 审核结论会引用它，所以它要显示出来：admin 才能对上"这条结论按的是哪一版"。
-   * 改一次 SOP 而版本号不动的话，历史结论的依据就指向一份已经不存在的文本。
-   */
-  version: number;
-  updatedAt: string | null;
-}
-
-/**
- * GET /skills 的返回。
- *
- * 两层分开返回，因为它们能做的操作不同（内置只读）。`canEdit` 是后端按工作区角色
- * 判的——前端不自己推，那件事的判据在服务端（一条 SOP 影响全工作区所有人的执行
- * 方式，不是"上传自己的资料"那个权限级别）。
- */
-export interface SkillsResponse {
-  builtin: BuiltinSkill[];
-  workspace: WorkspaceSkill[];
-  /** 后端有没有开 SKILL_ENABLED。关着时写了也不生效，要说清楚 */
-  enabled: boolean;
-  canEdit: boolean;
-}
-
-/** 审核结论的一档：通过 / 不通过 / 需要人判断。 */
-export type ReviewVerdict = "pass" | "reject" | "needs_human";
-
-/** submit_review 逐项核对的一条必备材料。 */
-export interface ReviewInputCheck {
-  name: string;
-  /** 找到的原值；没找到时为空 */
-  value?: string | null;
-  found: boolean;
-}
-
-/** 台账里的一条审核结论（GET /reviews 的 items[]）。 */
-export interface ReviewLedgerItem {
-  id: string;
-  /** 审的是什么（文件名 / 单号 / 一句话描述） */
-  subject: string;
-  /** 按哪份作业指导审的 */
-  sopName: string;
-  /** 当时那份 SOP 的版本号。内置 SOP 是 0（版本跟 git 走，不由这张表决定） */
-  sopVersion: number;
-  verdict: ReviewVerdict;
-  /** 逐项核对的必备材料 */
-  inputs: ReviewInputCheck[];
-  /** 依据：引用的规程条目 + 材料出处 */
-  basis: string[];
-  /**
-   * 复审跑了几次。1 表示**没做一致性检查**（不是"检查过且一致"）——要和 agreed
-   * 一起读，界面上分开显示，否则一条没复审过的结论会看起来像通过了复审。
-   */
-  runs: number;
-  /** 复审是否一致。runs=1 时它恒为 true，那时读作"没检查过" */
-  agreed: boolean;
-  /** 据以判断的材料原文。null 表示这条是加这一列之前记的 */
-  evidence: string | null;
-  createdAt: string | null;
-  /** 触发这次审核的那段对话，用来回溯"当时怎么审的" */
-  chatId: string | null;
-  resolvedBy: string | null;
-  resolvedAt: string | null;
-  /** 人复核后的处置：approved / rejected / amended。null = 还没人处置 */
-  resolution: string | null;
-  resolutionNote: string | null;
-}
-
-/**
- * GET /reviews 的返回。
- *
- * `enabled` 一起返回：关着开关时台账是空的，而"没开这个功能"和"还没审过任何东西"
- * 在界面上长得一样——不说清用户会以为审核记录丢了。
- */
-export interface ReviewListResponse {
-  items: ReviewLedgerItem[];
-  enabled: boolean;
-}
+/** 左侧导航的模块标识。路由与 NavRail 共用，避免两处各写一份 */
+export type TicketDeskModule =
+  | "queue"
+  | "approvals"
+  | "governance"
+  | "metrics"
+  | "knowledge"
+  | "skills"
+  | "notifications"
+  | "audit"
+  | "workspace";

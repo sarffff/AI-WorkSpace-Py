@@ -1,134 +1,108 @@
 import type {
-  Message,
-  Chat,
-  ChatRequest,
-  CreateChatRequest,
-  CompletionResponse,
-  StreamChunk,
-  KnowledgeDocument,
+  AttachmentUploadResult,
+  AuditListResponse,
+  AuditVerifyResponse,
+  AuthResponse,
+  CloseTicketResponse,
+  CsatResponse,
+  DecisionRequest,
+  DocumentChunkView,
   DocumentVisibility,
+  GovernorPauseResponse,
+  GovernorState,
+  HealthResponse,
   JoinWorkspaceResponse,
+  KnowledgeDocument,
+  KnowledgeQueryResult,
+  LoginRequest,
+  NotificationListResponse,
+  OperationListResponse,
+  OperationReviewRequest,
+  OperationRow,
+  OutboxDrainResult,
+  OutboxResponse,
+  PendingApprovalListResponse,
+  RegisterRequest,
+  SkillsResponse,
+  SubmitTicketRequest,
+  SubmitTicketResponse,
+  TicketDetail,
+  TicketEventsResponse,
+  TicketMetrics,
+  TicketQueueResponse,
+  TicketRisk,
+  TicketRunResult,
+  TokenResponse,
+  TraceDetail,
+  TraceSummary,
   UploadDocumentResponse,
+  UsageSummary,
+  User,
   WorkspaceInfo,
   WorkspaceMemberMutationResponse,
-  LoginRequest,
-  RegisterRequest,
-  AuthResponse,
-  User,
-  TokenResponse,
-  Prompt,
-  PromptCreateRequest,
-  PromptLibraryEntry,
-  AppSettings,
-  UserPreferences,
-  UsageSummary,
-  TraceSummary,
-  TraceDetail,
-  KnowledgeQueryResult,
-   MessageFeedback,
-   FeedbackSummary,
-   UserMemory,
-   ToolStep,
-  AgentMetrics,
-  FsBrowseResponse,
-  FsRoot,
-  FsBackup,
-  FsBackupsResponse,
-  FsRootsResponse,
-  SkillsResponse,
-  WorkspaceSkill,
-  ReviewLedgerItem,
-  ReviewListResponse,
-  PendingApproval,
-  ResumableRun,
-  AgentRunDetail,
-  CheckpointStateView,
-  AppNotification,
-  NotificationListResponse,
-  DocumentChunkView,
 } from "../types/api.types";
 
 /**
- * FastAPI后端API客户端
- * 对接Python后端的所有端点
+ * FastAPI 后端的 API 客户端。
+ *
+ * 一个类而不是按域拆十个模块：认证态（access/refresh token、401 单飞刷新）是
+ * 跨域共享的可变状态，拆开就要在每个模块里重复一次刷新逻辑，而"某个模块忘了
+ * 刷新"这种 bug 只在 token 过期后的第一个请求上出现，测试覆盖不到。
+ *
+ * **这里不再有 SSE/流式**。上一版有 openStream/readStream/reconnect 那一整套
+ * （约 300 行），服务的是对话循环的逐字输出。工单的生命周期比 HTTP 请求长得多
+ * ——一张单可能挂几天等人批——所以提交与执行是两个接口，界面读的是**落库的轨迹**
+ * （GET /tickets/{id}/events），不是一条需要维持的长连接。留着那套只会让人以为
+ * 工单是流式的。
  */
 export class ApiClient {
   private baseUrl: string;
 
-  /** 后端基础 URL（用于拼接附件等静态资源地址） */
-  getBaseUrl(): string {
-    return this.baseUrl;
-  }
   private token: string | null = null;
   private refreshToken: string | null = null;
   private refreshing: Promise<string | null> | null = null;
 
   constructor(baseUrl: string = "http://localhost:3000") {
     this.baseUrl = baseUrl;
-    // 从 localStorage 读取 token
     this.token = localStorage.getItem("access_token");
     this.refreshToken = localStorage.getItem("refresh_token");
   }
 
-  /**
-   * 设置认证 token
-   */
+  /** 拼接附件等静态资源地址用 */
+  getBaseUrl(): string {
+    return this.baseUrl;
+  }
+
   setToken(token: string | null) {
     this.token = token;
-    if (token) {
-      localStorage.setItem("access_token", token);
-    } else {
-      localStorage.removeItem("access_token");
-    }
+    if (token) localStorage.setItem("access_token", token);
+    else localStorage.removeItem("access_token");
   }
 
-  /**
-   * 设置 refresh token
-   */
   setRefreshToken(token: string | null) {
     this.refreshToken = token;
-    if (token) {
-      localStorage.setItem("refresh_token", token);
-    } else {
-      localStorage.removeItem("refresh_token");
-    }
+    if (token) localStorage.setItem("refresh_token", token);
+    else localStorage.removeItem("refresh_token");
   }
 
-  /**
-   * 获取当前 token
-   */
   getToken(): string | null {
     return this.token;
   }
 
-  /**
-   * 获取请求 headers
-   */
-  private getHeaders(): HeadersInit {
-    const headers: HeadersInit = {
-      "Content-Type": "application/json",
-    };
-
-    if (this.token) {
-      headers["Authorization"] = `Bearer ${this.token}`;
-    }
-
-    return headers;
+  private authHeader(token: string | null): Record<string, string> {
+    return token ? { Authorization: `Bearer ${token}` } : {};
   }
 
   /**
-   * 尝试用 refresh token 获取新的 access token
-   * 使用单例模式避免并发刷新
+   * 用 refresh token 换一个新的 access token。
+   *
+   * 单飞（同一个 Promise 复用）：队列页一次并发五六个请求，401 同时到达时
+   * 不能各自去刷——refresh 是一次性凭据，并发刷新的第二个必然失败，
+   * 表现是"页面自己退出了登录"。
    */
   private async tryRefreshToken(): Promise<string | null> {
-    // 如果已经在刷新中,复用同一个 Promise
-    if (this.refreshing) {
-      return this.refreshing;
-    }
-
-    if (!this.refreshToken) {
-      return null;
-    }
+    if (this.refreshing) return this.refreshing;
+    if (!this.refreshToken) return null;
 
     this.refreshing = (async () => {
       try {
@@ -137,15 +111,12 @@ export class ApiClient {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ refresh_token: this.refreshToken }),
         });
-
         if (!response.ok) {
-          // refresh token 也失效了,清除认证
           this.setToken(null);
           this.setRefreshToken(null);
           localStorage.removeItem("user");
           return null;
         }
-
         const data: TokenResponse = await response.json();
         this.setToken(data.access_token);
         return data.access_token;
@@ -160,1413 +131,398 @@ export class ApiClient {
   }
 
   /**
-   * 带自动刷新的 fetch 封装
-   * 当收到 401 时自动尝试刷新 token 并重试一次
-   */
-  private async authedFetch(
-    url: string,
-    options: RequestInit = {},
-  ): Promise<Response> {
-    const response = await fetch(url, {
-      ...options,
-      headers: { ...this.getHeaders(), ...options.headers },
-    });
-
-    if (response.status === 401 && this.refreshToken) {
-      // 尝试刷新 token
-      const newToken = await this.tryRefreshToken();
-      if (newToken) {
-        // 用新 token 重试
-        const retryHeaders: Record<string, string> =
-          typeof options.headers === "object"
-            ? { ...(options.headers as Record<string, string>) }
-            : {};
-        retryHeaders["Authorization"] = `Bearer ${newToken}`;
-        return fetch(url, { ...options, headers: retryHeaders });
-      }
-    }
-
-    return response;
-  }
-
-  // ========== Auth API ==========
-
-  /**
-   * 用户注册
-   * POST /auth/register
-   */
-  async register(request: RegisterRequest): Promise<AuthResponse> {
-    const response = await fetch(`${this.baseUrl}/auth/register`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(request),
-    });
-
-    if (!response.ok) {
-      const error = await response.json();
-      throw { response: { data: error } };
-    }
-
-    const data = await response.json();
-    this.setToken(data.access_token);
-    this.setRefreshToken(data.refresh_token);
-    return data;
-  }
-
-  /**
-   * 用户登录
-   * POST /auth/login
-   */
-  async login(request: LoginRequest): Promise<AuthResponse> {
-    const response = await fetch(`${this.baseUrl}/auth/login`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(request),
-    });
-
-    if (!response.ok) {
-      const error = await response.json();
-      throw { response: { data: error } };
-    }
-
-    const data = await response.json();
-    this.setToken(data.access_token);
-    this.setRefreshToken(data.refresh_token);
-    return data;
-  }
-
-  /**
-   * 获取当前用户信息
-   * GET /auth/me
-   */
-  async getCurrentUser(): Promise<User> {
-    const response = await this.authedFetch(`${this.baseUrl}/auth/me`, {
-      method: "GET",
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch current user: ${response.statusText}`);
-    }
-
-    return response.json();
-  }
-
-  /**
-   * 用户登出
-   * POST /auth/logout
-   */
-  async logout(): Promise<{ success: boolean; message: string }> {
-    const response = await this.authedFetch(`${this.baseUrl}/auth/logout`, {
-      method: "POST",
-    });
-
-    // 即使服务端登出失败也清除本地 token
-    this.setToken(null);
-    this.setRefreshToken(null);
-    localStorage.removeItem("user");
-
-    if (!response.ok) {
-      throw new Error(`Failed to logout: ${response.statusText}`);
-    }
-
-    return response.json();
-  }
-
-  /**
-   * 刷新 token
-   * POST /auth/refresh
-   */
-  async getRefreshToken(): Promise<TokenResponse> {
-    if (!this.refreshToken) {
-      throw new Error("No refresh token available");
-    }
-
-    const response = await fetch(`${this.baseUrl}/auth/refresh`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ refresh_token: this.refreshToken }),
-    });
-
-    if (!response.ok) {
-      this.setToken(null);
-      this.setRefreshToken(null);
-      localStorage.removeItem("user");
-      throw new Error(`Failed to refresh token: ${response.statusText}`);
-    }
-
-    const data = await response.json();
-    this.setToken(data.access_token);
-    return data;
-  }
-
-  // ========== Chat API ==========
-
-  /**
-   * 获取所有对话列表
-   * GET /chats
-   */
-  async getChats(): Promise<Chat[]> {
-    const response = await this.authedFetch(`${this.baseUrl}/chats`, {
-      method: "GET",
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch chats: ${response.statusText}`);
-    }
-
-    return response.json();
-  }
-
-  /**
-   * 获取指定对话的消息列表
-   * GET /chats/{chat_id}/messages
-   */
-  async getMessages(chatId: string): Promise<Message[]> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/chats/${chatId}/messages`,
-      { method: "GET" },
-    );
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch messages: ${response.statusText}`);
-    }
-
-    return response.json();
-  }
-
-  /**
-   * 取回一个对话已落库的工具执行轨迹。
+   * 所有请求的唯一出口。
    *
-   * SSE 里的 tool_start / tool_result 是瞬时事件，刷新页面就没了；这是把那条
-   * 时间线找回来的唯一入口。返回的步骤按时间升序，`messageId` 指向触发那一回合的
-   * **用户**消息，不是回答。
-   */
-  async getToolSteps(chatId: string): Promise<ToolStep[]> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/chats/${chatId}/tool-steps`,
-      { method: "GET" },
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to fetch tool steps: ${response.statusText}`);
-    }
-    const payload = await response.json();
-    return payload.steps ?? [];
-  }
-
-  /**
-   * 创建新对话
-   * POST /chats
-   */
-  async createChat(
-    request: CreateChatRequest = {},
-  ): Promise<{ id: string; title: string }> {
-    const response = await this.authedFetch(`${this.baseUrl}/chats`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(request),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to create chat: ${response.statusText}`);
-    }
-
-    return response.json();
-  }
-
-  /**
-   * 非流式对话
-   * POST /chats/completions
-   */
-  async sendMessage(request: ChatRequest): Promise<CompletionResponse> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/chats/completions`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(request),
-      },
-    );
-
-    if (!response.ok) {
-      throw new Error(`Failed to send message: ${response.statusText}`);
-    }
-
-    return response.json();
-  }
-
-  /**
-   * 发起一个 SSE 请求并在 401 时刷新 token 重试一次。
+   * 错误一律抛 `Error`，消息取后端的 `detail`：那些文案是后端按情形写的中文
+   * （"这张工单不存在"、"仅管理员可暂停"、"TICKET_AGENT_ENABLED=false"），
+   * 比前端自己拼一句 "Failed to fetch" 有用得多，也不需要在这里维护第二份
+   * 状态码→文案的映射。
    *
-   * 普通对话与审批恢复共用它：两者都是"POST 一个 JSON、读回一串 data: 行"，
-   * 解析逻辑抄第二遍的话，以后往流里加字段就得改两处，漏一处的症状是
-   * 恢复之后轨迹少了几步——而且只在用过审批的会话里出现，很难对上原因。
+   * `allow409` 是给提交/执行用的：409 在这里不是故障而是业务答复（工单域没开），
+   * 调用方要能拿到那个 detail 去显示，而不是被当成异常吞掉。
    */
-  private async openStream(
+  private async request<T>(
     path: string,
-    body: unknown,
-    signal?: AbortSignal,
-  ): Promise<Response> {
-    let headers = this.getHeaders();
-    const send = () =>
+    options: RequestInit = {},
+    { allow409 = false }: { allow409?: boolean } = {}
+  ): Promise<T> {
+    const send = (token: string | null) =>
       fetch(`${this.baseUrl}${path}`, {
-        method: "POST",
-        headers: { ...headers, "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal,
+        ...options,
+        headers: {
+          ...(options.body instanceof FormData
+            ? {}
+            : { "Content-Type": "application/json" }),
+          ...this.authHeader(token),
+          ...(options.headers as Record<string, string> | undefined),
+        },
       });
 
-    let response = await send();
+    let response = await send(this.token);
+
     if (response.status === 401 && this.refreshToken) {
-      const newToken = await this.tryRefreshToken();
-      if (newToken) {
-        headers = { ...headers, Authorization: `Bearer ${newToken}` };
-        response = await send();
+      const fresh = await this.tryRefreshToken();
+      if (fresh) response = await send(fresh);
+    }
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      const detail = (body as { detail?: string })?.detail;
+      if (response.status === 409 && allow409) {
+        // 409 当正常返回交出：调用方读 message 显示成"这个能力没开"
+        return { conflict: true, message: detail } as unknown as T;
       }
-    }
-    return response;
-  }
-
-  /** 把一条 SSE 响应逐块解析成 StreamChunk */
-  private async *readStream(
-    response: Response,
-  ): AsyncGenerator<StreamChunk, void, undefined> {
-    const reader = response.body?.getReader();
-    if (!reader) {
-      throw new Error("Response body is null");
-    }
-
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-
-        if (done) {
-          break;
-        }
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith("data:")) {
-            continue;
-          }
-
-          const data = trimmed.slice(5).trim();
-          if (!data) {
-            continue;
-          }
-
-          try {
-            const chunk: StreamChunk = JSON.parse(data);
-            yield chunk;
-          } catch {
-            // 跳过无法解析的 SSE 行
-          }
-        }
-      }
-    } finally {
-      reader.releaseLock();
-    }
-  }
-
-  /**
-   * 流式对话 (SSE)
-   * POST /chats/completions/stream
-   */
-  async *streamMessage(
-    request: ChatRequest,
-    signal?: AbortSignal,
-  ): AsyncGenerator<StreamChunk, void, undefined> {
-    const response = await this.openStream(
-      "/chats/completions/stream",
-      request,
-      signal,
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to stream message: ${response.statusText}`);
-    }
-    yield* this.readStream(response);
-  }
-
-  /**
-   * 裁决一次工具审批，并把这一回合接着跑完。
-   * POST /chats/runs/{runId}/resume
-   *
-   * 响应是 SSE，和普通对话同一套事件——区别只在它是从数据库里的快照接上的，
-   * 所以前端可以用同一个渲染循环处理。
-   *
-   * 409 表示这次执行已经不在等待审批（多开了一个标签页、或者刚才点过一次）。
-   * 这种情况不该当成错误弹给用户，调用方据此把卡片收掉即可。
-   */
-  async *resumeRun(
-    runId: string,
-    approved: boolean,
-    note = "",
-    signal?: AbortSignal,
-    /**
-     * 改过参数再放行。只传**用户真正改过的键**——后端按
-     * `{**原参数, **这里给的}` 合并，没给的键用原值。
-     *
-     * 不能把整份预览回传：预览是 `build_preview` 的产物，字符串被 `mask_markup`
-     * 中和过、还截断到 800 字，整份回传会用有损副本覆盖原文。
-     *
-     * 后端要求 `approved=true` 才接受它（`approved=false` 配编辑是自相矛盾的
-     * 请求，会 422）。
-     */
-    editedArguments?: Record<string, unknown>,
-  ): AsyncGenerator<StreamChunk, void, undefined> {
-    const response = await this.openStream(
-      `/chats/runs/${runId}/resume`,
-      {
-        approved,
-        note,
-        // 没有编辑时**不带这个键**，而不是传 null：后端 `editedArguments: dict | None`
-        // 两者等价，但省掉它让请求体如实反映"这是一次原样批准"。
-        ...(editedArguments ? { editedArguments } : {}),
-      },
-      signal,
-    );
-    if (response.status === 409) {
-      throw new Error("STALE_APPROVAL");
-    }
-    if (!response.ok) {
-      throw new Error(`Failed to resume run: ${response.statusText}`);
-    }
-    yield* this.readStream(response);
-  }
-
-  /**
-   * 回答模型的澄清问题，并**接着原来那一轮**跑下去。
-   * POST /chats/runs/{runId}/answer
-   *
-   * 与 `resumeRun` 分开而不是共用一个带 mode 的方法：载荷没有交集（那个是
-   * 裁决 + 可选的参数修改，这个是一句话），后端的前置状态校验也不同
-   * （`waiting_approval` vs `waiting_input`）。
-   *
-   * **为什么必须接续而不是当成新一轮**：模型问问题的时候，手里还攥着它这一轮
-   * 检索到的一切。把答案作为新消息发出去会丢掉那些工具结果，模型得从头再查一遍
-   * ——用户看到的是"我回答完它又重新搜了一次"。
-   *
-   * 409 表示这个 run 已经不在 `waiting_input`（别的标签页答过了，或者审批
-   * 已超时被标成 abandoned）。同 `resumeRun`，调用方据此把卡片收掉。
-   */
-  async *answerClarification(
-    runId: string,
-    answer: string,
-    signal?: AbortSignal,
-  ): AsyncGenerator<StreamChunk, void, undefined> {
-    const response = await this.openStream(
-      `/chats/runs/${runId}/answer`,
-      { answer },
-      signal,
-    );
-    if (response.status === 409) {
-      throw new Error("STALE_CLARIFICATION");
-    }
-    if (!response.ok) {
-      throw new Error(`Failed to answer clarification: ${response.statusText}`);
-    }
-    yield* this.readStream(response);
-  }
-
-  /**
-   * 接上一个因断线而没跑完的回合。
-   * POST /chats/runs/{runId}/continue
-   *
-   * 与 `resumeRun` 分开而不是加个可选参数：那个要带裁决（同意/拒绝/改参数），
-   * 这个没有任何载荷——没有人做错什么，是连接断了。
-   *
-   * 409 有两种含义，都不该重试：
-   * - 这个回合断在工具执行中途，接上去可能重复写入（服务端拒绝）
-   * - 它已经跑完了，或已经被别的标签页接走了
-   * 统一抛 `NOT_RESUMABLE`，由调用方决定是重新提问还是什么都不做。
-   */
-  async *continueRun(
-    runId: string,
-    signal?: AbortSignal,
-  ): AsyncGenerator<StreamChunk, void, undefined> {
-    const response = await this.openStream(
-      `/chats/runs/${runId}/continue`,
-      {},
-      signal,
-    );
-    if (response.status === 409) {
-      throw new Error("NOT_RESUMABLE");
-    }
-    if (!response.ok) {
-      throw new Error(`Failed to continue run: ${response.statusText}`);
-    }
-    yield* this.readStream(response);
-  }
-
-  /**
-   * 停止一个正在跑的执行。
-   * POST /chats/runs/{runId}/cancel
-   *
-   * 与 `continueRun` 相反：那个是"连接断了、接着跑"，这个是"用户说了别跑了"。
-   * 服务端把执行标成终态 `cancelled`，不会出现在可接续列表里。
-   *
-   * 不是 SSE，普通 JSON 响应。调用方通常在 abort 掉流之前 fire-and-forget 地调它
-   * ——它走的是独立的 fetch，abort 那条 SSE 连接不会影响这个请求送达。
-   */
-  async cancelRun(
-    runId: string,
-  ): Promise<{ runId: string; cancelled: boolean; live: boolean }> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/chats/runs/${runId}/cancel`,
-      { method: "POST" },
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to cancel run: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  /**
-   * 断线留下、可以接着跑的执行。
-   * GET /chats/runs/resumable
-   *
-   * 与 `getPendingApprovals` 分开：那个是"等你做决定"，这个是"连接断了"。
-   * 界面上是两种不同的提示——前者要人裁决，后者只要问一句"接着跑吗"。
-   */
-  async getResumableRuns(): Promise<ResumableRun[]> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/chats/runs/resumable`,
-      { method: "GET" },
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to fetch resumable runs: ${response.statusText}`);
-    }
-    const body = (await response.json()) as { items?: ResumableRun[] };
-    return body.items ?? [];
-  }
-
-  /**
-   * 当前用户所有等待审批的执行
-   * GET /chats/runs/pending
-   *
-   * 刷新页面之后 SSE 里的 approval_required 已经不存在了，这是唯一能把审批
-   * 卡片找回来的入口。
-   */
-  async getPendingApprovals(): Promise<PendingApproval[]> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/chats/runs/pending`,
-      {
-        method: "GET",
-      },
-    );
-    if (!response.ok) {
       throw new Error(
-        `Failed to fetch pending approvals: ${response.statusText}`,
+        detail || `请求失败（${response.status} ${response.statusText}）`
       );
     }
-    return response.json();
+
+    if (response.status === 204) return undefined as T;
+    const text = await response.text();
+    return (text ? JSON.parse(text) : undefined) as T;
   }
 
-  /**
-   * 一次执行的详情（含子代理与检查点列表）
-   * GET /chats/runs/{runId}
-   */
-  async getAgentRun(runId: string): Promise<AgentRunDetail> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/chats/runs/${runId}`,
-      {
-        method: "GET",
-      },
+  private get<T>(path: string, opts?: { allow409?: boolean }) {
+    return this.request<T>(path, { method: "GET" }, opts);
+  }
+
+  private post<T>(path: string, body?: unknown, opts?: { allow409?: boolean }) {
+    return this.request<T>(
+      path,
+      { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) },
+      opts
     );
-    if (!response.ok) {
-      throw new Error(`Failed to fetch run: ${response.statusText}`);
-    }
-    return response.json();
   }
 
+  // ========== Auth ==========
+
   /**
-   * 某次执行第 `seq` 个快照时的**只读**状态（回放用，B4）。
-   * GET /chats/runs/{runId}/checkpoints/{seq}
+   * 注册与登录成功后立刻把两枚 token 存进实例。
    *
-   * `getAgentRun` 的 `checkpoints` 只给目录（seq/phase/round），这里才给那一格的
-   * 正文（已裁剪、不含 base64）。只读、不触发重跑。404 时抛错，调用方据此提示
-   * "该快照已被清理"（AGENT_CHECKPOINT_KEEP 只留最近若干份）。
+   * 不在调用方做：漏一处就意味着后续每个请求都带着空 Authorization 去撞 401，
+   * 而 401 的自动刷新又没有 refresh token——表现是"登录成功但整页都是空的"。
    */
-  async getRunCheckpoint(
-    runId: string,
-    seq: number,
-  ): Promise<CheckpointStateView> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/chats/runs/${runId}/checkpoints/${seq}`,
-      { method: "GET" },
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to fetch checkpoint: ${response.statusText}`);
-    }
-    return response.json();
+  async register(request: RegisterRequest): Promise<AuthResponse> {
+    const data = await this.request<AuthResponse>("/auth/register", {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+    this.setToken(data.access_token);
+    this.setRefreshToken(data.refresh_token);
+    return data;
   }
 
+  async login(request: LoginRequest): Promise<AuthResponse> {
+    const data = await this.request<AuthResponse>("/auth/login", {
+      method: "POST",
+      body: JSON.stringify(request),
+    });
+    this.setToken(data.access_token);
+    this.setRefreshToken(data.refresh_token);
+    return data;
+  }
+
+  getCurrentUser(): Promise<User> {
+    return this.get<User>("/auth/me");
+  }
+
+  async logout(): Promise<{ success: boolean; message: string }> {
+    const result = await this.post<{ success: boolean; message: string }>(
+      "/auth/logout"
+    );
+    this.setToken(null);
+    this.setRefreshToken(null);
+    return result;
+  }
+
+  getRefreshToken(): Promise<TokenResponse> {
+    return this.post<TokenResponse>("/auth/refresh");
+  }
+
+  // ========== 工单：提交、队列、详情、轨迹 ==========
+
   /**
-   * 导出整段对话为可下载的 Markdown 或 JSON（B5）。
-   * GET /chats/{chatId}/export?format=md|json
+   * 提交一张工单。只落库，不驱动执行。
    *
-   * 返回 Blob 而不是解析后的对象：后端带 `Content-Disposition: attachment` 直接吐
-   * 文件正文，调用方据此触发浏览器下载。文件名由后端定（chat-{id}.{ext} 纯 ASCII，
-   * 中文标题在正文里——塞进 header 的 filename 会撞上 latin-1 限制）。
+   * 409（工单域没开）当正常结果交出：调用方显示"后端没开工单能力"，
+   * 而不是抛一个看起来像网络故障的异常。
    */
-  async exportChat(chatId: string, format: "md" | "json" = "md"): Promise<Blob> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/chats/${chatId}/export?format=${format}`,
-      { method: "GET" },
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to export chat: ${response.statusText}`);
-    }
-    return response.blob();
+  submitTicket(body: SubmitTicketRequest): Promise<SubmitTicketResponse> {
+    return this.post<SubmitTicketResponse>("/tickets", body, { allow409: true });
   }
 
-  /**
-   * 重命名对话
-   * PATCH /chats/{chat_id}
-   */
-  async renameChat(
-    chatId: string,
-    title: string,
-  ): Promise<{ id: string; title: string }> {
-    const response = await this.authedFetch(`${this.baseUrl}/chats/${chatId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title }),
+  listTickets(
+    filters: {
+      status?: string;
+      risk?: TicketRisk;
+      mine?: boolean;
+      limit?: number;
+      offset?: number;
+    } = {}
+  ): Promise<TicketQueueResponse> {
+    const params = new URLSearchParams();
+    if (filters.status) params.set("status", filters.status);
+    if (filters.risk) params.set("risk", filters.risk);
+    if (filters.mine) params.set("mine", "true");
+    params.set("limit", String(filters.limit ?? 50));
+    if (filters.offset) params.set("offset", String(filters.offset));
+    return this.get<TicketQueueResponse>(`/tickets?${params.toString()}`, {
+      allow409: true,
     });
-
-    if (!response.ok) {
-      throw new Error(`Failed to rename chat: ${response.statusText}`);
-    }
-
-    return response.json();
   }
 
+  getTicket(ticketId: string): Promise<TicketDetail> {
+    return this.get<TicketDetail>(`/tickets/${encodeURIComponent(ticketId)}`).then(
+      (body) => (body as unknown as { ticket: TicketDetail }).ticket
+    );
+  }
+
+  getTicketEvents(
+    ticketId: string,
+    limit = 500
+  ): Promise<TicketEventsResponse> {
+    return this.get<TicketEventsResponse>(
+      `/tickets/${encodeURIComponent(ticketId)}/events?limit=${limit}`
+    );
+  }
+
+  /** 驱动这张工单往前走一步（或从头跑）。可能返回 awaiting_approval 并挂起 */
+  runTicket(ticketId: string): Promise<TicketRunResult> {
+    return this.post<TicketRunResult>(
+      `/tickets/${encodeURIComponent(ticketId)}/run`,
+      undefined,
+      { allow409: true }
+    );
+  }
+
+  decideTicket(ticketId: string, body: DecisionRequest): Promise<TicketRunResult> {
+    return this.post<TicketRunResult>(
+      `/tickets/${encodeURIComponent(ticketId)}/decision`,
+      body
+    );
+  }
+
+  submitCsat(ticketId: string, score: number, comment = ""): Promise<CsatResponse> {
+    return this.post<CsatResponse>(
+      `/tickets/${encodeURIComponent(ticketId)}/csat`,
+      { score, comment }
+    );
+  }
+
+  closeTicket(
+    ticketId: string,
+    resolution: string,
+    note = ""
+  ): Promise<CloseTicketResponse> {
+    return this.post<CloseTicketResponse>(
+      `/tickets/${encodeURIComponent(ticketId)}/close`,
+      { resolution, note }
+    );
+  }
+
+  // ========== 工单：审批收件箱与治理 ==========
+
   /**
-   * 删除对话
-   * DELETE /chats/{chat_id}
+   * 待批列表。响应里的 `pending` 是编排层的 interrupt 载荷，**snake_case**：
+   * 它不是 router 拼的 dict，而是检查点里原样透出来的那份。见 api.types 的说明。
    */
-  async deleteChat(chatId: string): Promise<{ success: boolean }> {
-    const response = await this.authedFetch(`${this.baseUrl}/chats/${chatId}`, {
-      method: "DELETE",
+  getPendingApprovals(): Promise<PendingApprovalListResponse> {
+    return this.get<PendingApprovalListResponse>("/tickets/pending", {
+      allow409: true,
     });
-
-    if (!response.ok) {
-      throw new Error(`Failed to delete chat: ${response.statusText}`);
-    }
-
-    return response.json();
   }
 
-  /** 截断用户消息之后的旧分支，并可选地更新该用户消息。 */
-  async reviseMessage(
-    chatId: string,
-    messageId: string,
-    content?: string,
-  ): Promise<{ success: boolean; message_id: string; content: string }> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/chats/${chatId}/messages/${messageId}/revise`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(content === undefined ? {} : { content }),
-      },
+  ticketMetrics(days?: number): Promise<TicketMetrics> {
+    const query = days ? `?days=${days}` : "";
+    return this.get<TicketMetrics>(`/tickets/metrics${query}`, { allow409: true });
+  }
+
+  governorState(): Promise<GovernorState> {
+    return this.get<GovernorState>("/tickets/governor/state", { allow409: true });
+  }
+
+  /** 一键暂停。**理由必填**：暂停是个要事后能回答"当时为什么按下去"的动作 */
+  pauseGovernor(reason: string): Promise<GovernorPauseResponse> {
+    return this.post<GovernorPauseResponse>("/tickets/governor/pause", { reason });
+  }
+
+  resumeGovernor(reason: string): Promise<GovernorPauseResponse> {
+    return this.post<GovernorPauseResponse>("/tickets/governor/resume", { reason });
+  }
+
+  unreviewedOperations(days = 7, limit = 50): Promise<OperationListResponse> {
+    const params = new URLSearchParams({ days: String(days), limit: String(limit) });
+    return this.get<OperationListResponse>(
+      `/tickets/operations/unreviewed?${params.toString()}`,
+      { allow409: true }
     );
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.detail || "Failed to revise message");
-    }
-    return response.json();
   }
 
-  // ========== Knowledge API ==========
+  reviewOperation(
+    operationId: string,
+    body: OperationReviewRequest
+  ): Promise<OperationRow> {
+    return this.post<OperationRow>(
+      `/tickets/operations/${encodeURIComponent(operationId)}/review`,
+      body
+    );
+  }
+
+  // ========== 工单：回复出口 ==========
+
+  outboxQueue(status?: string, limit = 50): Promise<OutboxResponse> {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (status) params.set("status", status);
+    return this.get<OutboxResponse>(`/tickets/outbox?${params.toString()}`, {
+      allow409: true,
+    });
+  }
 
   /**
-   * 获取知识库文档列表
-   * GET /knowledge/documents
+   * 催一次投递。没有接任何真实通道时后端不改状态，
+   * 返回的计数会全是 0——那是"没有出口"，不是"发送失败"，界面要分开说。
    */
-  async getDocuments(): Promise<KnowledgeDocument[]> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/knowledge/documents`,
-      { method: "GET" },
+  drainOutbox(limit = 10): Promise<OutboxDrainResult> {
+    return this.post<OutboxDrainResult>(`/tickets/outbox/drain?limit=${limit}`);
+  }
+
+  /** 抑制一条待发消息。理由必填，它进审计 */
+  suppressOutbox(rowId: string, reason: string): Promise<OutboxResponse> {
+    return this.post<OutboxResponse>(
+      `/tickets/outbox/${encodeURIComponent(rowId)}/suppress`,
+      { reason }
     );
+  }
 
-    if (!response.ok) {
-      throw new Error(`Failed to fetch documents: ${response.statusText}`);
-    }
+  // ========== 知识库 ==========
 
-    return response.json();
+  getDocuments(): Promise<KnowledgeDocument[]> {
+    return this.get<KnowledgeDocument[]>("/knowledge/documents");
   }
 
   /**
-   * 上传文档到知识库
-   * POST /knowledge/documents/upload
+   * 上传。`visibility` 显式传而不靠后端默认——两个入口的默认值本来就不同。
+   * 后端还会校验：非 admin 传 workspace 会被 403 挡掉，detail 直接透给调用方。
    */
-  async uploadDocument(
+  uploadDocument(
     file: File,
-    visibility: DocumentVisibility = "workspace",
+    visibility: DocumentVisibility = "workspace"
   ): Promise<UploadDocumentResponse> {
     const formData = new FormData();
     formData.append("file", file);
-    // 显式传而不是靠后端默认：两个入口的默认值不同（知识库页面共享、
-    // chat 附件私有），依赖同一个默认值会让其中一个变成错的。
-    // 后端仍会校验：user 传 workspace 会被 403 挡掉。
     formData.append("visibility", visibility);
-
-    const headers: HeadersInit = {};
-    if (this.token) {
-      headers["Authorization"] = `Bearer ${this.token}`;
-    }
-
-    let response = await fetch(`${this.baseUrl}/knowledge/documents/upload`, {
+    return this.request<UploadDocumentResponse>("/knowledge/documents/upload", {
       method: "POST",
-      headers,
       body: formData,
     });
-
-    // 401 自动刷新重试
-    if (response.status === 401 && this.refreshToken) {
-      const newToken = await this.tryRefreshToken();
-      if (newToken) {
-        headers["Authorization"] = `Bearer ${newToken}`;
-        response = await fetch(`${this.baseUrl}/knowledge/documents/upload`, {
-          method: "POST",
-          headers,
-          body: formData,
-        });
-      }
-    }
-
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(
-        error.detail || `Failed to upload document: ${response.statusText}`,
-      );
-    }
-
-    return response.json();
   }
 
-  /**
-   * 从 URL 抓取网页并加入知识库。
-   * POST /knowledge/documents/from-url
-   *
-   * 后端把网页抓成结构化正文（标题→Markdown、段落分行），以 .md 落库，走与
-   * uploadDocument 相同的后台索引路径。出站请求由 egress 防护（拦私网/云元数据）。
-   */
-  async addDocumentFromUrl(
+  /** 抓网页入知识库。出站由后端 egress 拦私网，前端不需要预校验 */
+  addDocumentFromUrl(
     url: string,
-    visibility: DocumentVisibility = "workspace",
+    visibility: DocumentVisibility = "workspace"
   ): Promise<UploadDocumentResponse & { sourceUrl?: string }> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/knowledge/documents/from-url`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url, visibility }),
-      },
+    return this.post("/knowledge/documents/from-url", { url, visibility });
+  }
+
+  deleteDocument(docId: string): Promise<{ success: boolean }> {
+    return this.request<{ success: boolean }>(
+      `/knowledge/documents/${encodeURIComponent(docId)}`,
+      { method: "DELETE" }
     );
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(
-        error.detail ||
-          `Failed to add document from URL: ${response.statusText}`,
-      );
-    }
-    return response.json();
   }
 
-  /**
-   * 删除知识库文档
-   * DELETE /knowledge/documents/{id}
-   */
-  async deleteDocument(docId: string): Promise<{ success: boolean }> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/knowledge/documents/${docId}`,
-      { method: "DELETE" },
-    );
-
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(
-        error.detail || `Failed to delete document: ${response.statusText}`,
-      );
-    }
-
-    return response.json();
-  }
-
-  // ========== Workspace API ==========
-
-  /**
-   * 当前用户的工作区信息(名称/角色/成员)
-   * GET /workspace
-   */
-  async getWorkspace(): Promise<WorkspaceInfo> {
-    const response = await this.authedFetch(`${this.baseUrl}/workspace`);
-
-    if (!response.ok) {
-      throw new Error(`Failed to load workspace: ${response.statusText}`);
-    }
-
-    return response.json();
-  }
-
-  /**
-   * 凭邀请码加入工作区
-   * POST /workspace/join
-   *
-   * 加入是**换空间**：调用方必须把响应里的 leftBehindDocuments 提示给用户。
-   */
-  async joinWorkspace(inviteCode: string): Promise<JoinWorkspaceResponse> {
-    const response = await this.authedFetch(`${this.baseUrl}/workspace/join`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ invite_code: inviteCode }),
+  queryKnowledge(query: string, topK = 5): Promise<KnowledgeQueryResult> {
+    return this.post<KnowledgeQueryResult>("/knowledge/query", {
+      query,
+      // 请求体是 snake_case：整个透传 camelCase 对象会让 top_k 取默认值，
+      // 于是"调 top_k"这个开关看起来生效、实际从未生效
+      top_k: topK,
     });
-
-    if (!response.ok) {
-      // 400 的 detail 是面向用户的文案（"邀请码无效"、"你已在该工作区中"），
-      // 直接透出去比一句 "Failed to join" 有用
-      const detail = await response
-        .json()
-        .then((body) => body?.detail)
-        .catch(() => null);
-      throw new Error(detail || `加入工作区失败: ${response.statusText}`);
-    }
-
-    return response.json();
   }
 
-  /**
-   * 改一个成员的角色(仅管理员)。
-   * PATCH /workspace/members/{id}
-   *
-   * 四种失败(非管理员、人不在本空间、角色非法、最后一个管理员)后端都回 400,
-   * detail 是面向用户的中文——直接透出去,调用方不需要分辨是哪一种。
-   */
-  async setMemberRole(
-    memberId: string,
-    role: "admin" | "user",
-  ): Promise<WorkspaceMemberMutationResponse> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/workspace/members/${encodeURIComponent(memberId)}`,
-      {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ role }),
-      },
-    );
-
-    if (!response.ok) {
-      const detail = await response
-        .json()
-        .then((body) => body?.detail)
-        .catch(() => null);
-      throw new Error(detail || `修改角色失败: ${response.statusText}`);
-    }
-
-    return response.json();
-  }
-
-  /**
-   * 把一个成员移出工作区(仅管理员)。
-   * DELETE /workspace/members/{id}
-   *
-   * 响应里带整份 workspace,调用方直接拿去替换本地状态——再发一次 GET 会闪。
-   */
-  async removeMember(
-    memberId: string,
-  ): Promise<WorkspaceMemberMutationResponse> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/workspace/members/${encodeURIComponent(memberId)}`,
-      { method: "DELETE" },
-    );
-
-    if (!response.ok) {
-      const detail = await response
-        .json()
-        .then((body) => body?.detail)
-        .catch(() => null);
-      throw new Error(detail || `移除成员失败: ${response.statusText}`);
-    }
-
-    return response.json();
-  }
-
-  /**
-   * 重置邀请码(仅管理员)。旧码立即作废
-   * POST /workspace/invite-code
-   */
-  async regenerateInviteCode(): Promise<{ inviteCode: string }> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/workspace/invite-code`,
-      { method: "POST" },
-    );
-
-    if (!response.ok) {
-      const detail = await response
-        .json()
-        .then((body) => body?.detail)
-        .catch(() => null);
-      throw new Error(detail || `重置邀请码失败: ${response.statusText}`);
-    }
-
-    return response.json();
-  }
-
-  /**
-   * 知识库检索
-   * POST /knowledge/query
-   */
-  async queryKnowledge(
-    query: string,
-    topK: number = 5,
-  ): Promise<KnowledgeQueryResult> {
-    const response = await this.authedFetch(`${this.baseUrl}/knowledge/query`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query, top_k: topK }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to query knowledge: ${response.statusText}`);
-    }
-
-    return response.json();
-  }
-
-  /**
-   * 按 (文档, 分块号) 取原文及相邻分块——引用点击跳原文用（B5）。
-   * GET /knowledge/documents/{documentId}/chunks/{chunkIndex}?window=
-   *
-   * 按**当前用户的检索可见范围**收口（共享 + 自己的私有）：引用来自用户自己那次
-   * 回答的检索，这里让他回看命中块的上下文，但不能借它去读别人的私有文档——
-   * 不可见时后端返回 404（不泄露"存在但不是你的"）。window 后端夹在 0–5。
-   */
-  async getDocumentChunk(
+  getDocumentChunk(
     documentId: string,
-    chunkIndex: number,
-    window = 1,
+    chunkIndex: number
   ): Promise<DocumentChunkView> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/knowledge/documents/${documentId}/chunks/${chunkIndex}?window=${window}`,
-      { method: "GET" },
+    return this.get<DocumentChunkView>(
+      `/knowledge/documents/${encodeURIComponent(documentId)}/chunks/${chunkIndex}`
     );
-    if (!response.ok) {
-      const detail = await response
-        .json()
-        .then((body) => body?.detail)
-        .catch(() => null);
-      throw new Error(detail || `Failed to fetch chunk: ${response.statusText}`);
-    }
-    return response.json();
   }
 
-  // ========== 健康检查 ==========
+  // ========== 工单附件 ==========
 
-  /**
-   * 检查服务器状态
-   */
-  async ping(): Promise<boolean> {
-    try {
-      const response = await fetch(`${this.baseUrl}/`, {
-        method: "GET",
-        headers: {
-          "Content-Type": "application/json",
-        },
-      });
-      return response.ok;
-    } catch {
-      return false;
-    }
-  }
-
-  // ========== Prompt API ==========
-
-  /** 获取提示词列表 */
-  async getPrompts(): Promise<Prompt[]> {
-    const response = await this.authedFetch(`${this.baseUrl}/prompts`, {
-      method: "GET",
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to fetch prompts: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  /**
-   * 获取系统提示词注册表（只读）。
-   * 与 getPrompts 不是一回事：那个是用户自己攒的提示词片段（数据库里的行），
-   * 这个是驱动对话与评估的系统提示词版本（仓库里的文件）。
-   */
-  async getPromptLibrary(): Promise<PromptLibraryEntry[]> {
-    const response = await this.authedFetch(`${this.baseUrl}/prompts/library`, {
-      method: "GET",
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to fetch prompt library: ${response.statusText}`);
-    }
-    const data = await response.json();
-    return data.entries ?? [];
-  }
-
-  /** 创建提示词 */
-  async createPrompt(body: PromptCreateRequest): Promise<Prompt> {
-    const response = await this.authedFetch(`${this.baseUrl}/prompts`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
-      throw new Error(
-        err.detail || `Failed to create prompt: ${response.statusText}`,
-      );
-    }
-    return response.json();
-  }
-
-  /** 更新提示词 */
-  async updatePrompt(
-    id: string,
-    body: Partial<PromptCreateRequest>,
-  ): Promise<Prompt> {
-    const response = await this.authedFetch(`${this.baseUrl}/prompts/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
-      throw new Error(
-        err.detail || `Failed to update prompt: ${response.statusText}`,
-      );
-    }
-    return response.json();
-  }
-
-  /** 删除提示词 */
-  async deletePrompt(id: string): Promise<{ success: boolean }> {
-    const response = await this.authedFetch(`${this.baseUrl}/prompts/${id}`, {
-      method: "DELETE",
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to delete prompt: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  // ========== Settings API ==========
-
-  /** 获取应用设置 */
-  async getSettings(): Promise<AppSettings> {
-    const response = await this.authedFetch(`${this.baseUrl}/settings`, {
-      method: "GET",
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to fetch settings: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  /** 更新用户偏好 */
-  async updatePreferences(
-    body: Partial<UserPreferences>,
-  ): Promise<{ success: boolean; preferences: UserPreferences }> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/settings/preferences`,
-      {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      },
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to update preferences: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  // ========== Attachment API ==========
-
-  /**
-   * 上传对话附件（图片/文件），返回相对 URL 和元信息。
-   * 返回的 url 为 /uploads/... 相对路径，调用方需自行拼接 baseUrl。
-   */
-  async uploadAttachment(file: File): Promise<{
-    url: string;
-    filename: string;
-    size: number;
-    contentType: string;
-    isImage: boolean;
-  }> {
+  /** 上传一张工单附件，返回 /uploads/... 相对路径。目前只存不进检索 */
+  uploadAttachment(file: File): Promise<AttachmentUploadResult> {
     const formData = new FormData();
     formData.append("file", file);
-
-    const headers: HeadersInit = {};
-    if (this.token) {
-      headers["Authorization"] = `Bearer ${this.token}`;
-    }
-
-    let response = await fetch(`${this.baseUrl}/chats/attachments/upload`, {
+    return this.request<AttachmentUploadResult>("/attachments/upload", {
       method: "POST",
-      headers,
       body: formData,
     });
-
-    // 401 自动刷新重试
-    if (response.status === 401 && this.refreshToken) {
-      const newToken = await this.tryRefreshToken();
-      if (newToken) {
-        headers["Authorization"] = `Bearer ${newToken}`;
-        response = await fetch(`${this.baseUrl}/chats/attachments/upload`, {
-          method: "POST",
-          headers,
-          body: formData,
-        });
-      }
-    }
-
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
-      throw new Error(
-        err.detail || `Failed to upload attachment: ${response.statusText}`,
-      );
-    }
-
-    return response.json();
   }
 
-  // ========== 用量与追踪 ==========
+  // ========== 工作区 ==========
 
-  /**
-   * 统计窗口内的用量、成本与失败情况
-   * GET /metrics/usage
-   */
-  async getUsage(days?: number): Promise<UsageSummary> {
-    const query = days ? `?days=${days}` : "";
-    const response = await this.authedFetch(
-      `${this.baseUrl}/metrics/usage${query}`,
-      { method: "GET" },
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to fetch usage: ${response.statusText}`);
-    }
-    return response.json();
+  getWorkspace(): Promise<WorkspaceInfo> {
+    return this.get<WorkspaceInfo>("/workspace");
   }
 
   /**
-   * 委派 / 审批 / 子代理的线上指标
-   * GET /metrics/agents
-   *
-   * 与 getUsage 分开而不是塞进同一个接口：用量回答"钱花在哪个环节"，
-   * 这个回答"委派值不值"。两者的分桶维度完全不同（一个按 span，一个按执行），
-   * 合并只能得到一个谁都不好用的响应。
+   * 凭邀请码加入。加入是**换空间**，响应里的 leftBehindDocuments 必须提示给用户，
+   * 否则他的第一反应是"资料丢了"。
    */
-  async getAgentMetrics(days?: number): Promise<AgentMetrics> {
-    const query = days ? `?days=${days}` : "";
-    const response = await this.authedFetch(
-      `${this.baseUrl}/metrics/agents${query}`,
-      { method: "GET" },
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to fetch agent metrics: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  /**
-   * 最近若干次回答的 trace 概览
-   * GET /metrics/traces
-   */
-  async getTraces(chatId?: string, limit = 20): Promise<TraceSummary[]> {
-    const params = new URLSearchParams({ limit: String(limit) });
-    if (chatId) params.set("chat_id", chatId);
-    const response = await this.authedFetch(
-      `${this.baseUrl}/metrics/traces?${params.toString()}`,
-      { method: "GET" },
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to fetch traces: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  /**
-   * 单棵 trace 的 span 树
-   * GET /metrics/traces/{traceId}
-   */
-  async getTrace(traceId: string): Promise<TraceDetail> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/metrics/traces/${traceId}`,
-      { method: "GET" },
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to fetch trace: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  /**
-   * 提交或更新一条消息反馈（同一条消息只保留一份）
-   * POST /feedback
-   */
-  async submitFeedback(body: {
-    messageId: string;
-    rating: "up" | "down";
-    reason?: string;
-    comment?: string;
-    expectedAnswer?: string;
-  }): Promise<MessageFeedback> {
-    const response = await this.authedFetch(`${this.baseUrl}/feedback`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+  joinWorkspace(inviteCode: string): Promise<JoinWorkspaceResponse> {
+    return this.post<JoinWorkspaceResponse>("/workspace/join", {
+      invite_code: inviteCode,
     });
-    if (!response.ok) {
-      throw new Error(`Failed to submit feedback: ${response.statusText}`);
-    }
-    return response.json();
   }
 
-  /**
-   * 撤销反馈（再次点击同一个按钮）
-   * DELETE /feedback/{messageId}
-   */
-  async revokeFeedback(messageId: string): Promise<{ success: boolean }> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/feedback/${messageId}`,
-      { method: "DELETE" },
+  setMemberRole(
+    memberId: string,
+    role: "admin" | "user"
+  ): Promise<WorkspaceMemberMutationResponse> {
+    return this.request<WorkspaceMemberMutationResponse>(
+      `/workspace/members/${encodeURIComponent(memberId)}`,
+      { method: "PATCH", body: JSON.stringify({ role }) }
     );
-    if (!response.ok) {
-      throw new Error(`Failed to revoke feedback: ${response.statusText}`);
-    }
-    return response.json();
   }
 
-  /**
-   * 批量取回某些消息的反馈状态，用于切换会话后点亮按钮
-   * GET /feedback?messageIds=a,b,c
-   */
-  async getFeedback(messageIds: string[]): Promise<MessageFeedback[]> {
-    if (!messageIds.length) return [];
-    const params = new URLSearchParams({ messageIds: messageIds.join(",") });
-    const response = await this.authedFetch(
-      `${this.baseUrl}/feedback?${params.toString()}`,
-      { method: "GET" },
+  removeMember(memberId: string): Promise<WorkspaceMemberMutationResponse> {
+    return this.request<WorkspaceMemberMutationResponse>(
+      `/workspace/members/${encodeURIComponent(memberId)}`,
+      { method: "DELETE" }
     );
-    if (!response.ok) {
-      throw new Error(`Failed to fetch feedback: ${response.statusText}`);
-    }
-    const payload = await response.json();
-    return payload.items ?? [];
+  }
+
+  regenerateInviteCode(): Promise<{ inviteCode: string }> {
+    return this.post<{ inviteCode: string }>("/workspace/invite-code");
+  }
+
+  // ========== SOP 作业指导 ==========
+
+  getSkills(): Promise<SkillsResponse> {
+    return this.get<SkillsResponse>("/skills");
   }
 
   /**
-   * 满意度概览
-   * GET /feedback/summary
+   * upsert 一份工作区 SOP。PUT 是整体覆盖，所以 `requiredInputs` **必须传**——
+   * 不传会把已有声明清成空串，而那不报错：规程从此少了几项必填材料，安静地松一档。
    */
-  async getFeedbackSummary(): Promise<FeedbackSummary> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/feedback/summary`,
-      {
-        method: "GET",
-      },
-    );
-    if (!response.ok) {
-      throw new Error(
-        `Failed to fetch feedback summary: ${response.statusText}`,
-      );
-    }
-    return response.json();
-  }
-
-  // ========== Memory API ==========
-
-  /**
-   * 跨会话长期记忆列表（按时间倒序）
-   * GET /memories
-   */
-  async getMemories(): Promise<UserMemory[]> {
-    const response = await this.authedFetch(`${this.baseUrl}/memories`);
-    if (!response.ok) {
-      throw new Error(`Failed to load memories: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  /**
-   * 删除一条记忆，立即停止注入后续对话上下文
-   * DELETE /memories/{id}
-   */
-  async deleteMemory(memoryId: string): Promise<void> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/memories/${memoryId}`,
-      { method: "DELETE" },
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to delete memory: ${response.statusText}`);
-    }
-  }
-
-  /**
-   * 已授权给文件工具的本机文件夹，以及文件能力的开关状态
-   * GET /fs/roots
-   */
-  async getFsRoots(): Promise<FsRootsResponse> {
-    const response = await this.authedFetch(`${this.baseUrl}/fs/roots`);
-    if (!response.ok) {
-      throw new Error(`Failed to load folders: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  /**
-   * 授权一个本机文件夹
-   * POST /fs/roots
-   *
-   * 后端会校验它此刻真的是一个目录，不是就返回 400——错误消息可直接展示给用户
-   * （"D:\\nope 不是一个存在的目录"比一句 400 有用）。
-   */
-  async addFsRoot(path: string, label?: string): Promise<FsRoot> {
-    const response = await this.authedFetch(`${this.baseUrl}/fs/roots`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path, label }),
-    });
-    if (!response.ok) {
-      const detail = await response
-        .json()
-        .then((body) => body?.detail)
-        .catch(() => null);
-      throw new Error(detail || `Failed to add folder: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  /**
-   * 撤销一个文件夹的授权
-   * DELETE /fs/roots/{id}
-   */
-  async removeFsRoot(rootId: string): Promise<void> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/fs/roots/${rootId}`,
-      { method: "DELETE" },
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to remove folder: ${response.statusText}`);
-    }
-  }
-
-  /**
-   * 写操作留下的旧版本，最新的在前
-   * GET /fs/backups
-   */
-  async getFsBackups(): Promise<FsBackupsResponse> {
-    const response = await this.authedFetch(`${this.baseUrl}/fs/backups`);
-    if (!response.ok) {
-      throw new Error(`Failed to load backups: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  /**
-   * 把某份旧版本放回原位
-   * POST /fs/backups/{id}/restore
-   *
-   * 恢复本身也会先备份当前内容，所以点错了还能再撤回来。
-   */
-  async restoreFsBackup(backupId: string): Promise<{ path: string }> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/fs/backups/${backupId}/restore`,
-      { method: "POST" },
-    );
-    if (!response.ok) {
-      // 400 的 detail 是面向用户的文案（"该备份不存在"、"原来的目录已经不存在"），
-      // 照抄 addFsRoot 那边的形状
-      const detail = await response
-        .json()
-        .then((body) => body?.detail)
-        .catch(() => null);
-      throw new Error(detail || `恢复失败：${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  /**
-   * 浏览一个已授权目录
-   * GET /fs/browse
-   *
-   * 省略 path 时返回授权根列表本身——界面第一次打开时还不知道有什么。
-   * 越界路径后端返回 400，detail 里是可直接展示的中文。
-   */
-  async browseFs(path?: string): Promise<FsBrowseResponse> {
-    const query = path ? `?path=${encodeURIComponent(path)}` : "";
-    const response = await this.authedFetch(
-      `${this.baseUrl}/fs/browse${query}`,
-    );
-    if (!response.ok) {
-      const detail = await response
-        .json()
-        .then((body) => body?.detail)
-        .catch(() => null);
-      throw new Error(detail || `Failed to browse: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  /**
-   * 作业指导：内置（只读）+ 工作区（admin 可改）
-   * GET /skills
-   */
-  async getSkills(): Promise<SkillsResponse> {
-    const response = await this.authedFetch(`${this.baseUrl}/skills`);
-    if (!response.ok) {
-      throw new Error(`Failed to load skills: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  /**
-   * 新增或按 name 更新一份工作区作业指导
-   * PUT /skills
-   *
-   * upsert 而不是 POST/PATCH 分开：admin 最常做的是改一条 SOP 的正文，
-   * 而"它是不是新的"这个判断在服务端更准（唯一约束就在那里）。
-   */
-  async saveSkill(payload: {
+  saveSkill(payload: {
     name: string;
     description: string;
     instructions: string;
     enabled?: boolean;
-    /**
-     * 逗号分隔的前置材料。**必须传**——PUT 是整体覆盖，不传就会把已有的声明
-     * 覆盖成空串，而那不报错：审核从此少了几个必填槽位，安静地松了一档。
-     */
     requiredInputs?: string;
   }): Promise<
     Pick<
-      WorkspaceSkill,
+      import("../types/api.types").WorkspaceSkill,
       "id" | "name" | "description" | "enabled" | "requiredInputs" | "version"
     >
   > {
-    const response = await this.authedFetch(`${this.baseUrl}/skills`, {
+    return this.request("/skills", {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      // 逐字段列出而不是原样 JSON.stringify(payload)：后端字段是 snake_case
-      // （同 joinWorkspace 的 invite_code）。整体透传的话 requiredInputs 会被
-      // Pydantic 当成未知键丢掉，而 required_inputs 取默认空串——保存成功、
-      // 声明消失，一声不响。
       body: JSON.stringify({
         name: payload.name,
         description: payload.description,
@@ -1575,166 +531,113 @@ export class ApiClient {
         required_inputs: payload.requiredInputs ?? "",
       }),
     });
-    if (!response.ok) {
-      const detail = await response
-        .json()
-        .then((body) => body?.detail)
-        .catch(() => null);
-      throw new Error(detail || `Failed to save skill: ${response.statusText}`);
-    }
-    return response.json();
   }
 
-  /**
-   * 删除一份工作区作业指导
-   * DELETE /skills/{id}
-   */
-  async deleteSkill(skillId: string): Promise<void> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/skills/${skillId}`,
-      { method: "DELETE" },
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to delete skill: ${response.statusText}`);
-    }
+  deleteSkill(skillId: string): Promise<void> {
+    return this.request<void>(`/skills/${encodeURIComponent(skillId)}`, {
+      method: "DELETE",
+    });
   }
 
-  // ========== 审核台账 API ==========
+  // ========== 通知 ==========
 
-  /**
-   * 审核台账，按时间倒序。
-   * GET /reviews
-   *
-   * `pendingOnly` 取的是"还等着人看"——needs_human 且没人处置过。这个筛选不是
-   * 便利功能：转人工如果没有"待办在哪"的入口，就等于把结论扔进一个没人看的队列。
-   */
-  async getReviews(
-    pendingOnly = false,
-    limit = 50,
-  ): Promise<ReviewListResponse> {
-    const params = new URLSearchParams({ limit: String(limit) });
-    if (pendingOnly) params.set("pending_only", "true");
-    const response = await this.authedFetch(
-      `${this.baseUrl}/reviews?${params.toString()}`,
-      { method: "GET" },
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to fetch reviews: ${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  /**
-   * 记下人复核之后的处置。
-   * POST /reviews/{id}/resolve
-   *
-   * 处置不限 admin：定规矩（改 SOP）是管理行为，按规矩复核一张单子是日常工作，
-   * 锁给 admin 会让待办堵在一个人身上，而那正好是转人工要避免的形状。
-   * 已处置过的再改会被后端 400 挡回（台账要能作依据，可反复改写就作不了依据）。
-   */
-  async resolveReview(
-    verdictId: string,
-    resolution: string,
-    note = "",
-  ): Promise<ReviewLedgerItem> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/reviews/${verdictId}/resolve`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ resolution, note }),
-      },
-    );
-    if (!response.ok) {
-      const detail = await response
-        .json()
-        .then((body) => body?.detail)
-        .catch(() => null);
-      throw new Error(detail || `处置失败：${response.statusText}`);
-    }
-    return response.json();
-  }
-
-  // ========== 通知收件箱 API ==========
-
-  /**
-   * 当前用户的通知，按时间倒序。自作用域。
-   * GET /notifications
-   */
-  async getNotifications(
+  getNotifications(
     unreadOnly = false,
     limit = 50,
-    offset = 0,
+    offset = 0
   ): Promise<NotificationListResponse> {
     const params = new URLSearchParams({
       limit: String(limit),
       offset: String(offset),
     });
     if (unreadOnly) params.set("unread_only", "true");
-    const response = await this.authedFetch(
-      `${this.baseUrl}/notifications?${params.toString()}`,
-      { method: "GET" },
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to fetch notifications: ${response.statusText}`);
-    }
-    return response.json();
+    return this.get<NotificationListResponse>(`/notifications?${params.toString()}`);
   }
 
   /**
-   * 未读数——给顶栏铃铛的红点徽标用。
-   * GET /notifications/unread_count
-   *
-   * 这个端点在后端顺带当线上健康监控的**心跳**（evaluate_and_alert 自带节流/非阻塞
-   * 兜底，关着时直接空转）：前端定时轮询红点，于是不必引调度器就能让告警"主动"起来。
-   * 所以铃铛的轮询不只是刷新红点，也是在替整个部署驱动健康评估。
+   * 未读数。这个端点在后端顺带当**线上健康的心跳**：前端轮询红点，于是没有调度器
+   * 也能让告警评估按节流跑起来。所以轮询不只是刷新红点，别把它关掉。
    */
   async getUnreadCount(): Promise<number> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/notifications/unread_count`,
-      { method: "GET" },
-    );
-    if (!response.ok) {
-      throw new Error(`Failed to fetch unread count: ${response.statusText}`);
-    }
-    const body = (await response.json()) as { count?: number };
-    return body.count ?? 0;
+    const body = await this.get<{ count?: number }>("/notifications/unread_count");
+    return body?.count ?? 0;
   }
 
-  /**
-   * 标记一条通知已读。按 user 自作用域——改不动别人的。
-   * POST /notifications/{id}/read
-   */
-  async markNotificationRead(notificationId: string): Promise<void> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/notifications/${notificationId}/read`,
-      { method: "POST" },
+  markNotificationRead(notificationId: string): Promise<void> {
+    return this.post<void>(
+      `/notifications/${encodeURIComponent(notificationId)}/read`
     );
-    if (!response.ok) {
-      throw new Error(
-        `Failed to mark notification read: ${response.statusText}`,
-      );
-    }
   }
 
-  /**
-   * 全部标记已读，返回标记了几条。
-   * POST /notifications/read_all
-   */
   async markAllNotificationsRead(): Promise<number> {
-    const response = await this.authedFetch(
-      `${this.baseUrl}/notifications/read_all`,
-      { method: "POST" },
-    );
-    if (!response.ok) {
-      throw new Error(
-        `Failed to mark all notifications read: ${response.statusText}`,
-      );
+    const body = await this.post<{ marked?: number }>("/notifications/read_all");
+    return body?.marked ?? 0;
+  }
+
+  // ========== 审计 ==========
+
+  getAuditEntries(limit = 100, offset = 0): Promise<AuditListResponse> {
+    const params = new URLSearchParams({
+      limit: String(limit),
+      offset: String(offset),
+    });
+    return this.get<AuditListResponse>(`/audit?${params.toString()}`);
+  }
+
+  /** 哈希链校验：回答"这串记录没被改过"。firstBrokenSeq 指出断在哪一跳 */
+  verifyAuditChain(): Promise<AuditVerifyResponse> {
+    return this.get<AuditVerifyResponse>("/audit/verify");
+  }
+
+  // ========== 用量与埋点 ==========
+
+  getUsage(days?: number): Promise<UsageSummary> {
+    const query = days ? `?days=${days}` : "";
+    return this.get<UsageSummary>(`/metrics/usage${query}`);
+  }
+
+  /** 全局线上健康。**管理员专属**，非 admin 拿 403（detail 已是中文说明）。
+   *  顺带触发一次即时告警评估 */
+  getHealth(): Promise<HealthResponse> {
+    return this.get<HealthResponse>("/metrics/health");
+  }
+
+  listTraces(ticketId?: string, limit = 20): Promise<TraceSummary[]> {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (ticketId) params.set("ticket_id", ticketId);
+    return this.get<TraceSummary[]>(`/metrics/traces?${params.toString()}`);
+  }
+
+  getTrace(traceId: string): Promise<TraceDetail> {
+    return this.get<TraceDetail>(`/metrics/traces/${encodeURIComponent(traceId)}`);
+  }
+
+  /** 后端活着吗。用于启动时的连接提示，不用于业务分支 */
+  async ping(): Promise<boolean> {
+    try {
+      await this.request("/");
+      return true;
+    } catch {
+      return false;
     }
-    const body = (await response.json()) as { marked?: number };
-    return body.marked ?? 0;
   }
 }
 
-// 导出默认实例
 export const apiClient = new ApiClient();
+
+/**
+ * 这是不是一个"能力没开"的答复。
+ *
+ * 后端在 `TICKET_AGENT_ENABLED=false` 时对写操作与执行类接口回 409，而这不是错误：
+ * 界面要显示"这个能力没开"并说明怎么开，而不是抛一个看起来像网络故障的异常。
+ * 判据集中在这里，页面就不必各自去猜响应体里那个 `conflict` 键。
+ */
+export interface ConflictResult {
+  conflict: true;
+  message?: string;
+}
+
+export const isConflictResponse = (value: unknown): value is ConflictResult =>
+  typeof value === "object" &&
+  value !== null &&
+  (value as { conflict?: boolean }).conflict === true;

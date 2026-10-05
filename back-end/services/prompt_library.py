@@ -46,19 +46,6 @@ PROMPT_DIR = os.path.join(
 # active: 当前默认；candidate: 已就绪、等着被 A/B；archived: 只作对照，不要启用
 STATUSES = ("active", "candidate", "archived")
 
-# 模板可以在 frontmatter 里用 ``expects:`` 声明它是为哪种运行时配置写的，
-# 逗号分隔。启动时据此校验「配置和提示词是否匹配」——此前这件事只写在 notes
-# 里（"开启委派时必须切到这一版"），而注释拦不住任何人。
-#
-# 为什么是模板自己声明，而不是在 main.py 里列一张版本名表：加新版本时那张表
-# 一定会漏掉，而漏掉的表现是"配置错了但程序照跑"，正是这个机制要消灭的东西。
-EXPECTATIONS = (
-    # 讲了 delegate 怎么用：任务描述必须自包含、什么时候不该委派
-    "delegation",
-    # 为 supervisor 模式写的：主代理把查询类工具收进子代理，自己只保留写操作
-    "supervisor",
-)
-
 
 class PromptError(RuntimeError):
     """模板缺失、占位符不匹配、条件段没闭合——一律在加载或渲染时立刻抛出。"""
@@ -114,38 +101,38 @@ SPECS: dict[str, PromptSpec] = {
         default_version="v1",
         required=("ticket_text", "intent", "risk", "tools", "max_steps"),
     ),
-    # 子代理各自一个 key,而不是共用一个带 [[if role]] 分支的模板:三个角色的
-    # 约束几乎不重叠(researcher 要讲出处分层,analyst 要讲"缺输入就停",
-    # critic 要讲"没依据别提"),塞进一版会变成一个谁都不好改的大文件,
-    # 而且改 researcher 那段会让 critic 的评估结果一起失效。
-    # 三个角色各自一个 setting，而不是共享一个 PROMPT_AGENT_VERSION：理由和
-    # 上面"为什么是三个 key 而不是一个带 [[if role]] 分支的模板"一样——共享的话
-    # 没法单独 A/B researcher，动一个会让另两个的结果一起失效。
+    # 子代理各自一个 key,而不是共用一个带 [[if role]] 分支的模板:三个角色的约束
+    # 几乎不重叠(inquiry 要讲"编号只能来自工具返回",policy 要讲"政策原文照抄不要改写成
+    # 承诺",reassurance 要讲"没依据就不要承诺时效或退款"),塞进一版会变成一个谁都不好改
+    # 的大文件,而且改 inquiry 那段会让 reassurance 的评估结果一起失效。
+    #
+    # 三个角色各自一个 setting，而不是共享一个开关：理由和上面"为什么是三个 key"一样——
+    # 共享的话没法单独 A/B 一个角色，动一个会让另两个的结果一起失效。
     #
     # 不开 request_overridable：子代理的版本由谁定应当和主代理解耦，而单次请求
-    # 只带一个 prompt_version 字段，语义上指的是对话系统提示词。要按请求覆盖
-    # 子代理版本得先想清楚那个字段怎么扩展，现在没有这个需求。
-    "agent_researcher": PromptSpec(
-        key="agent_researcher",
-        purpose="researcher 子代理：查资料并如实汇报出处",
-        # v2：把"必须先调工具"写成硬要求。v1 没有这一条，2026-08-28 的评估里
-        # memory-web 与 recovery-search-down 两条都是 researcher 一次工具都没调
-        # 就凭记忆交了报告——而 v1 里"没有出处就标明是推测"恰好给了它一个合法出口。
-        # v1 保留在目录里，好对照跑 A/B。
+    # 只带一个 prompt_version 字段，语义上指的是主提示词。要按请求覆盖子代理版本
+    # 得先想清楚那个字段怎么扩展，现在没有这个需求。
+    "ticket_sub_inquiry": PromptSpec(
+        key="ticket_sub_inquiry",
+        purpose="inquiry 子代理：查订单/物流/客户档案并如实汇报编号与出处",
+        # v2：把"必须先调工具"写成硬要求。上一代 researcher 在 2026-08-28 的评估里
+        # 有两条是一次工具都没调就凭记忆交了报告——而"没有出处就标明是推测"那句话
+        # 恰好给了它一个合法出口。工单这边这个失败更贵：一份凭记忆写的"这单还能退"
+        # 会直接把主代理推向一笔不该发的退款。v1 留在目录里作 A/B 对照。
         default_version="v2",
-        setting="PROMPT_AGENT_RESEARCHER_VERSION",
+        setting="PROMPT_TICKET_SUB_INQUIRY_VERSION",
     ),
-    "agent_analyst": PromptSpec(
-        key="agent_analyst",
-        purpose="analyst 子代理：精确计算与读取附件",
+    "ticket_sub_policy": PromptSpec(
+        key="ticket_sub_policy",
+        purpose="policy 子代理：检索政策原文并带出处汇报，不改写成承诺",
         default_version="v1",
-        setting="PROMPT_AGENT_ANALYST_VERSION",
+        setting="PROMPT_TICKET_SUB_POLICY_VERSION",
     ),
-    "agent_critic": PromptSpec(
-        key="agent_critic",
-        purpose="critic 子代理：只依据给定材料审查草稿",
+    "ticket_sub_reassurance": PromptSpec(
+        key="ticket_sub_reassurance",
+        purpose="reassurance 子代理：只依据任务描述里给定的事实起草安抚草稿",
         default_version="v1",
-        setting="PROMPT_AGENT_CRITIC_VERSION",
+        setting="PROMPT_TICKET_SUB_REASSURANCE_VERSION",
     ),
 }
 
@@ -229,16 +216,11 @@ class PromptTemplate:
     body: str
     placeholders: tuple[str, ...]
     flags: tuple[str, ...]
-    # frontmatter 的 ``expects:``。这一版是为哪种运行时配置写的，供启动校验用。
-    expects: tuple[str, ...] = ()
 
     @property
     def ref(self) -> str:
         """写进埋点的版本标识。一条 trace 必须能回答「这是哪一版提示词跑出来的」。"""
         return f"{self.key}@{self.version}"
-
-    def expects_all(self, *names: str) -> bool:
-        return all(name in self.expects for name in names)
 
     def render(self, *, flags: dict[str, bool] | None = None, **values: Any) -> str:
         where = f"prompts/{self.key}/{self.version}.md"
@@ -279,17 +261,6 @@ def _parse(raw: str, key: str, version: str) -> PromptTemplate:
     if status not in STATUSES:
         raise PromptError(f"{where}: status 只能是 {STATUSES} 之一，收到 {status!r}")
 
-    # 拼错的 expects 必须在这里炸：静默忽略的话，启动校验会以为这一版"没有声明
-    # 任何前置条件"从而放行，而那正是错配能溜过去的方式。
-    expects = tuple(
-        item.strip() for item in meta.get("expects", "").split(",") if item.strip()
-    )
-    unknown_expects = sorted(set(expects) - set(EXPECTATIONS))
-    if unknown_expects:
-        raise PromptError(
-            f"{where}: 未知的 expects 取值 {unknown_expects}，可用 {list(EXPECTATIONS)}"
-        )
-
     spec = SPECS[key]
     placeholders = _placeholder_names(body)
     flags = _flag_names(body)
@@ -317,7 +288,6 @@ def _parse(raw: str, key: str, version: str) -> PromptTemplate:
         body=body,
         placeholders=placeholders,
         flags=flags,
-        expects=expects,
     )
 
 
@@ -451,8 +421,6 @@ def catalog() -> list[dict[str, Any]]:
                         "body": template.body,
                         "chars": len(template.body),
                         "isActive": template.version == active,
-                        # 提示词实验台上要能看出"这一版需要什么配置才成立"
-                        "expects": list(template.expects),
                     }
                     for template in versions(key)
                 ],

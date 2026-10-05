@@ -74,38 +74,22 @@ def available(db: Session, workspace_id: str) -> dict[str, Skill]:
             attachments=(),
             # 和内置 skill 的 frontmatter 共用一套解析：两处各写一遍的话
             # "逗号后的空格算不算"迟早分叉，而分叉的表现是同一份 SOP 在两种
-            # 来源下要求的项数不一样——不报错，只是审核松了一档。
+            # 来源下登记出不同的材料清单——不报错，只是 admin 看到的清单
+            # 取决于这份是从哪来的。
             required_inputs=skill_library.parse_required_inputs(row.required_inputs),
         )
     return merged
 
 
-def version_of(db: Session, workspace_id: str, skill: Skill) -> int:
-    """这份 SOP 当前的版本号。审核结论要记下它。
-
-    **内置 skill 返回 0**，含义是"版本由代码仓库决定，不由这张表决定"。
-    它跟着 git 走，没有行级版本号可言；给个 1 会让台账上"第 1 版"同时指两件事
-    （内置的、以及工作区那份从没改过的），而这两者的追溯方式完全不同——
-    前者去查那次部署的 commit，后者查 workspace_skills。
-
-    0 不是"未知"或"出错"：迁移 0016 给工作区行的 server_default 是 1，
-    所以 0 只会出现在内置这一种情形上，读得出来。
-
-    按 ``skill.source`` 判而不是"查库看有没有行"：同名时工作区那份盖内置
-    （见 ``available``），而被盖掉的那一刻 source 就是 workspace 了——
-    查库会在"有行但停用了、实际用的是内置"这个情形上给出错的版本号。
-    """
-    if skill.source != "workspace":
-        return 0
-    row = _workspace_skills(db, workspace_id).get(skill.name)
-    # 拿不到行却声称是 workspace 来源，说明调用方手上的 Skill 比库里的旧
-    # （比如刚被别人删了）。1 是那张表的起始值，比抛异常合适：
-    # 台账少一次记录比整次审核失败更糟。
-    return (row.version if row else 1) or 1
-
-
 def build_index_block(db: Session, workspace_id: str) -> str:
-    """注入用的索引。没有任何 skill 时返回空串（调用方据此不发这条消息）。
+    """注入用的索引。能力关着或没有任何 skill 时返回空串（调用方据此不发这条消息）。
+
+    ``SKILL_ENABLED`` 关掉时**连索引也不发**：那份清单的最后一句是"需要某一份的完整
+    内容时调用 load_skill 取"，而开关关着时 ``skill_tools.build`` 不注册那个工具。
+    发出去就等于指示模型去做一件它做不了的事，而这件事的失败是静默的——模型只会
+    白试一轮，然后按自己的通用做法办，谁都不会知道 SOP 被绕过了。
+    判据放在这里而不是调用方，是因为"开关与索引必须同步"这件事只有一处说了算
+    才不会被漏掉（同 ``skill_tools.build`` 里"一份都没有时不注册"那条）。
 
     索引里只放名字和描述，**不放正文**：一个企业几十个 SOP，全塞进去的话每一轮都
     要付这笔固定成本，而其中至多一个和当前问题有关。
@@ -113,6 +97,8 @@ def build_index_block(db: Session, workspace_id: str) -> str:
     描述过 ``mask_markup``：工作区 skill 的描述是 admin 写的，但 admin 也可能从别处
     复制粘贴。这一句会出现在系统上下文里，可信度很高，所以标记语法要中和掉。
     """
+    if not skill_library.enabled():
+        return ""
     skills = available(db, workspace_id)
     if not skills:
         return ""
@@ -236,7 +222,8 @@ def list_for_admin(db: Session, workspace_id: str) -> dict[str, Any]:
                 "instructions": row.instructions,
                 "enabled": row.enabled,
                 "requiredInputs": row.required_inputs or "",
-                # 审核结论引用的就是这个号。列出来才能对上"这条结论按的哪一版"
+                # 这个号说的不是"第 N 版正文长什么样"（表里只有最新一份），
+                # 而是"这份被动过没有、动过几次"——没有它，改过 SOP 这件事看不出来。
                 "version": row.version or 1,
                 "updatedAt": row.updated_at.isoformat() if row.updated_at else None,
             }
@@ -266,14 +253,19 @@ def upsert(
 
     只在 ``instructions`` 或 ``description`` 真的变了的时候。理由分两头：
 
-    - **不能不涨。** 审核结论会引用 ``sop_version``（见 ``ReviewVerdict``）。
-      不涨的话 admin 改一次 SOP，之前所有结论的依据就都指向一份已经不存在的文本
-      ——三个月后有人问"当时为什么通过"，答不出来。
+    - **不能不涨。** 历史工单会留下"按《某份指导》办的"这种话，而那行文本随时会被
+      admin 改掉。号不动，就没有任何东西说得出"这两张单用的不是同一份规程"。
     - **不能乱涨。** ``enabled`` 开关、以及"保存了但一个字没改"都不该让它跳。
       每次保存都 +1 的话这个号很快大到没人看，"版本变了"这个信号也就没用了。
 
-    ``required_inputs`` 变化**也算**：它直接决定 ``ReviewVerdict`` 有几个必填槽位，
-    也就是直接决定审核的严格程度。改了它而版本号不动，等于悄悄放宽了标准。
+    ``required_inputs`` 变化**也算**：那是这份 SOP 对材料的要求变了，对人来说是一次
+    实质修改，不该记成"没变过"。
+
+    诚实说清楚它现在能回答什么：这张表**只存最新一份正文**，所以版本号回答
+    "改过几次、这次改没改"，回答不了"当时那版写的是什么"。它的读者目前只有
+    admin 界面（列表里显示第 N 版）——原先那个强制读者（结构化审核结论要引用
+    ``sop_version``）随报销审核栈一起删掉了。要做到真正的逐版追溯得给
+    ``workspace_skills`` 加历史行，那是另一件事，别误以为这个号已经做到了。
     """
     cleaned_name = (name or "").strip()
     if not cleaned_name:
@@ -369,5 +361,4 @@ __all__ = [
     "most_relevant",
     "reset_vector_cache",
     "upsert",
-    "version_of",
 ]

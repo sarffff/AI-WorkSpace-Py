@@ -1,92 +1,120 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useDispatch, useSelector } from "react-redux";
-import { useNavigate, useLocation } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
+import {
+  BarChart3,
+  Bell,
+  BookOpen,
+  Fingerprint,
+  Inbox,
+  LogOut,
+  Monitor,
+  Moon,
+  ScrollText,
+  Settings2,
+  ShieldCheck,
+  SlidersHorizontal,
+  Sun,
+  Users,
+  type LucideIcon,
+} from "lucide-react";
 import { RootState } from "@/app/providers/store";
 import { clearAuth } from "@/entities/auth/model/authSlice";
 import { apiClient } from "@/shared/api/client";
-import { useTheme } from "@/shared/lib/ThemeContext";
+import { NEXT_MODE, THEME_LABELS, useTheme, type ThemeMode } from "@/shared/lib/ThemeContext";
 import { BrandMark } from "@/shared/ui/BrandMark";
-import {
-  LayoutDashboard,
-  MessageSquare,
-  ClipboardCheck,
-  BookOpen,
-  ScrollText,
-  FlaskConical,
-  Route as RouteIcon,
-  BarChart3,
-  Settings,
-  Sun,
-  Moon,
-  LogOut,
-} from "lucide-react";
+import { NotificationBell } from "@/features/notifications/ui/NotificationBell";
+
+interface Module {
+  id: string;
+  label: string;
+  icon: LucideIcon;
+  path: string;
+  /** 这一格要不要挂一个"有人在等"的徽标 */
+  alarm?: "approvals";
+}
 
 /**
- * 图标轨：企业工作台的主导航。
+ * 图标轨：工单台的模块集合，对着 Development_Process.md 的五层来。
  *
- * 换掉旧的 chat-centric 侧栏——旧侧栏把"新对话 + 会话历史"顶在最高层级，让一个
- * 审核生产工具长得像 chatbot。这里主模块平权：工作台 / 对话·审核 / 台账 / 知识库 /
- * 作业指导 / 提示词 / 轨迹 / 运营指标。会话列表下沉到「对话」模块的上下文面板，
- * 作业指导从设置里提上来，提示词与运营指标从"有页面却进不去"接回导航。
+ * 顺序就是坐席的一天：先看队列（谁的事没办）→ 审批（等我点的）→ 治理台
+ * （额度与暂停，出事时才进）→ 指标（这周办得怎么样）→ 资料（知识库 / SOP）→
+ * 通知 / 审计 / 成员。
+ *
+ * 刻意没有"对话"这一格：Agent 办单的现场是那张工单的轨迹，不是一个聊天框。
  */
-const MODULES = [
-  { id: "dashboard", label: "工作台", icon: LayoutDashboard, path: "/dashboard" },
-  { id: "chat", label: "对话 · 审核", icon: MessageSquare, path: "/chat" },
-  { id: "reviews", label: "审核台账", icon: ClipboardCheck, path: "/reviews", badge: true },
+const MODULES: Module[] = [
+  { id: "queue", label: "工单队列", icon: Inbox, path: "/queue" },
+  { id: "approvals", label: "审批收件箱", icon: ShieldCheck, path: "/approvals", alarm: "approvals" },
+  { id: "governance", label: "治理台", icon: SlidersHorizontal, path: "/governance" },
+  { id: "metrics", label: "指标看板", icon: BarChart3, path: "/metrics" },
   { id: "knowledge", label: "知识库", icon: BookOpen, path: "/knowledge" },
   { id: "skills", label: "作业指导", icon: ScrollText, path: "/skills" },
-  { id: "prompts", label: "提示词工作台", icon: FlaskConical, path: "/prompts" },
-  { id: "traces", label: "运行轨迹", icon: RouteIcon, path: "/traces" },
-  { id: "metrics", label: "运营指标", icon: BarChart3, path: "/metrics" },
-] as const;
+  { id: "notifications", label: "通知", icon: Bell, path: "/notifications" },
+  { id: "audit", label: "审计", icon: Fingerprint, path: "/audit" },
+  { id: "workspace", label: "工作区", icon: Users, path: "/workspace" },
+];
 
 export const NavRail: React.FC = () => {
   const dispatch = useDispatch();
   const navigate = useNavigate();
   const location = useLocation();
-  const { theme, toggleTheme } = useTheme();
+  const { mode, theme, cycleMode } = useTheme();
   const { user } = useSelector((state: RootState) => state.auth);
 
   const [pending, setPending] = useState(0);
-  const [workspace, setWorkspace] = useState<{
-    name: string;
-    role: string;
-  } | null>(null);
+  const [workspace, setWorkspace] = useState<{ name: string; role: string } | null>(
+    null
+  );
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
-  const active = location.pathname.split("/")[1] || "dashboard";
+  const active = location.pathname.split("/")[1] || "queue";
 
-  // 工作区信息拉一次；待办数随导航刷新（在台账里处置完再切走就会更新）
+  /**
+   * 待批数是**整个界面唯一的外部计数轮询**。
+   *
+   * 只问 `/tickets/pending` 的 count，不拉队列：一张挂起的工单可能等人批一整天，
+   * 而坐席不该靠"恰好刷新了页面"才发现它。铃铛那边的未读轮询顺带驱动后端的
+   * 线上健康评估，两件事合起来就够了，不需要再来一个定时器。
+   */
+  useEffect(() => {
+    let alive = true;
+    const load = () =>
+      apiClient
+        .getPendingApprovals()
+        .then((r) => alive && setPending(r.count))
+        .catch(() => undefined);
+    load();
+    const timer = window.setInterval(load, 30_000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [location.pathname]);
+
   useEffect(() => {
     apiClient
       .getWorkspace()
       .then((w) => setWorkspace({ name: w.name, role: w.role }))
-      .catch(() => {});
+      .catch(() => undefined);
   }, []);
 
   useEffect(() => {
-    apiClient
-      .getReviews(true, 200)
-      .then((r) => setPending(r.items.length))
-      .catch(() => {});
-  }, [location.pathname]);
-
-  useEffect(() => {
-    const onClick = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+    const onDown = (event: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
         setMenuOpen(false);
       }
     };
-    document.addEventListener("mousedown", onClick);
-    return () => document.removeEventListener("mousedown", onClick);
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
   }, []);
 
   const handleLogout = async () => {
     try {
       await apiClient.logout();
     } catch {
-      /* 服务端登出失败也清本地 */
+      /* 服务端登出失败也要清本地：留着一枚已经作废的 token 只会让下次启动更慢 */
     }
     dispatch(clearAuth());
     navigate("/login");
@@ -96,105 +124,88 @@ export const NavRail: React.FC = () => {
   const initial = displayName.charAt(0).toUpperCase();
 
   return (
-    <aside className="w-[68px] shrink-0 h-full flex flex-col items-center py-3 bg-[#f3f0e6]/90 dark:bg-[#1a1917]/90 backdrop-blur-sm border-r border-[#e6e2d8] dark:border-[#282724] select-none relative z-20">
+    <aside className="w-[76px] shrink-0 h-full flex flex-col items-center py-4 gap-3 border-r border-line bg-mantle relative z-20">
       <button
-        onClick={() => navigate("/dashboard")}
-        className="mb-3 transition-transform hover:scale-105"
-        title="有据工作台"
-        aria-label="有据工作台"
+        onClick={() => navigate("/queue")}
+        className="transition-transform hover:scale-105"
+        title="客服工单台"
+        aria-label="客服工单台"
       >
         <BrandMark size={34} />
       </button>
 
       <nav className="flex-1 flex flex-col items-center gap-1.5 w-full">
-        {MODULES.map((m) => {
-          const on = active === m.id;
-          const Icon = m.icon;
+        {MODULES.map((module) => {
+          const on = active === module.id;
+          const Icon = module.icon;
+          const badge = module.alarm === "approvals" ? pending : 0;
           return (
             <button
-              key={m.id}
-              onClick={() => navigate(m.path)}
+              key={module.id}
+              onClick={() => navigate(module.path)}
               className={`group relative w-11 h-11 rounded-xl flex items-center justify-center transition-all duration-200 ${
                 on
-                  ? "bg-[#eae6db] dark:bg-[#262522] text-[#da7756]"
-                  : "text-[#6e6b63] dark:text-[#a19f96] hover:text-[#1f1e1d] dark:hover:text-[#edece8] hover:bg-[#eae6db]/60 dark:hover:bg-[#22211e]"
+                  ? "bg-surface text-accent shadow-card"
+                  : "text-ink-soft hover:text-ink hover:bg-overlay"
               }`}
-              aria-label={m.label}
+              aria-label={module.label}
               aria-current={on ? "page" : undefined}
             >
               {on && (
-                <span className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-full bg-[#da7756]" />
+                <span className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-full bg-accent" />
               )}
               <Icon className="w-[18px] h-[18px]" />
-              {"badge" in m && m.badge && pending > 0 && (
-                <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 rounded-full bg-[#da7756] text-white text-[9px] font-bold flex items-center justify-center">
-                  {pending > 99 ? "99+" : pending}
+              {badge > 0 && (
+                <span className="absolute -top-1 -right-1 min-w-[17px] h-[17px] px-1 rounded-full bg-state-bad text-surface text-[9px] font-bold font-mono flex items-center justify-center">
+                  {badge > 99 ? "99+" : badge}
                 </span>
               )}
-              <span className="pointer-events-none absolute left-[52px] px-2 py-1 rounded-md bg-[#1f1e1d] dark:bg-[#33312d] text-white text-[11px] font-medium whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity z-30 shadow-lg">
-                {m.label}
+              <span className="pointer-events-none absolute left-[54px] px-2 py-1 rounded-md bg-ink text-surface text-[11px] font-medium whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity z-30 shadow-card">
+                {module.label}
               </span>
             </button>
           );
         })}
       </nav>
 
-      <div className="flex flex-col items-center gap-1.5 w-full pt-2 mt-1 border-t border-[#e6e2d8]/70 dark:border-[#282724]/70">
+      <div className="flex flex-col items-center gap-1.5 w-full pt-3 border-t border-line">
         <button
-          onClick={() => navigate("/settings")}
+          onClick={() => navigate("/workspace")}
           className={`group relative w-11 h-11 rounded-xl flex items-center justify-center transition-all ${
             active === "settings"
-              ? "bg-[#eae6db] dark:bg-[#262522] text-[#da7756]"
-              : "text-[#6e6b63] dark:text-[#a19f96] hover:text-[#1f1e1d] dark:hover:text-[#edece8] hover:bg-[#eae6db]/60 dark:hover:bg-[#22211e]"
+              ? "bg-surface text-accent"
+              : "text-ink-soft hover:text-ink hover:bg-overlay"
           }`}
-          aria-label="设置"
+          aria-label="工作区设置"
         >
-          {active === "settings" && (
-            <span className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 rounded-full bg-[#da7756]" />
-          )}
-          <Settings className="w-[18px] h-[18px]" />
-          <span className="pointer-events-none absolute left-[52px] px-2 py-1 rounded-md bg-[#1f1e1d] dark:bg-[#33312d] text-white text-[11px] font-medium whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity z-30 shadow-lg">
+          <Settings2 className="w-[18px] h-[18px]" />
+          <span className="pointer-events-none absolute left-[54px] px-2 py-1 rounded-md bg-ink text-surface text-[11px] whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity z-30">
             设置
           </span>
         </button>
 
-        <button
-          onClick={toggleTheme}
-          className="group relative w-11 h-11 rounded-xl flex items-center justify-center text-[#6e6b63] dark:text-[#a19f96] hover:text-[#1f1e1d] dark:hover:text-[#edece8] hover:bg-[#eae6db]/60 dark:hover:bg-[#22211e] transition-all"
-          aria-label={theme === "dark" ? "切换到浅色" : "切换到深色"}
-        >
-          {theme === "dark" ? (
-            <Sun className="w-[18px] h-[18px] text-amber-400" />
-          ) : (
-            <Moon className="w-[18px] h-[18px]" />
-          )}
-          <span className="pointer-events-none absolute left-[52px] px-2 py-1 rounded-md bg-[#1f1e1d] dark:bg-[#33312d] text-white text-[11px] font-medium whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity z-30 shadow-lg">
-            {theme === "dark" ? "浅色" : "深色"}
-          </span>
-        </button>
+        <ThemeButton mode={mode} theme={theme} onCycle={cycleMode} />
+
+        <NotificationBell />
 
         <div className="relative" ref={menuRef}>
           <button
-            onClick={() => setMenuOpen((v) => !v)}
-            className="w-9 h-9 rounded-full bg-[#da7756] text-white text-xs font-bold flex items-center justify-center mt-0.5 shadow-sm hover:brightness-110 transition"
+            onClick={() => setMenuOpen((open) => !open)}
+            className="w-9 h-9 rounded-full bg-accent text-surface text-xs font-bold flex items-center justify-center mt-0.5 hover:brightness-110 transition"
             aria-label="账户菜单"
             aria-expanded={menuOpen}
           >
             {initial}
           </button>
           {menuOpen && (
-            <div className="absolute bottom-0 left-[52px] w-56 card-surface rounded-xl p-3 z-40 anim-fade-up">
-              <div className="text-sm font-semibold text-[#1f1e1d] dark:text-[#edece8] truncate">
-                {displayName}
-              </div>
+            <div className="absolute bottom-0 left-[54px] w-60 card-surface rounded-xl p-3 z-40 anim-fade-up">
+              <div className="text-sm font-semibold text-ink truncate">{displayName}</div>
               {user?.email && (
-                <div className="text-[11px] text-[#918d83] truncate">
-                  {user.email}
-                </div>
+                <div className="text-[11px] text-ink-faint truncate">{user.email}</div>
               )}
               {workspace && (
-                <div className="mt-2 pt-2 border-t border-[#e6e2d8] dark:border-[#282724] flex items-center justify-between gap-2">
-                  <span className="text-[11px] text-[#6e6b63] dark:text-[#a19f96] truncate">
+                <div className="mt-2 pt-2 border-t border-line flex items-center justify-between gap-2">
+                  <span className="text-[11px] text-ink-soft truncate">
                     {workspace.name}
                   </span>
                   <span className="chip text-[9px]">
@@ -204,7 +215,8 @@ export const NavRail: React.FC = () => {
               )}
               <button
                 onClick={handleLogout}
-                className="mt-2 w-full py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-600 dark:text-rose-400 text-[11px] font-medium flex items-center justify-center gap-1.5 border border-rose-500/20"
+                className="mt-3 w-full py-1.5 rounded-lg border text-[11px] font-semibold flex items-center justify-center gap-1.5 text-state-bad"
+                style={{ borderColor: "var(--c-bad-faint)" }}
               >
                 <LogOut className="w-3 h-3" />
                 退出登录
@@ -213,8 +225,34 @@ export const NavRail: React.FC = () => {
           )}
         </div>
       </div>
-
     </aside>
   );
 };
 
+/**
+ * 三态而不是两态：值班的机房是暗的，白天办公室是亮的，而公司的系统策略
+ * 已经替很多人做过这个决定——"跟随系统"是把那个决定还给他们。
+ *
+ * 图标显示的是**当前生效**的那一套（跟随系统时跟着系统变），
+ * 悬停提示说的是**下一次点击**会变成什么，两者不同是刻意的。
+ */
+const ThemeButton: React.FC<{
+  mode: ThemeMode;
+  theme: "light" | "dark";
+  onCycle: () => void;
+}> = ({ mode, theme, onCycle }) => {
+  const Icon = mode === "system" ? Monitor : theme === "dark" ? Moon : Sun;
+  const next = THEME_LABELS[NEXT_MODE[mode]];
+  return (
+    <button
+      onClick={onCycle}
+      className="group relative w-11 h-11 rounded-xl flex items-center justify-center text-ink-soft hover:text-ink hover:bg-overlay transition-all"
+      aria-label={`主题：${THEME_LABELS[mode]}（点击切换到${next}）`}
+    >
+      <Icon className="w-[18px] h-[18px]" />
+      <span className="pointer-events-none absolute left-[54px] px-2 py-1 rounded-md bg-ink text-surface text-[11px] whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity z-30">
+        {THEME_LABELS[mode]} → {next}
+      </span>
+    </button>
+  );
+};

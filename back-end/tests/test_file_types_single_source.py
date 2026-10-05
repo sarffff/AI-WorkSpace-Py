@@ -295,22 +295,33 @@ def test_no_backend_module_relists_extensions():
     )
 
 
-# ========== 前端：两处 accept 必须来自后端 ==========
-# 只断言两个不含歧义的信号（没有硬编码 accept、确实引用了 fileTypes），
-# 不做 TS 的字面量扫描：那需要一个 TS parser，而用正则找 `new Set([...])`
-# 会在注释和无关字符串上误报。更宽的"有人又搭了一个 Set"由代码评审兜。
+# ========== 前端：不许再写一份扩展名清单 ==========
+# 只断言一个不含歧义的信号（没有硬编码 accept），不做 TS 的字面量扫描：那需要
+# 一个 TS parser，而用正则找 ``new Set([...])`` 会在注释和无关字符串上误报。
+# 更宽的"有人又搭了一个 Set"由代码评审兜。
 
 
-@pytest.mark.parametrize(
-    "relative_path",
-    [
-        "front-end/src/pages/chat/ui/ChatPage.tsx",
-        "front-end/src/pages/knowledge/ui/KnowledgePage.tsx",
-    ],
-)
-def test_frontend_pages_do_not_hardcode_accept(relative_path):
-    """``accept=".txt,.md,..."`` 这个形状就是改动前的两个 bug 所在。"""
-    source = (REPO / relative_path).read_text(encoding="utf-8")
-    hardcoded = re.findall(r'accept="\.[^"]*"', source)
-    assert not hardcoded, f"{relative_path} 硬编码了 accept：{hardcoded}"
-    assert "fileTypes" in source, f"{relative_path} 没有引用后端给的 fileTypes"
+def test_frontend_does_not_hardcode_accept_anywhere():
+    """``accept=".txt,.md,..."`` 这个形状就是改动前的两个 bug 所在。
+
+    扫的是整个 ``front-end/src`` 而不是点名几个文件：原先那份点名清单里写着
+    对话工作台那一页，页面随栈删掉之后这条断言只是拿一个不存在的文件失败，
+    既不红在真正的风险上，也不会在有人**新写**一个上传框时报警。
+    清单会过期，"整个前端里不许出现这个形状"不会。
+
+    这里刻意**不**断言前端引用了后端给的那份清单——它以前从 ``/settings`` 的
+    ``capabilities.fileTypes`` 取，那个端点随对话工作台一起删了。在后端重新公布
+    这份清单之前，前端唯一能守的就是"别自己写一份"：上传框不设 accept，
+    不收的类型由后端在摄取时拒掉，那本来也就是唯一有效的判点。
+    """
+    offenders: list[str] = []
+    for path in sorted((REPO / "front-end" / "src").rglob("*.tsx")):
+        hardcoded = re.findall(r'accept="\.[^"]*"', path.read_text(encoding="utf-8"))
+        if hardcoded:
+            offenders.append(
+                f"{path.relative_to(REPO)} 硬编码了 accept：{hardcoded}"
+            )
+    assert not offenders, (
+        "前端又写了一份扩展名清单，而它已经是第八份了：\n  "
+        + "\n  ".join(offenders)
+    )

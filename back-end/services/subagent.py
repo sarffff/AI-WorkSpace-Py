@@ -7,8 +7,8 @@
 
 三个关键约束：
 
-1. **子代理看不到对话历史。** 只给它任务描述。这不是省事,是委派的全部意义所在:
-   如果它还要读完整段对话,那主代理直接自己做就行了,委派只多付了一次生成。
+1. **子代理看不到这张工单。** 只给它任务描述。这不是省事,是委派的全部意义所在:
+   如果它还要读完整的工单与检索材料,那主代理直接自己做就行了,委派只多付了一次生成。
    代价是任务描述写得不好它就查错方向——那正是主代理该负的责任。
 2. **预算是共享的。** ``budget`` 由主循环传进来,子代理消耗的是同一份总额。
    各自独立计预算的话,委派三次就等于把上下文预算用了四倍,而这件事在
@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from config import settings
-from services import agent_roles, guardrails, prompt_library
+from services import agent_roles, guardrails, pricing, prompt_library
 from services.agent_roles import AgentRole
 from services.model_adapter import ModelAdapter, ModelCompletion
 from services.telemetry import SpanKind, tracer
@@ -63,6 +63,12 @@ class SubAgentOutcome:
     # 它读到的文字不会说"我还没查完",看起来和查完了一模一样。
     truncated: bool = False
     failed: bool = False
+    # 这个子代理自己烧掉的模型成本。委派对主循环来说只是"一次工具调用",
+    # 而它内部是一整个 3~5 轮的循环——不把这里的数字记回工单的成本账,
+    # 文档§6.3 那条"单工单成本上限"就会在开委派之后被悄悄绕过。
+    # 与 graph 里的取舍一致：None 是"不知道花了多少"，不是"没花钱"。
+    cost: float | None = None
+    cost_known: bool = False
 
 
 def role_prompt(role: AgentRole) -> str:
@@ -91,9 +97,15 @@ def repeat_limit() -> int:
 class SubAgentRunner:
     """按角色跑一次委派。
 
-    ``take_budget`` 是主循环的 ``_ToolResultBudget.take``:子代理的工具结果和
-    主代理的走同一份预算,签名只暴露一个函数而不是整个预算对象,是为了让
+    ``take_budget`` 是主循环的字符预算领取函数:子代理的工具结果和主代理的走同一份
+    预算,签名只暴露一个函数而不是整个预算对象,是为了让
     "子代理只能花钱、不能查还剩多少、也不能改" 这件事由类型保证。
+
+    ``sanitize_result`` 是主循环的协议中和函数（工单那侧是 ``graph._sanitize_plain``）。
+    **这一道不能省**：主代理的工具结果是在 ``execute`` 节点里过中和的,而子代理的
+    工具结果压根不经过那个节点——它在一个工具处理器的调用栈里直接进了子代理自己的
+    messages。少这一道,一段写在订单备注里的 ``<function=call>`` 就能打乱文本工具协议
+    模型对"哪句是工具结果"的判断,而文档§护栏要的正是"外部内容进上下文之前过一遍"。
     """
 
     def __init__(
@@ -103,17 +115,28 @@ class SubAgentRunner:
         *,
         generation: dict[str, Any],
         take_budget: Callable[[str], str],
+        sanitize_result: Callable[[str], str] | None = None,
     ) -> None:
         self._adapter = model_adapter
         self._runtime = runtime
         self._generation = generation
         self._take_budget = take_budget
+        self._sanitize = sanitize_result or (lambda text: text)
+
+    @property
+    def _fallback_model(self) -> str:
+        """成本换算用的模型名：提供商没在 span 上留模型时用它。
+
+        从 ``generation`` 里取而不是加一个构造参数——那个字典本来就是"这次调用用什么
+        模型、什么温度"，再传一次同名参数迟早会和这里的对不上。
+        """
+        return str(self._generation.get("model") or "")
 
     def _schemas_for(self, role: AgentRole) -> list[dict[str, Any]]:
         """该角色能用的工具 schema。
 
-        取交集而不是照 ``role.tools`` 全给:知识库开关关着的时候
-        ``search_knowledge_base`` 根本没注册,给了它 schema 就是让它去调一个
+        取交集而不是照 ``role.tools`` 全给:没接政策检索的时候
+        ``search_policy`` 根本没注册,给了它 schema 就是让它去调一个
         不存在的工具,白烧一轮。
         """
         allowed = set(role.tools)
@@ -144,6 +167,12 @@ class SubAgentRunner:
         report_parts: list[str] = []
         round_index = 0
         truncated = False
+        # 逐轮累加，而不是在退出的那一刻读外层 span 的用量：外层那个
+        # ``agent.<role>`` span 跨了 3~5 次模型调用，而提供商的 ``set_usage`` 是
+        # **覆盖**写，跑完只剩最后一轮的 token 数——一次多轮委派会被记成"只花了
+        # 一轮的钱"。所以每一轮单独开一个 LLM span，用完立刻换算、加总。
+        cost_total = 0.0
+        cost_seen = False
 
         async with tracer.span(
             f"agent.{role.name}",
@@ -166,7 +195,19 @@ class SubAgentRunner:
                         }
                     )
 
-                completion = await self._complete(messages, schemas, role)
+                async with tracer.span(
+                    f"{role.name}.round",
+                    SpanKind.LLM,
+                    role=role.name,
+                    round_index=round_index,
+                    tool_count=len(schemas),
+                ) as turn:
+                    completion = await self._complete(messages, schemas, role)
+                spent, known = pricing.cost_of_span(turn, self._fallback_model)
+                if spent is not None:
+                    cost_total += float(spent)
+                cost_seen = cost_seen or known
+
                 if completion is None:
                     span.set(failed=True)
                     return SubAgentOutcome(
@@ -175,6 +216,8 @@ class SubAgentRunner:
                         steps=steps,
                         rounds=round_index,
                         failed=True,
+                        cost=cost_total or None,
+                        cost_known=cost_seen,
                     )
 
                 if completion.protocol_error:
@@ -185,6 +228,8 @@ class SubAgentRunner:
                         steps=steps,
                         rounds=round_index,
                         failed=not completion.content.strip(),
+                        cost=cost_total or None,
+                        cost_known=cost_seen,
                     )
 
                 calls = [] if is_final else completion.tool_calls
@@ -258,7 +303,7 @@ class SubAgentRunner:
                         )
                     )
 
-                    content = self._take_budget(result_text)
+                    content = self._take_budget(self._sanitize(result_text))
                     if completion.uses_text_tool_protocol:
                         text_results.append(f"工具 {call.name} 的结果：\n{content}")
                     else:
@@ -307,6 +352,7 @@ class SubAgentRunner:
                 report_chars=len(report) or None,
                 truncated=truncated or None,
                 repeated_blocked=repeats.blocked or None,
+                cost=cost_total or None,
             )
             return SubAgentOutcome(
                 role=role.name,
@@ -315,6 +361,8 @@ class SubAgentRunner:
                 rounds=round_index,
                 truncated=truncated,
                 failed=not report,
+                cost=cost_total or None,
+                cost_known=cost_seen,
             )
 
     async def _complete(
@@ -351,22 +399,18 @@ def build_delegate_schema(roles: list[AgentRole]) -> dict[str, Any]:
     描述里把每个角色能干什么列全,因为这是主代理选人的唯一依据——工具描述
     是它能看到的全部信息,角色的提示词它看不到。
 
-    **这里只写契约,不写策略。** "什么时候值得委派"归系统提示词
-    (``chat_system_rag`` 的 v5-augment / v6-supervisor),原因有两个:
+    **这里只写契约,不写策略。** "什么时候值得委派"由调用方在系统上下文里给
+    一段说明（工单那侧是 ``graph._delegation_notice``）。两件事分开的原因是:
+    策略要说的那句"这一步自己做还是派人"取决于此刻注册了哪些工具,而 schema
+    这段 description 是**按当前角色列表现场生成的**——把策略写死在这里,
+    supervisor 模式下"能直接调工具解决的事自己做"就成了假话(那时主代理没有那些工具)。
 
-    1. 提示词是版本化的、进 A/B 的、写进 trace 的 ``prompt_version``;这段
-       description 不是。同一件事在两处各写一遍,改了一处忘另一处时模型会同时
-       收到两份矛盾的策略,而 trace 只记得其中一份。
-    2. 策略本身**因模式而异**。原来这里写着"能直接调工具解决的事自己做",
-       在 supervisor 模式下是错的——那时主代理没有那些工具。一段固定的
-       description 说不清一件随配置变化的事。
-
-    留在这里的是不随模式变的事实:子代理看不到对话(所以 task 必须自包含)、
+    留在这里的是不随配置变的事实:子代理看不到工单原文(所以 task 必须自包含)、
     有哪些角色、各自能做什么。
     """
     lines = [
         "把一个独立的子任务交给专门的子代理执行，并拿回它的报告。",
-        "子代理看不到本次对话，只能看到你在 task 里写的内容。",
+        "子代理看不到这张工单，只能看到你在 task 里写的内容。",
         "可用的子代理：",
     ]
     lines += [f"- {role.name}：{role.summary}" for role in roles]
@@ -381,24 +425,63 @@ def build_delegate_schema(roles: list[AgentRole]) -> dict[str, Any]:
             "task": {
                 "type": "string",
                 # 这是整个工具面里唯一一个"写法质量直接决定成败"的参数:其它工具
-                # 的参数都是单值(查询词、路径、表达式),写错了模型能从报错里看出来,
+                # 的参数都是单值(订单号、检索词),写错了模型能从报错里看出来,
                 # 而一句写得含糊的 task 会拿回一份看起来很正常但查错方向的报告。
                 # 所以这里给一正一反两个例子——提示词里反复讲"必须自包含"是抽象的,
                 # 一个反例比三句叮嘱更能说明"含糊"长什么样。
                 "description": (
-                    "给子代理的任务描述。它看不到对话历史，所以背景、要查什么、"
-                    "你已经知道的相关信息、需要它核对的材料原文，都要写进这一段里。\n"
-                    "好的例子：「查明公司差旅住宿费的一线城市每晚上限。用户问的是"
-                    "上季度出差 7 晚的报销总额，我已知市内交通为 540 元。"
-                    "请给出上限金额及其出处（文档名与分块号）。」\n"
-                    "不好的例子：「帮我查一下这个的标准是多少」——子代理不知道"
-                    "「这个」指什么、不知道要查哪一类标准，只能瞎查。"
+                    "给子代理的任务描述。它看不到工单原文，所以背景、要查什么、"
+                    "你已经知道的编号与事实、需要它核对的材料原文，都要写进这一段里。\n"
+                    "好的例子：「核对订单 ORD20260115001 是否还能改地址。客户说想改到"
+                    "上海。我已查到该单状态为 paid、收货地址在苏州。请给出订单当前状态、"
+                    "是否已发货，以及如果已发货，物流到哪一步。」\n"
+                    "不好的例子：「帮我查一下这个还能不能改」——子代理不知道"
+                    "「这个」指哪张单、不知道要改什么，只能瞎查。"
                 ),
             },
         },
         "required": ["role", "task"],
         "additionalProperties": False,
     }, "\n".join(lines)
+
+
+def delegation_notice(roles: list[AgentRole], mode: str) -> str:
+    """给主代理的那段"什么时候值得委派"，注入系统上下文。
+
+    为什么是一段注入的消息而不是 ``prompts/ticket_agent/`` 里的一个版本分支：
+    这段话里**必须列出此刻真正可用的角色**，而那份清单取决于本轮注册了哪些工具
+    （没接政策检索时 policy 角色不存在，low 风险的工单没有资金类工具）。写进
+    版本化的模板就只有两种可能：把清单写死（那它迟早和工具面对不上），或者加一个
+    占位符（那 messages[0] 每换一张工单就变一次，整段提示词缓存作废——
+    见 ``prompts/ticket_agent/v1.md`` 的 notes 与 ``graph._PLAN_NOTICE`` 同样的取舍）。
+
+    策略本身（"一次能查完的自己做"）是不随工单变的那部分，它留在这里；
+    随配置变的只有角色清单和 supervisor 那一句。
+    """
+    if not roles:
+        return ""
+    menu = "、".join(f"{role.name}（{role.summary.split('。')[0]}）" for role in roles)
+    lines = [
+        "[可以把独立的子任务交出去]",
+        f"可用的子代理：{menu}。",
+    ]
+    if mode == "supervisor":
+        lines.append(
+            "这个模式下你自己没有查询工具——需要事实就派人查，拿到报告再继续。"
+        )
+    else:
+        lines.append(
+            "一次工具调用就能查完的事自己做：委派要多付一整个子代理循环的生成，"
+            "而它看不到这张工单，你得把背景重述一遍，重述本身就是成本。"
+        )
+    lines += [
+        "值得派人的情形：要跨好几张单据核对、要查政策原文，或者要给情绪激动的客户"
+        "起草一段话——它的报告只带结论回来，比把一堆原文留在上下文里省。",
+        "写操作一律由你自己提出（改地址、开票、退款、取消）。不要试图委派它们："
+        "提出之后它们会在工单台上停下来等人批，而委派出去的执行不过那道闸门。",
+        "task 参数必须自包含：订单号、已查到的状态与金额、要它核对的原文，都写进去。",
+    ]
+    return "\n".join(lines)
 
 
 def format_report(outcome: SubAgentOutcome) -> str:

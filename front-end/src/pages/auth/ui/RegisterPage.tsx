@@ -16,12 +16,13 @@ import {
   Chrome,
   Sun,
   Moon,
+  Monitor,
 } from "lucide-react";
 
 export const RegisterPage: React.FC = () => {
   const navigate = useNavigate();
   const dispatch = useDispatch();
-  const { theme, toggleTheme } = useTheme();
+  const { mode, theme, cycleMode } = useTheme();
 
   const [formData, setFormData] = useState({
     email: "",
@@ -118,10 +119,16 @@ export const RegisterPage: React.FC = () => {
     <div className="min-h-screen app-atmosphere flex transition-colors duration-200">
       <div className="absolute top-6 right-6 z-20">
         <button
-          onClick={toggleTheme}
+          onClick={cycleMode}
           className="p-2.5 rounded-full bg-[#f3f0e6] hover:bg-[#eae6db] dark:bg-[#1e1d1b] dark:hover:bg-[#262522] border border-[#e3dfd5] dark:border-[#2e2d2a] text-[#1f1e1d] dark:text-[#edece8] transition-all shadow-md"
         >
-          {theme === "dark" ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4 text-slate-700" />}
+          {mode === "system" ? (
+            <Monitor className="w-4 h-4" />
+          ) : theme === "dark" ? (
+            <Sun className="w-4 h-4 text-state-hold" />
+          ) : (
+            <Moon className="w-4 h-4" />
+          )}
         </button>
       </div>
 
@@ -132,18 +139,18 @@ export const RegisterPage: React.FC = () => {
         <div className="relative z-10">
           <div className="flex items-center gap-3 mb-10">
             <BrandMark size={40} />
-            <span className="font-display text-lg font-semibold">有据工作台</span>
+            <span className="font-display text-lg font-semibold">客服工单台</span>
           </div>
-          <p className="label-eyebrow mb-3">新工作台</p>
+          <p className="label-eyebrow mb-3">加入一个工作区</p>
           <h1 className="font-display text-[40px] leading-[1.15] font-semibold text-[#1f1e1d] dark:text-[#edece8] text-balance">
-            搭一张<br />能核对的台子
+            注册之后<br />先有一个空间
           </h1>
           <p className="mt-4 text-sm text-[#6e6b63] dark:text-[#a19f96] max-w-sm leading-relaxed">
-            注册之后就能上传文档、挂提示词版本、回放每一次回答。这里练的是工程，不是聊天。
+            工单、共享知识库与作业指导都挂在空间上。没有邀请码的话，注册会给你开一个自己的空间。
           </p>
         </div>
         <div className="relative z-10 space-y-3">
-          {["文档进库即可引用", "工具轨迹跨回合回灌", "差评能变成回归用例"].map(
+          {["自己的空间默认是管理员", "有邀请码就加入团队的空间", "换空间不会删掉你上传的文档"].map(
             (line, i) => (
               <div
                 key={line}

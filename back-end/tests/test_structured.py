@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 
+from pydantic import BaseModel, field_validator
+
 from conftest import ScriptedAdapter, run
 from services import structured
 
@@ -26,6 +28,43 @@ class Adapter(ScriptedAdapter):
             max_tokens=max_tokens,
             top_p=top_p,
         )
+
+
+class _Tag(BaseModel):
+    """测试用的最小契约:一个枚举字段 + 一个长度上限。
+
+    原来这几条用的是 ``structured.MemoryItems``——那是 workbench 记忆功能的契约,
+    随那个模块一起删了。而被测的机制(枚举不合法要拒、超长要拒、报错回灌重试)
+    和业务无关,所以在这里留一份替身,而不是把三条测试一起删掉——删掉之后
+    "重试消息里带上模型自己那句话"这条就没有任何回归保护了。
+    """
+
+    kind: str
+    content: str
+
+    @field_validator("kind")
+    @classmethod
+    def _known_kind(cls, value: str) -> str:
+        kind = value.strip()
+        if kind not in ("fact", "preference"):
+            raise ValueError("kind 只能是 fact 或 preference")
+        return kind
+
+    @field_validator("content")
+    @classmethod
+    def _bounded(cls, value: str) -> str:
+        content = value.strip()
+        if not content:
+            raise ValueError("content 不能为空")
+        # 上限在契约里而不是在调用方的 if 里:超长的多半是把整段原文抄了一遍,
+        # 那是模型没照指令做,应该让它重试一次,而不是静默接受
+        if len(content) > 20:
+            raise ValueError("content 超过 20 字，请只写一条可复用的事实")
+        return content
+
+
+class _Tags(BaseModel):
+    items: list[_Tag]
 
 
 def _ask(adapter, schema, *, array: bool, retries: int = 1, rescue=None):
@@ -108,7 +147,7 @@ def test_retry_feeds_validation_error_back():
         ]
     )
 
-    result, report = _ask(adapter, structured.MemoryItems, array=True)
+    result, report = _ask(adapter, _Tags, array=True)
 
     assert result is not None
     assert result.items[0].kind == "fact"
@@ -229,13 +268,10 @@ def test_retry_happens_when_rescue_declines():
 # ========== 契约细节 ==========
 
 
-def test_memory_item_rejects_oversized_content(monkeypatch):
-    from config import settings
+def test_contract_bound_rejects_oversized_content():
+    adapter = Adapter([{"text": json.dumps([{"kind": "fact", "content": "x" * 40}])}])
 
-    monkeypatch.setattr(settings, "MEMORY_ITEM_MAX_CHARS", 10)
-    adapter = Adapter([{"text": json.dumps([{"kind": "fact", "content": "x" * 20}])}])
-
-    result, report = _ask(adapter, structured.MemoryItems, array=True, retries=0)
+    result, report = _ask(adapter, _Tags, array=True, retries=0)
 
     assert result is None
     assert report.failures == ["invalid"]

@@ -100,30 +100,34 @@ class Settings(BaseSettings):
     # off        : 单代理,与此前逐位相同(默认)
     # augment    : 主代理保留全部工具,额外多一个 delegate。它可以自己做也可以派人,
     #              于是"什么时候值得委派"由模型判断——这是能看出委派有没有用的模式。
-    # supervisor : 专用工具从主代理手里收走,只留 delegate 与不属于任何角色的工具。
-    #              分工更干净,代价是简单问题也得多付一次生成。
+    # supervisor : 查询类工具从主代理手里收走,只留 delegate、写操作与 load_skill。
+    #              分工更干净——所有事实都经 inquiry/policy 两个子代理之手,
+    #              代价是简单问题也得多付一次生成。
     #
-    # 默认 off 不是保守:委派会把一次回答的模型调用次数变成不确定的(每次委派多一次
+    #              写操作**任何模式都不进子代理工具面**：审批闸门在主循环按
+    #              proposals 判,而子代理跑在一个工具处理器里面,委派出去的执行
+    #              不过人审（详见 agent_roles 模块文档）。
+    #
+    # 默认 off 不是保守:委派会把一次工单的模型调用次数变成不确定的(每次委派多一次
     # 完整的子代理循环),成本与延迟都随之上升。开之前应该先在 traces 里看清
     # 单代理模式下究竟是哪一步不够用。
     AGENT_DELEGATION_MODE: str = "off"
 
-    # 计划最多几步。上限是**校验**不是截断:多出来的步骤砍掉等于把"模型没照
-    # max_steps 做"翻译成"计划就这么长"(见 structured.Plan)。
-    AGENT_PLAN_MAX_STEPS: int = 5
+    # 一张工单最多委派几次。子代理内部的工具调用**也**计入
+    # ``TICKET_MAX_TOOL_CALLS``（见 graph 的 execute 记账）,所以这个上限管的是
+    # "另起几个独立上下文"——那才是成本与延迟的真正来源:每次委派是一整个
+    # 3~5 轮的循环,而它烧的钱不体现在主循环的轮次里。
+    # 没有上限时,一个"稳妥"的模型能把索引里每个角色都派一遍再开始办事。
+    AGENT_MAX_DELEGATIONS: int = 2
 
-
-
-
-
-
-    # 留空则用提供商默认端点;填了可指向自建代理或区域端点
-    WEB_SEARCH_BASE_URL: str = ""
+    # 子代理每次工具结果回灌给它的字符上限。主代理的工具结果整条进 messages,
+    # 而子代理的那些会连同它的报告一起回到主代理上下文里——不加一道截断,
+    # 一次委派就能把三张订单的全文带回来,而主代理要的只是那一句结论。
+    AGENT_SUBAGENT_RESULT_MAX_CHARS: int = 4000
 
     # 单个页面允许读取的字节上限（超出即判失败）与注入上下文的字符上限
     WEB_FETCH_MAX_BYTES: int = 200 * 1024
     WEB_FETCH_TIMEOUT_SECONDS: float = 10.0
-
 
     # ========== Skill（作业指导） ==========
     # 一份 skill 回答"这件事在本组织该怎么做"——报销怎么审、季度报告怎么写。
@@ -474,9 +478,6 @@ class Settings(BaseSettings):
     # 想让联网抓取只能碰几个可信域时设它。
     EGRESS_ALLOWLIST: str = ""
 
-    # 单条记忆的字符上限,超长的"记忆"多半是把整段对话抄了一遍
-    MEMORY_ITEM_MAX_CHARS: int = 200
-
     PROMPT_EVAL_ANSWER_VERSION: str = ""
     # 子代理提示词的版本。三个角色各自一项——共享一个开关就没法单独 A/B 某个
     # 角色,动一个会让另两个的结果一起失效。
@@ -484,25 +485,9 @@ class Settings(BaseSettings):
     # 没有这三项之前,``role_prompt()`` 唯一的出口是 SPECS 里的 default_version,
     # 也就是说新版本只能靠改源码才能生效,eval 变体扫不到它——``prompt_key``
     # 那套版本化机制是空转的。
-    PROMPT_AGENT_RESEARCHER_VERSION: str = ""
-    PROMPT_AGENT_ANALYST_VERSION: str = ""
-    PROMPT_AGENT_CRITIC_VERSION: str = ""
-
-    # ========== 提示词缓存（provider 侧上下文缓存） ==========
-    # 智谱等 OpenAI 兼容端点的上下文缓存是**隐式**的:没有 cache_control 断点、
-    # 没有请求参数,提供商自己识别与之前请求相同的前缀并复用那部分计算,命中的
-    # token 按标准价打折计费(智谱文档写的是约 50%)。因此工程上能做的只有一件事:
-    # **让前缀真的逐字一致**。
-    #
-    # 开启后系统提示词按 prefetched=False 渲染,"已预检索过、不要重复检索"这句话
-    # 改从用户消息里给(预检索没命中时那句提示本来就走这条路,见 chat_service)。
-    # 关掉即回到改动前的行为——那时 messages[0] 会随预检索命中与否在两种正文之间
-    # 来回切,而它是整个前缀的第一条消息,一变就是整段缓存作废。
-    #
-    # 留成开关而不是直接删掉模板里的 [[if prefetched]]:那一版条件段是"要不要在
-    # 系统提示词里讲预检索"的对照组,和 TOOL_HISTORY_ENABLED / RAG_PREFETCH 一样,
-    # 旧行为必须仍然跑得起来才能量出这个改动值多少。
-    PROMPT_CACHE_STABLE_PREFIX: bool = True
+    PROMPT_TICKET_SUB_INQUIRY_VERSION: str = ""
+    PROMPT_TICKET_SUB_POLICY_VERSION: str = ""
+    PROMPT_TICKET_SUB_REASSURANCE_VERSION: str = ""
 
     # ========== 结构化输出 ==========
     # 模型输出解析/校验失败时的重试次数。重试会把 Pydantic 的报错原文回灌给模型
@@ -515,9 +500,9 @@ class Settings(BaseSettings):
 
     # ========== 工单域（客服 + 工单解决 Agent）==========
     # 整个工单域的总开关。默认关，与一切会改变状态的能力一致
-    # （REVIEW_LEDGER_ENABLED / TOOL_FS_* / SKILL_ENABLED 都是关的）。
+    # （SKILL_ENABLED / AGENT_DELEGATION_MODE 都是关的）。
     #
-    # 关着的时候工单路由不注册、业务工具不注册，对话与知识库的行为逐位等价于
+    # 关着的时候工单路由不注册、业务工具不注册，知识库的行为逐位等价于
     # 加这套东西之前——这是本仓库每一个新能力的通式，不是形式主义：它让
     # "上线出问题时把开关拨回去"成为一条不需要回滚部署的动作。
     TICKET_AGENT_ENABLED: bool = False

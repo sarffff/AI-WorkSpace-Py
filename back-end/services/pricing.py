@@ -190,3 +190,34 @@ def estimate_cost(
     return price_table().estimate(
         model, prompt_tokens, completion_tokens, cached_tokens
     )
+
+
+def cost_of_span(span: Any, fallback_model: str) -> tuple[Decimal | None, bool]:
+    """把一个模型调用 span 的用量换算成成本。
+
+    返回 ``(成本或 None, 这次是否知道了成本)``。第二个分量是必需的：提供商没回传
+    用量、模型不在价目表里、遥测关着，这三种情况都给不出数——把它们折算成 0 就等于
+    宣布"这一段没花钱"，而成本熔断的正面恰好就是这句话（见
+    ``ticket.graph._cost_over``）。这里只知道"有没有算出钱"这件事，熔断怎么判是上层的事。
+
+    放在 pricing 而不是编排层：主代理每轮、每个子代理每轮都要做同一道换算，
+    两处各写一遍迟早会不一样——而"缓存命中减掉再打折"这种细节不一致时，
+    差出来的那一点正好落在熔断阈值附近。
+
+    缓存命中的那部分是 ``prompt_tokens`` 的子集，必须减掉再按打折价单算，
+    否则一份输入会被计成两遍钱（见 ``telemetry.Span.cached_tokens`` 的说明）。
+    """
+    prompt_tokens = getattr(span, "prompt_tokens", None)
+    completion_tokens = getattr(span, "completion_tokens", None)
+    if prompt_tokens is None and completion_tokens is None:
+        return None, False
+    cost = estimate_cost(
+        getattr(span, "model", None) or fallback_model,
+        prompt_tokens,
+        completion_tokens,
+        getattr(span, "cached_tokens", None),
+    )
+    if cost is None:
+        # 有用量但没价目：知道花了多少 token，但不知道值多少钱
+        return None, True
+    return cost.amount, True
