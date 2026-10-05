@@ -1,0 +1,22 @@
+# 构建上下文里不该进镜像的东西。前两条是**用户数据**：把它们打进镜像，等于把某个
+# 人的本机文件索引和上传过的文档发给了任何拿到这个镜像的人。
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# 用户上传的文档与本机文件工具的备份：数据，不是代码
+uploads/
+fs_backups/
+
+# 开发期本地状态：sqlite 文件（含工单检查点）、真实的价目表、本地 .env
+*.db
+*.db-journal
+model_prices.json
+.env
+
+# 评估报告与跑出来的产物：体积大、且是某台机器某次运行的快照
+eval/reports/
+node_modules/
+.git/

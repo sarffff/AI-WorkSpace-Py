@@ -16,7 +16,6 @@ from decimal import Decimal
 from services import pricing
 from services.model_adapter import OpenAICompatibleAdapter
 from services.prompt_library import get as get_prompt
-from services.chat_service import ChatService
 
 
 class _Details:
@@ -180,29 +179,5 @@ def test_unknown_model_still_returns_none():
 # ========== 前缀稳定性 ==========
 
 
-def test_stable_prefix_keeps_system_prompt_identical(monkeypatch):
-    from config import settings
-
-    monkeypatch.setattr(settings, "PROMPT_CACHE_STABLE_PREFIX", True)
-    template = get_prompt("chat_system_rag", "v2")
-
-    hit = ChatService._system_prompt(template, True)
-    miss = ChatService._system_prompt(template, False)
-
-    # 这是整个改动的要点:前缀第一条消息不再随预检索结果变化
-    assert hit == miss
-    assert "预先检索" not in hit
 
 
-def test_disabling_stable_prefix_restores_old_behaviour(monkeypatch):
-    from config import settings
-
-    monkeypatch.setattr(settings, "PROMPT_CACHE_STABLE_PREFIX", False)
-    template = get_prompt("chat_system_rag", "v2")
-
-    hit = ChatService._system_prompt(template, True)
-    miss = ChatService._system_prompt(template, False)
-
-    assert hit != miss
-    assert "预先检索" in hit
-    assert "预先检索" not in miss

@@ -76,16 +76,6 @@ def test_attachment_router_allowlist_is_the_source():
     assert attachment_router.ALLOWED_EXT is file_types.ATTACHMENT
 
 
-def test_workspace_tools_image_extensions_is_the_source():
-    """第七处副本，清点第一轮漏掉的那个。
-
-    ``read_attachment`` 用它决定"这是图片，给出那句需要视觉模型的解释"而不是
-    去做文本解析。漏改它的症状不是报错，是回答变得莫名其妙——某种图片会拿到
-    "解析失败"而不是那句解释。
-    """
-    from services import workspace_tools
-
-    assert workspace_tools._IMAGE_EXTENSIONS is file_types.IMAGE
 
 
 # ========== 集合代数：派生关系本身 ==========
@@ -216,37 +206,9 @@ def test_payload_categories_match_the_sets():
     assert set(body["document"]) == set(file_types.DOCUMENT)
 
 
-def test_settings_endpoint_exposes_file_types():
-    """接线断言：payload 进了 capabilities。
-
-    少了这一条，上面所有断言都可能在"前端根本收不到"的情况下全绿——而那就是
-    这个仓库里"记录了但没冒泡到消费者那一层"的第四次重演。
-    """
-    import inspect
-
-    from routers import settings_router
-
-    source = inspect.getsource(settings_router.get_settings)
-    assert "fileTypes" in source
-    assert "file_types.payload()" in source
-
-
 # ========== 第八份副本：能派生的已派生，不能派生的用测试盯 ==========
 
 
-def test_vision_mime_table_covers_exactly_the_image_category():
-    """``vision._MIME_TYPES`` 的**键集**必须等于 IMAGE。
-
-    这一处没有改成派生，因为 MIME 值推不出来（``jpg`` → ``image/jpeg``），
-    所以它只能靠测试盯住。而它确实是一份实质副本：``vision.py:111`` 用
-    ``not in _MIME_TYPES`` 当准入判据。
-
-    失效方式是**静默**的：往 IMAGE 加一种格式却忘了加 MIME，那种图片会在
-    第 111 行被安静跳过——用户抱怨"它没看见我的图"，而日志里什么都没有。
-    """
-    from services import vision
-
-    assert set(vision._MIME_TYPES) == set(file_types.IMAGE)
 
 
 def test_attachment_signature_table_covers_the_image_category():
@@ -293,8 +255,8 @@ def _extension_literals_in(path: pathlib.Path) -> list[tuple[int, set[str]]]:
     ``_IMAGE_SIGNATURES`` 里有 ``("jpg", "jpeg")`` 这样的合法二元组，它回答的是
     "这个签名对应哪些扩展名"，不是一份清单。
 
-    只看集合/列表/元组，**不看 dict**：``vision._MIME_TYPES`` 是合法的
-    ext→MIME 映射，它的键集由上面那条专门的测试盯着。
+    只看集合/列表/元组，**不看 dict**：按扩展名查 MIME/签名的映射是合法形状，
+    它的键集由上面那条专门的测试盯着。
     """
     tree = ast.parse(path.read_text(encoding="utf-8"))
     found: list[tuple[int, set[str]]] = []

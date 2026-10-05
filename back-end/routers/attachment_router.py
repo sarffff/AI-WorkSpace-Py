@@ -1,11 +1,15 @@
-"""对话附件上传路由：把用户在聊天框上传的文件保存到本地，返回可访问的 URL。
+"""附件上传路由：把随工单/文档提交的文件保存到本地，返回可访问的 URL。
+
+工单接入的第一步就要标准化**附件**（客户发来的订单截图、发票照片、故障视频），
+所以这里不属于某个前端页面，而是渠道侧的入口。上传只做保存与类型校验；解析与
+进检索是另一条链路（``/knowledge/documents``）。
 
 支持三类，划分与白名单都来自 ``services.file_types``（单一真相源，别在这里
 再列一份——那正是改动前的问题）：
 
-- 文本类：前端会直接读取内容拼到 prompt，本接口仅做归档
-- 图片类：前端通过 <img> 渲染，后端通过 /uploads 静态服务返回；额外做 magic bytes 校验
-- 文档类（pdf）：走知识库解析链路，同样做签名校验
+- 文本类：调用方会直接读取内容，本接口仅做归档
+- 图片类：通过 <img> 渲染，后端通过 /uploads 静态服务返回；额外做 magic bytes 校验
+- 文档类（pdf/docx/xlsx/pptx）：走知识库解析链路，同样做签名校验
 """
 import os
 import uuid
@@ -18,7 +22,7 @@ from config import settings
 from services import file_types
 from services.clock import now as app_now
 
-router = APIRouter(prefix="/chats/attachments", tags=["对话附件"])
+router = APIRouter(prefix="/attachments", tags=["工单附件"])
 
 # 从 file_types 派生。svg / html 的排除**不在这里**表达了——它们不在任何基础类别里，
 # 所以自动不在这个集合里。理由与那条安全测试的关系见 services/file_types.py

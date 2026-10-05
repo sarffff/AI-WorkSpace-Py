@@ -205,5 +205,6 @@ def test_仓库自带的skill能通过校验():
     ``validate()``，这里红了意味着服务起不来。
     """
     skills = skill_library.reload()
-    assert "expense-review" in skills
-    assert skills["expense-review"].attachments == ("报销额度标准.md",)
+    assert "refund-playbook" in skills
+    # 规程类 SOP 的价值在"缺哪项就不能办"，那件事由 required_inputs 承载
+    assert skills["refund-playbook"].required_inputs

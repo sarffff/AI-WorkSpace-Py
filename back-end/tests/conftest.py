@@ -52,21 +52,21 @@ _PINNED_FLAGS = {
     # 的测试全部受影响，而报错是 `assert 0 == 1`，完全没提审批。
     # ``AGENT_PLAN_MODE=plan_execute`` 会在每个回合前多插一次辅助模型调用，
     # 把 ScriptedAdapter 的剧本错位一格——那时"第一轮"拿到的是规划那次的脚本。
-    "AGENT_APPROVAL_MODE": "off",
-    "AGENT_PLAN_MODE": "off",
-    # 2026-08-28 补：模型名也得钉。``chat_service`` 到处是
-    # ``model or settings.LLM_MODEL``，所以任何不显式传模型的测试，实际参与
-    # 判断的都是本地 .env 里的模型名。视觉那两条测试就是这么红的：白名单写
-    # ``glm-4.5-air``，而 .env 是 ``glm-4.6v``，于是断言"图片变成内容块"必然失败，
-    # 报错却长得像视觉功能坏了。钉成一个**不在任何视觉白名单里**的固定名字，
-    # 需要视觉的测试自己 monkeypatch 成白名单里的值。
+    # 字符串型的**模式**开关。``AGENT_DELEGATION_MODE`` 开着时子代理会把工具面
+    # 换成按角色裁剪的那一份，断言"模型这轮看到了哪些工具"的测试就会漂——而报错
+    # 长得像工具注册坏了。要测委派路径的测试自己打开它。
+    "AGENT_DELEGATION_MODE": "off",
+    # 模型名也得钉。辅助调用到处是 ``model or settings.utility_model``，所以任何
+    # 不显式传模型的测试，实际参与判断的都是本地 .env 里的模型名。钉成一个固定
+    # 名字，需要特定模型的测试自己 monkeypatch。
     "LLM_MODEL": "glm-4.5-air",
-    "VISION_MODELS": "",
-    # 提示词版本。空串 = 走代码里的默认版本；.env 里设成 v4-workspace 之后，
-    # 断言系统提示词内容的测试会挂在与改动无关的地方（v4 里没有"不要重复检索"
-    # 那句，它属于 v2/v3-lean）。提示词版本和工具面是耦合的，一旦本地为了试新
-    # 工具切了版本，这类断言就全部漂移。
-    "PROMPT_CHAT_SYSTEM_VERSION": "",
+    # 提示词版本。空串 = 走代码里的默认版本；.env 里设成某个具体版本之后，
+    # 断言提示词内容的测试会挂在与改动无关的地方。提示词版本和其它配置是耦合的，
+    # 一旦本地为了试新版切了版本，这类断言就全部漂移。
+    "PROMPT_AGENT_RESEARCHER_VERSION": "",
+    "PROMPT_AGENT_ANALYST_VERSION": "",
+    "PROMPT_AGENT_CRITIC_VERSION": "",
+    "PROMPT_EVAL_ANSWER_VERSION": "",
     # 护栏按"开启但不拦截"测，拦截行为由 test_guardrails 自己 monkeypatch 阈值
     "GUARDRAIL_ENABLED": True,
     "GUARDRAIL_BLOCK_SCORE": 0,
@@ -103,25 +103,6 @@ def _code_default_flags() -> dict[str, object]:
         for name, field in Settings.model_fields.items()
         if isinstance(field.default, bool)
     }
-
-
-@pytest.fixture(autouse=True)
-def _isolate_fs_backups(tmp_path_factory, monkeypatch):
-    """把 ``FS_BACKUP_DIR`` 指到临时目录。
-
-    autouse 且必须在这里，不能靠各个测试自己记得：默认值是
-    ``back-end/fs_backups``，也就是**仓库里的一个真实目录**。不隔离的话跑一次
-    测试就会往那儿写十几份备份，而且 ``index.json`` 跨运行累积——
-    下一次跑 ``list_for_user`` 会看到上一次留下的行。
-
-    这是"结果取决于上一次跑过什么"那一类，和 ``_pin_feature_flags`` 防的是
-    同一件事，只不过脏的是磁盘而不是配置。
-
-    它是字符串型设置，按 bool 类型钉开关的那条规则覆盖不到。
-    """
-    monkeypatch.setattr(
-        settings, "FS_BACKUP_DIR", str(tmp_path_factory.mktemp("fs_backups"))
-    )
 
 
 @pytest.fixture(autouse=True)
@@ -405,42 +386,3 @@ def db_real():
         session.close()
         engine.dispose()
 
-
-def _seed_chat(session, *, user_id: str = "u1"):
-    from models import Chat, Message
-    from services.clock import naive_now
-
-    now = naive_now()
-    chat = Chat(id="c1", user_id=user_id, title="测试会话", created_at=now, updated_at=now)
-    session.add(chat)
-    question = Message(
-        id="m-user", chat_id="c1", role="user", content="试用期多久？", created_at=now
-    )
-    session.add(question)
-    session.commit()
-    return chat, question
-
-
-@pytest.fixture
-def chat_with_question(db_real) -> tuple[str, str]:
-    _chat, question = _seed_chat(db_real)
-    return "c1", question.id
-
-
-@pytest.fixture
-def chat_with_answer(db_real) -> tuple[str, str]:
-    from models import Message
-    from services.clock import naive_now
-
-    _seed_chat(db_real)
-    answer = Message(
-        id="m-assistant",
-        chat_id="c1",
-        role="assistant",
-        content="试用期 6 个月。",
-        model="glm-4.5-air",
-        created_at=naive_now(),
-    )
-    db_real.add(answer)
-    db_real.commit()
-    return "c1", answer.id

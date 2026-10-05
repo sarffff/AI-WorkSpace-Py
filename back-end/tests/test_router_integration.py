@@ -93,11 +93,11 @@ def test_register_login_and_protected_access(client, db_session):
     assert me.status_code == 200
     assert me.json()["email"] == "alice@example.com"
 
-    chats = client.get("/chats", headers=_auth(token))
-    assert chats.status_code == 200
-    assert chats.json() == []
+    tickets = client.get("/tickets", headers=_auth(token))
+    assert tickets.status_code == 200
+    assert tickets.json()["tickets"] == []
 
-    anonymous = client.get("/chats")
+    anonymous = client.get("/tickets")
     assert anonymous.status_code == 401
 
 
@@ -134,32 +134,6 @@ def test_login_wrong_password_rejected(client):
 # ========== 跨用户越权 ==========
 
 
-def test_cross_user_chat_access_returns_404(client, db_session):
-    """别人的对话在路由层是"不存在"：读消息、工具轨迹、重命名、删除全部 404。"""
-    _register(client, email="alice@example.com", username="alice")
-    _register(client, email="bob@example.com", username="bob")
-    alice_token = _login(client, email="alice@example.com")
-    bob_token = _login(client, email="bob@example.com")
-
-    created = client.post("/chats", json={"title": "机密"}, headers=_auth(alice_token))
-    assert created.status_code == 200
-    chat_id = created.json()["id"]
-
-    for method, path in [
-        ("get", f"/chats/{chat_id}/messages"),
-        ("get", f"/chats/{chat_id}/tool-steps"),
-        ("patch", f"/chats/{chat_id}"),
-        ("delete", f"/chats/{chat_id}"),
-    ]:
-        kwargs = {"headers": _auth(bob_token)}
-        if method == "patch":
-            kwargs["json"] = {"title": "改名"}
-        response = getattr(client, method)(path, **kwargs)
-        assert response.status_code == 404, f"{method} {path} -> {response.status_code}"
-
-    # 所有者本人仍可访问
-    own = client.get(f"/chats/{chat_id}/messages", headers=_auth(alice_token))
-    assert own.status_code == 200
 
 
 # ========== 文档的管理可见性(真正的闸口在路由) ==========
@@ -370,7 +344,7 @@ def test_metrics_usage_requires_auth_and_returns_totals(client, db_session):
     body = response.json()
     assert "totals" in body
     assert body["totals"]["spans"] == 0
-    assert "byModel" in body and "cache" in body
+    assert "byModel" in body and "byKind" in body
 
 
 # ========== 附件上传（HTTP 链路） ==========
@@ -398,7 +372,7 @@ def test_attachment_upload_http_flow(monkeypatch, db_session):
             _register(client)
             token = _login(client)
             response = client.post(
-                "/chats/attachments/upload",
+                "/attachments/upload",
                 files={
                     "file": (
                         "meeting.md",
@@ -421,7 +395,7 @@ def test_attachment_upload_http_flow(monkeypatch, db_session):
 
             # 恶意扩展名在入口被拦：可执行/内嵌脚本类型不许传
             blocked = client.post(
-                "/chats/attachments/upload",
+                "/attachments/upload",
                 files={"file": ("evil.svg", b"<svg onload=alert(1)>", "image/svg+xml")},
                 headers=_auth(token),
             )
@@ -453,7 +427,7 @@ def test_attachment_spoofed_image_rejected(monkeypatch, db_session):
             _register(client)
             token = _login(client)
             response = client.post(
-                "/chats/attachments/upload",
+                "/attachments/upload",
                 files={"file": ("fake.png", b"not a real image", "image/png")},
                 headers=_auth(token),
             )
@@ -467,274 +441,23 @@ def test_attachment_spoofed_image_rejected(monkeypatch, db_session):
 # ========== 用量闸门与审批审计（HTTP 链路） ==========
 
 
-def test_用量闸门在HTTP层返回429并带RetryAfter(client, db_session, monkeypatch):
-    """限流必须在进入 SSE 之前发生。
-
-    生成器里抛 HTTPException 只会得到一条已经建立、然后突然断掉的流，前端拿不到
-    状态码——用户看到的是"连上了又没了"，而不是"你被限流了"。这条断言的就是
-    真的拿到了 429 和 Retry-After，而不是一条空流。
-    """
-    from services import usage_guard
-
-    _register(client)
-    token = _login(client)
-
-    monkeypatch.setattr(settings, "USAGE_GUARD_ENABLED", True)
-    monkeypatch.setattr(settings, "USAGE_RATE_MAX_REQUESTS", 1)
-    monkeypatch.setattr(settings, "USAGE_RATE_WINDOW_MINUTES", 5.0)
-    usage_guard.reset_rate_counter()
-
-    payload = {"prompt": "你好", "use_rag": False}
-    # 第一次放行(会因为没有真实模型而失败，但那发生在闸门之后)
-    client.post("/chats/completions/stream", json=payload, headers=_auth(token))
-    # 第二次必须是 429，而且是**结构化的错误响应**，不是一条 SSE 流
-    response = client.post(
-        "/chats/completions/stream", json=payload, headers=_auth(token)
-    )
-    assert response.status_code == 429, response.text
-    assert response.headers.get("Retry-After") is not None
-    assert "过于频繁" in response.json()["detail"]
-
-    usage_guard.reset_rate_counter()
 
 
-def test_用量闸门关闭时不拦(client, db_session, monkeypatch):
-    from services import usage_guard
-
-    _register(client)
-    token = _login(client)
-    monkeypatch.setattr(settings, "USAGE_GUARD_ENABLED", False)
-    usage_guard.reset_rate_counter()
-
-    payload = {"prompt": "你好", "use_rag": False}
-    for _ in range(3):
-        response = client.post(
-            "/chats/completions/stream", json=payload, headers=_auth(token)
-        )
-        assert response.status_code != 429
 
 
-def test_审批审计能从run详情读到(client, db_session):
-    """写进库但没有读路径 = 审计表最常见的失效方式，而它在单测里看不出来。"""
-    from models import AgentRun, User
-    from services import approval_audit
-    from services.clock import naive_now
-
-    _register(client)
-    token = _login(client)
-    user = db_session.query(User).filter_by(username="alice").one()
-
-    db_session.add(
-        AgentRun(
-            id="run-audit",
-            chat_id="chat-x",
-            user_id=user.id,
-            status="done",
-            rounds=2,
-            started_at=naive_now(),
-            updated_at=naive_now(),
-        )
-    )
-    db_session.commit()
-
-    approval_audit.record_request(
-        db_session,
-        run_id="run-audit",
-        chat_id="chat-x",
-        user_id=user.id,
-        tool_name="save_to_knowledge_base",
-        tool_call_id="call-0",
-        round_index=1,
-        call_index=0,
-        arguments={"title": "报销制度", "content": "正文"},
-        reason="写操作需确认",
-    )
-    approval_audit.record_decision(
-        db_session,
-        run_id="run-audit",
-        decided_by=user.id,
-        approved=True,
-        effective_arguments={"title": "改过的标题", "content": "正文"},
-        edited_fields=["title"],
-    )
-
-    response = client.get("/chats/runs/run-audit", headers=_auth(token))
-    assert response.status_code == 200, response.text
-    approvals = response.json()["approvals"]
-    assert len(approvals) == 1
-    entry = approvals[0]
-    assert entry["decision"] == "approved"
-    assert entry["decidedBy"] == user.id
-    assert entry["decidedAt"] is not None
-    # 执行的不是模型原本要执行的那份——审计里最值得看的一行
-    assert entry["argumentsEdited"] is True
-    assert entry["editedFields"] == ["title"]
 
 
-def test_别人的run看不到审计(client, db_session):
-    from models import AgentRun, User
-    from services.clock import naive_now
-
-    _register(client)
-    _register(client, email="bob@example.com", username="bob")
-    token = _login(client)
-    bob = db_session.query(User).filter_by(username="bob").one()
-
-    db_session.add(
-        AgentRun(
-            id="run-bob",
-            chat_id="chat-b",
-            user_id=bob.id,
-            status="done",
-            rounds=1,
-            started_at=naive_now(),
-            updated_at=naive_now(),
-        )
-    )
-    db_session.commit()
-
-    response = client.get("/chats/runs/run-bob", headers=_auth(token))
-    assert response.status_code == 404
 
 
-def test_超时的审批不允许恢复(client, db_session, monkeypatch):
-    """一个三天前的审批现在被点同意，工具面会按**当下**的权限重建。
-
-    这道判断不能依赖过期扫描跑过——扫描挂在 /runs/pending 这个读路径上，
-    "一直没人打开审批列表"时它一次都不会发生。
-    """
-    from datetime import timedelta
-
-    from models import AgentRun, User
-    from services.clock import naive_now
-
-    _register(client)
-    token = _login(client)
-    user = db_session.query(User).filter_by(username="alice").one()
-
-    monkeypatch.setattr(settings, "AGENT_APPROVAL_TIMEOUT_HOURS", 24)
-    stale = naive_now() - timedelta(hours=25)
-    db_session.add(
-        AgentRun(
-            id="run-stale",
-            chat_id="chat-s",
-            user_id=user.id,
-            status="waiting_approval",
-            rounds=1,
-            started_at=stale,
-            updated_at=stale,
-        )
-    )
-    db_session.commit()
-
-    response = client.post(
-        "/chats/runs/run-stale/resume",
-        json={"approved": True},
-        headers=_auth(token),
-    )
-    assert response.status_code == 409, response.text
-    assert "时限" in response.json()["detail"]
-    # 就地标成 abandoned，不是留在 waiting_approval 里等下一次再拒
-    db_session.expire_all()
-    assert db_session.get(AgentRun, "run-stale").status == "abandoned"
 
 
 # ========== 取消执行（用户主动“停止生成”） ==========
 
 
-def test_取消自己的running执行标成cancelled(client, db_session, monkeypatch):
-    """POST /runs/{id}/cancel 把一个还在跑的执行落成终态 cancelled。
-
-    这里没有活着的循环（测试直接造的库行），所以走的是端点的兜底路径：
-    signal 找不到活循环 -> mark_cancelled 直接改库。live=False、cancelled=True。
-    """
-    from models import AgentRun, User
-    from services.clock import naive_now
-
-    _register(client)
-    token = _login(client)
-    user = db_session.query(User).filter_by(username="alice").one()
-    monkeypatch.setattr(settings, "AGENT_CHECKPOINT_ENABLED", True)
-
-    db_session.add(
-        AgentRun(
-            id="run-cancel",
-            chat_id="chat-c",
-            user_id=user.id,
-            status="running",
-            rounds=1,
-            started_at=naive_now(),
-            updated_at=naive_now(),
-        )
-    )
-    db_session.commit()
-
-    response = client.post("/chats/runs/run-cancel/cancel", headers=_auth(token))
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["cancelled"] is True
-    assert body["live"] is False
-    db_session.expire_all()
-    row = db_session.get(AgentRun, "run-cancel")
-    assert row.status == "cancelled"
-    assert row.error_type == "user_cancelled"
 
 
-def test_取消别人的执行返回404(client, db_session):
-    """归属校验先于一切：不该让别人的 run 存不存在这件事被探测出来。"""
-    from models import AgentRun, User
-    from services.clock import naive_now
-
-    _register(client)
-    _register(client, email="bob@example.com", username="bob")
-    token = _login(client)
-    bob = db_session.query(User).filter_by(username="bob").one()
-
-    db_session.add(
-        AgentRun(
-            id="run-bob-cancel",
-            chat_id="chat-b",
-            user_id=bob.id,
-            status="running",
-            rounds=1,
-            started_at=naive_now(),
-            updated_at=naive_now(),
-        )
-    )
-    db_session.commit()
-
-    response = client.post("/chats/runs/run-bob-cancel/cancel", headers=_auth(token))
-    assert response.status_code == 404
 
 
-def test_取消已完成的执行不改动状态(client, db_session, monkeypatch):
-    """done/failed 的执行没什么可取消的：cancelled=False，状态原样不动。"""
-    from models import AgentRun, User
-    from services.clock import naive_now
-
-    _register(client)
-    token = _login(client)
-    user = db_session.query(User).filter_by(username="alice").one()
-    monkeypatch.setattr(settings, "AGENT_CHECKPOINT_ENABLED", True)
-
-    db_session.add(
-        AgentRun(
-            id="run-done",
-            chat_id="chat-d",
-            user_id=user.id,
-            status="done",
-            rounds=2,
-            started_at=naive_now(),
-            updated_at=naive_now(),
-        )
-    )
-    db_session.commit()
-
-    response = client.post("/chats/runs/run-done/cancel", headers=_auth(token))
-    assert response.status_code == 200, response.text
-    assert response.json()["cancelled"] is False
-    db_session.expire_all()
-    assert db_session.get(AgentRun, "run-done").status == "done"
 
 
 # ========== URL 入库 ==========
@@ -747,12 +470,12 @@ _HTML = (
 
 
 def _stub_fetch(monkeypatch, html=_HTML):
-    from services import workspace_tools
+    from services import web_fetch
 
     async def fake_fetch(url: str) -> str:
         return html
 
-    monkeypatch.setattr(workspace_tools, "fetch_page_html", fake_fetch)
+    monkeypatch.setattr(web_fetch, "fetch_page_html", fake_fetch)
 
 
 def _stub_index(monkeypatch):
@@ -839,12 +562,12 @@ def test_从URL入库拒绝非http协议(client, monkeypatch):
 
 def test_从URL入库抓取失败归400(client, monkeypatch):
     """超时/连接拒绝这类大多是 URL 本身的问题，归 400 而不是 500。"""
-    from services import workspace_tools
+    from services import web_fetch
 
     async def boom(url: str) -> str:
         raise RuntimeError("connect timeout")
 
-    monkeypatch.setattr(workspace_tools, "fetch_page_html", boom)
+    monkeypatch.setattr(web_fetch, "fetch_page_html", boom)
     _stub_index(monkeypatch)
     _register(client)
     token = _login(client)

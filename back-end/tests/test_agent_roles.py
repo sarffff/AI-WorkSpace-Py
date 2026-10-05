@@ -151,14 +151,6 @@ def test_delegate_description_carries_no_policy():
         assert banned not in description, f"策略措辞「{banned}」应当留在提示词里"
 
 
-def test_delegation_policy_lives_in_the_prompt_versions():
-    """反过来钉住：策略必须在提示词里存在，不能两边都没有。"""
-    for version in ("v5-augment", "v6-supervisor"):
-        body = prompt_library.get("chat_system_rag", version).body
-        assert "自包含" in body, version
-        assert "委派" in body, version
-
-
 def test_task_param_shows_a_good_and_a_bad_example():
     """task 是唯一"写法决定成败"的参数，一个反例胜过三句叮嘱。"""
     schema, _description = _schema_and_description()

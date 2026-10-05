@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from auth import get_current_user
 from database import SessionLocal, get_db
 from models import User
-from services import document_queue, egress, file_types, ingest_clean, workspace_service, workspace_tools
+from services import document_queue, egress, file_types, ingest_clean, web_fetch, workspace_service
 from services.knowledge_service import KnowledgeService
 from services.workspace_service import WorkspaceError
 
@@ -59,7 +59,7 @@ async def get_documents(
     """
     workspace = workspace_service.resolve_for_user(db, current_user)
     # 惰性回收过期租约（认领它的进程死了的任务重新入队）——挂在读路径上,
-    # 项目里没有调度器,同 expire_stale_runs 挂在 /chats/runs/pending 的做法。
+    # 项目里没有调度器,同 ticket_sla 挂在队列读取上的做法。
     document_queue.reap_expired_leases(db)
     docs = await knowledge_service.get_documents(
         db,
@@ -185,7 +185,7 @@ async def add_document_from_url(
         )
 
     try:
-        raw_html = await workspace_tools.fetch_page_html(url)
+        raw_html = await web_fetch.fetch_page_html(url)
     except egress.EgressBlocked as exc:
         raise HTTPException(status_code=400, detail=f"抓取被拒：{exc}")
     except Exception as exc:
@@ -201,7 +201,7 @@ async def add_document_from_url(
         )
 
     title = ingest_clean.html_title(raw_html) or parsed.netloc or "web"
-    name = workspace_tools.safe_document_name(title) + ".md"
+    name = web_fetch.safe_document_name(title) + ".md"
 
     workspace = workspace_service.resolve_for_user(db, current_user)
     try:

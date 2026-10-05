@@ -1,19 +1,17 @@
-# 有据工作台 (YouJu Workspace)
+# 客服工单解决 Agent (Ticket Resolution Agent)
 
 <div align="center">
 
-![有据工作台](https://img.shields.io/badge/有据-工作台-blue?style=for-the-badge)
+![目标](https://img.shields.io/badge/目标-真正解决工单-blue?style=for-the-badge)
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)
-![React](https://img.shields.io/badge/React-19.0-61DAFB?style=for-the-badge&logo=react&logoColor=black)
-![TypeScript](https://img.shields.io/badge/TypeScript-5.5-3178C6?style=for-the-badge&logo=typescript&logoColor=white)
-![Electron](https://img.shields.io/badge/Electron-31.0-47848F?style=for-the-badge&logo=electron&logoColor=white)
+![LangGraph](https://img.shields.io/badge/LangGraph-1.2-14F195?style=for-the-badge&logo=langchain&logoColor=black)
 
-**回答有据可查的企业知识库 AI 工作台**
+**让 Agent 真的把工单办完，而不是只回答工单**
 
-集成知识库问答（RAG）、对话管理、提示词工程与全程可观测能力的桌面应用——每条引用可溯源、每次执行可回放、每条差评可变成回归用例。
+查订单、改地址、发起退款、开票、关单——高风险动作必须有人点头，全程可审计、可熔断、可量化。
 
-[快速开始](#快速开始) · [功能特性](#功能特性) · [技术栈](#技术栈) · [开发文档](#开发文档)
+[快速开始](#快速开始) · [功能特性](#功能特性) · [技术栈](#技术栈) · [API 文档](#api-文档)
 
 </div>
 
@@ -37,67 +35,77 @@
 
 ## ✨ 功能特性
 
-### 🤖 AI 对话
+按 `Development_Process.md` 的五层架构组织：接入 → 编排 → 能力 → 执行与安全 → 数据与记忆。
 
-- ✅ **多模型支持** - 支持 GLM-4.5、GPT、Claude 等主流大语言模型
-- ✅ **流式响应** - 基于 SSE 的实时流式对话体验
-- ✅ **会话管理** - 创建、重命名、删除、固定对话
-- ✅ **历史记录** - 完整的对话历史持久化存储
-- ✅ **上下文保持** - 自动维护对话上下文
+### 📥 接入与理解
 
-### 📚 知识库 (RAG)
+- ✅ **多渠道归一化** - web_chat / email / app / wecom / phone / api，配置取交集生效
+- ✅ **投递去重** - 同一封邮件重投递只建一张工单（`(workspace, channel, external_ref)` 唯一）
+- ✅ **身份识别** - 邮箱/手机号归一；多候选时**不猜也不合并**，留给工具回填
+- ✅ **原文不削尾** - 超限直接报错而不是截断：订单号常常就在被削掉的那一段里
+- ✅ **规则先行的实体抽取** - 订单号/金额先由确定性规则抽，模型只补齐；
+  模型给出的订单号与金额必须能在原文里逐字对上，否则丢弃
+- ✅ **风险分级不问模型** - 金额阈值、负面情绪、法律/投诉关键词决定风险档；
+  金额未知一律按最坏情况处理
 
-- ✅ **文档管理** - 上传、索引、管理知识库文档
-- ✅ **向量检索** - 基于语义的智能检索
-- ✅ **分块管理** - 文档自动分块和嵌入
-- ✅ **扫描件 OCR** - 没有文本层的 PDF 用视觉模型逐页转写再入库（默认关，需配视觉模型、页数封顶）
-- ✅ **状态追踪** - 实时查看文档处理状态
+### 📚 政策知识库（RAG）
 
-### 💡 提示词工程
+- ✅ **文档管理** - 上传、索引、按工作区/个人两级可见性隔离
+- ✅ **混合检索** - 稠密向量 + BM25，RRF 融合，可选重排（cross-encoder / API）
+- ✅ **持久索引队列** - 认领 + 租约 + 退避重试，进程重启不丢正在索引的文档
+- ✅ **注入防护** - 政策片段与客户原文进上下文前都过护栏（定界 + 标记中和）
 
-- ✅ **模板管理** - 增删改查、按 key 组织
-- ✅ **版本控制** - 一个 key 多版本，激活版本可切换
-- ✅ **契约校验** - 模板缺失或占位符漂移在 CI 里直接失败（不是运行时才报）
-- ✅ **版本引用落库** - 每次回答记下用的是哪个 `key@version`，可回溯
+### 🔀 编排层（LangGraph 状态机）
 
-### 🛠️ Agent 循环
+- ✅ **显式流程** - understand → retrieve → plan → reason ⇄ await_approval → execute → confirm | escalate
+- ✅ **真人在回路** - `interrupt()` 挂起，跨请求、跨进程恢复；批准的参数**就是**执行的参数
+- ✅ **检查点** - AsyncSqliteSaver 落盘，"点了同意但进程重启"不会丢单
+- ✅ **提示词按 key 版本化** - 工单理解 / 操作说明 / 规划各有独立版本，契约校验在启动时炸而不是运行时
+- ✅ **异常与超时** - 工具连续失败熔断、预算耗尽转人工、SLA 到点自动交接（带上"已经查到哪一步"）
 
-- ✅ **工具调用** - 7 个工具（检索、读文档、算式、联网搜索、抓网页、写知识库、问用户），
-  按开关注册，默认全关
-- ✅ **三道收敛保证** - 轮次上限、结果字符预算、重复调用检测；三者互相独立
-- ✅ **单工具熔断** - 连续失败即从工具面移除，作用域是单次回答
-- ✅ **人工审批** - 写操作执行前挂起，等用户在**另一个请求**里裁决；支持改参数再同意
-- ✅ **澄清提问** - `ask_user` 挂起当前回合，答案回来接着这一轮跑（不丢前几轮的工具结果）
-- ✅ **状态快照与恢复** - 一次执行的生命周期不再等于一个 HTTP 请求的生命周期
-- ✅ **审批审计** - 谁批的、什么时候、批准的和执行的是不是同一份参数
-- 🚧 **多代理委派** - 已实现并端到端评估过，但**默认关闭**：实测 `augment` 多花 29%
-  输入 token 换不到成功率提升，`supervisor` 有已定位的轮次预算缺陷（见评估报告）
+### 🛠️ 能力层
 
-### 🔍 检索增强 (RAG)
+- ✅ **业务系统工具** - 查订单 / 查物流 / 查客户 / 改地址 / 开票 / 退款 / 取消，
+  按查询-修改-资金三档分级，默认只给查询档
+- ✅ **MCP Server** - 同一套工具通过 `python -m services.ticket.mcp_server` 以 stdio 对外
+- ✅ **SOP Skills** - 版本化作业指导（内置 `refund-playbook`），工作区可自写同名覆盖
+- ✅ **通知** - 待审批与交接都会写持久收件箱，不依赖那条易失的 SSE 连接
 
-- ✅ **混合检索** - 稠密向量 + BM25，RRF 融合
-- ✅ **重排** - 本地 cross-encoder 与重排 API 两条路径
-- ✅ **查询改写** - 指代消解、HyDE、多查询
-- ✅ **上下文窗口** - 命中分块的相邻块一起给
-- ✅ **注入防护** - 资料夹带指令时的分级护栏与标记中和
-- ✅ **可见性隔离** - 工作区共享 / 个人私有两套判据，管理列表与检索作用域分开
+### 🛡️ 执行与安全
 
-### 📊 可观测与评估
+- ✅ **幂等键** - 写操作先查幂等再判业务状态；键由系统推导，不靠模型发明
+- ✅ **参数强校验** - Pydantic + JSON Schema，必填/未知键/类型不符都挡在执行之前
+- ✅ **限额与熔断** - 单工单工具调用数、单工单成本、当日退款总额、一键全局暂停
+- ✅ **完整审计** - 哈希链审计 + 工单轨迹（append-only）+ 操作台账，各自回答不同问题
+- ✅ **缺护栏就拒绝启动** - 开着 Agent 却没有当日退款上限时，生产环境起不来
 
-- ✅ **调用链追踪** - 父子 span 树，按轮次归因；token 来源（实测/估算）与成本分列
-- ✅ **成本估算** - 可覆盖的价目表；命中不了返回"未知"而不是编一个数字
-- ✅ **用量闸门** - 按用户的频率、成本、token 三道上界
-- ✅ **线上健康告警** - 错误率 / 人工介入率 / 单次成本 / p95 延迟超阈值，经通知出口自动推给管理员（默认关，补"离线金标↔线上分布"那半环）
-- ✅ **RAG 评估** - 54 题金标 / 13 篇语料 / 26 个配置变体，
-  precision@k、nDCG、拒答率、抗注入率、编造率
-- ✅ **Agent 评估** - 29 个任务，工具召回、轮次效率、委派开销
-- ✅ **评估门禁** - 阈值化的回归判定，区分"模型变差"与"测量坏了"
+### 📊 观测与指标
 
-### ⚙️ 系统设置
+- ✅ **工单台接口** - 队列（状态 / 风险 / SLA）、待审批收件箱、轨迹回放、指标看板
+- ✅ **五个核心指标** - 自动解决率、首次响应、平均处理时长、CSAT、错误操作率
+- ✅ **人工纠正台账** - 让"错误操作率"有真实数据源，而不是模型自报；未标注时返回 `None` 而不是 0
+- ✅ **成本按工单归因** - trace span 挂 `ticket_id`；用量取不到时返回"未知"而不是折成 0
+- ✅ **线上健康告警** - 失败率 / 人工介入率 / 单工单成本 / p95 处理时长越阈值时推给管理员
+- ✅ **护栏评估** - `eval/ticket_guardrail.py` 在通道边界打桩、只看落库事实判分：
+  漏投一次审批、重复退一笔钱、超额退款都会让门禁红
+- ✅ **RAG 金标评估与门禁** - 政策检索的质量回归，区分"模型变差"与"测量坏了"
 
-- ✅ **模型配置** - 灵活切换不同的 AI 模型
-- ✅ **数据库管理** - MySQL + Redis 双数据库支持
-- ✅ **实时状态** - 服务器连接状态实时监控
+### 📤 回复出口
+
+- ✅ **待发队列** - 回复与邀评先落库再发，租约 + 退避重试 + 幂等认领
+- ✅ **抑制必须写理由** - 不发是一个决定，不是一次事故
+- 🚧 **真实发送通道未接**（邮件 / 企微 / 短信）：没有通道时一行状态都不改，
+  队列会回答"没有接入任何发送通道"，而不是假装已送达
+
+### ⚠️ 当前边界（诚实清单）
+
+- 子代理（查询 / 政策 / 情绪安抚）与 SOP skill 尚未接进工单图：模块在，缺调用方
+- email / wecom / phone 的**收件**适配器未做，目前只有 `/tickets` 这一条真实入口
+- 工单附件只保存不解析，不进检索
+- 历史相似工单是判据查询（同客户 / 同订单 / 同意图），不是语义相似
+- 前端仍是知识库工作台那一套页面，工单台 UI 待重定位
+
+---
 
 ---
 
@@ -281,44 +289,60 @@ REDIS_URL=redis://localhost:6379/0
 
 ### 主要端点
 
-#### 对话管理
+#### 工单（接入 → 处置 → 治理）
 
 ```
-GET    /chats                      # 获取所有对话
-GET    /chats/{chat_id}/messages   # 获取对话消息
-POST   /chats                      # 创建新对话
-POST   /chats/completions          # 非流式对话
-POST   /chats/completions/stream   # 流式对话 (SSE)
+POST   /tickets                        # 提交工单（渠道归一化 + 去重 + 身份识别）
+GET    /tickets                        # 队列：状态 / 风险 / SLA，顺带回收超期工单
+GET    /tickets/{id}                   # 详情
+GET    /tickets/{id}/events            # 轨迹回放（append-only）
+POST   /tickets/{id}/run               # 跑编排（SSE）；挂在审批上时返回 awaiting_approval
+POST   /tickets/{id}/decision          # 人工裁决：同意 / 改参数同意 / 拒绝
+GET    /tickets/pending                # 待审批收件箱（从检查点读，跨进程可查）
+GET    /tickets/metrics                # 文档§1 那五个核心指标
+GET    /tickets/governor               # 当前限额；POST .../pause 与 .../resume 是一键闸门
+GET    /tickets/operations/unreviewed  # 待人工纠正的写操作
+POST   /tickets/operations/{id}/review # 标注"这次操作对不对"
+GET    /tickets/outbox                 # 待发回复；POST .../drain 抽干队列
 ```
 
-#### 知识库管理
+#### 政策知识库与作业指导
 
 ```
-GET    /knowledge/documents        # 获取文档列表
-POST   /knowledge/documents        # 上传文档
-DELETE /knowledge/documents/{id}  # 删除文档
+GET    /knowledge/documents            # 文档列表（工作区共享 / 个人私有）
+POST   /knowledge/documents/upload     # 上传并排队索引
+POST   /knowledge/documents/from-url   # 从 URL 抓政策页（SSRF 由 egress 兜）
+GET    /skills                         # 内置 + 本工作区自写的 SOP
+PUT    /skills                         # admin 写自己的 SOP（同名覆盖内置）
+POST   /attachments/upload             # 工单附件上传
+GET    /notifications                  # 坐席收件箱（待审批 / 交接 / 健康告警）
+GET    /audit                          # 哈希链审计，verify 能定位断点
+GET    /metrics/usage                  # token 与成本按模型/环节聚合
+GET    /metrics/health                 # 线上健康快照（admin）
+GET    /metrics/traces                 # 编排运行的埋点树，按 ticket_id 过滤
 ```
 
 ### 请求示例
 
-#### 创建对话
+#### 提交并跑一张退款工单
 
 ```bash
-curl -X POST http://localhost:3000/chats \
-  -H "Content-Type: application/json" \
-  -d '{"title": "New Chat"}'
+curl -X POST http://localhost:3000/tickets \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"channel": "web_chat", "content": "订单 AB-12345 的鞋子磨脚，要退款 299 元"}'
+
+# 跑编排。资金类操作会挂起等人批，返回 outcome=awaiting_approval
+curl -X POST http://localhost:3000/tickets/$TICKET_ID/run \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
-#### 发送消息 (流式)
+#### 批准后接着跑
 
 ```bash
-curl -X POST http://localhost:3000/chats/completions/stream \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "你好,介绍一下你自己",
-    "model": "glm-4.5-air",
-    "chat_id": "chat_id_here"
-  }'
+# 同意时改参数：<call_id> 来自上一步返回里那条待批内容
+curl -X POST http://localhost:3000/tickets/$TICKET_ID/decision \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"approved": true, "note": "按政策上限退", "edited": {"<call_id>": {"amount": "289"}}}'
 ```
 
 ---

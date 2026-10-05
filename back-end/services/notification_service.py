@@ -5,8 +5,8 @@
 两条和 audit_log / approval_audit 一致的取舍：
 - **写入失败只记日志、不抛。** 通知是旁路记录，绝不能让一次通知写失败把审批/中断
   主流程也带崩（通知是在那些流程的发射点顺带创建的）。
-- **去重防刷屏。** 中断恢复会重入同一个 waiting_* 状态，同一个 run 可能多次走到发射
-  点。给了 run_id 时，若已有同 (user, kind, run) 的**未读**通知就跳过——已读之后
+- **去重防刷屏。** 中断恢复会重入同一个 waiting_* 状态，同一张工单可能多次走到发射
+  点。给了 ticket_id 时，若已有同 (user, kind, ticket) 的**未读**通知就跳过——已读之后
   再来才是真的新事件。
 """
 from __future__ import annotations
@@ -32,18 +32,17 @@ class NotificationService:
         kind: str,
         title: str,
         body: str | None = None,
-        run_id: str | None = None,
-        chat_id: str | None = None,
+        ticket_id: str | None = None,
     ) -> str | None:
         """创建一条通知。返回 id；失败或被去重跳过时返回 None（只记日志、不抛）。"""
         try:
-            if run_id is not None:
+            if ticket_id is not None:
                 existing = (
                     db.query(Notification.id)
                     .filter(
                         Notification.user_id == user_id,
                         Notification.kind == kind,
-                        Notification.run_id == run_id,
+                        Notification.ticket_id == ticket_id,
                         Notification.read_at.is_(None),
                     )
                     .first()
@@ -56,8 +55,7 @@ class NotificationService:
                 kind=kind,
                 title=title[:255],
                 body=body,
-                run_id=run_id,
-                chat_id=chat_id,
+                ticket_id=ticket_id,
                 created_at=naive_now(),
             )
             db.add(note)
@@ -131,8 +129,7 @@ class NotificationService:
             "kind": row.kind,
             "title": row.title,
             "body": row.body,
-            "runId": row.run_id,
-            "chatId": row.chat_id,
+            "ticketId": row.ticket_id,
             "createdAt": row.created_at.isoformat() if row.created_at else None,
             "readAt": row.read_at.isoformat() if row.read_at else None,
             "read": row.read_at is not None,

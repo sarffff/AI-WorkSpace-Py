@@ -1,7 +1,8 @@
 """跨动作的防篡改审计链（配合 models.AuditLog）。
 
-与 ``approval_audit`` 分工：那个模块记审批这件事的详细状态；这里记"发生了哪个
-改变状态的动作"，并串成一条**哈希链**，用来回答"事后有没有被改过"。
+与 ``approval_audit`` 分工：那个模块只提供参数摘要算法（digest/preview，审批、
+账本与工单轨迹共用同一个哈希口径）；这里记"发生了哪个改变状态的动作"，并串成一条
+**哈希链**，用来回答"事后有没有被改过"。
 
 ## 防篡改怎么成立
 
@@ -16,7 +17,7 @@ actor 分段**：``seq`` 是该 actor 内从 1 起的序号。
    并发会读到同一 prev_hash（结构上消不掉，只能标出来）；真撞上链会分叉、verify
    报断点。审计动作低频（审批/写工具/登录），实际极难撞上。
 2. **失败只记日志、不阻断。** 审计是记录不是闸门；让审计写失败挡住用户的写操作，
-   等于把可观测性变成单点故障（同 approval_audit / checkpoint_store）。
+   等于把可观测性变成单点故障（同 approval_audit / ticket_outbox）。
 3. **ts 抹掉微秒。** entry_hash 覆盖时间戳，而 MySQL 的 DATETIME 不存小数秒——
    存进再读出微秒会丢、verify 就对不上。record 时先清零，让算 hash 的值与落库
    读回的值逐位一致。
@@ -74,8 +75,7 @@ def record(
     action: str,
     target: str | None = None,
     arguments: Any = None,
-    run_id: str | None = None,
-    chat_id: str | None = None,
+    ticket_id: str | None = None,
 ) -> str | None:
     """追加一条审计。返回记录 id，失败返回 None（只记日志、不抛）。"""
     try:
@@ -104,8 +104,7 @@ def record(
             target=(target[:255] if target else None),
             args_digest=args_digest,
             args_preview=args_preview,
-            run_id=run_id,
-            chat_id=chat_id,
+            ticket_id=ticket_id,
             prev_hash=prev_hash,
             entry_hash=entry_hash,
             created_at=ts,
@@ -128,8 +127,7 @@ def _row_to_dict(row: AuditLog) -> dict[str, Any]:
         "target": row.target,
         "argumentsPreview": row.args_preview,
         "argumentsDigest": row.args_digest,
-        "runId": row.run_id,
-        "chatId": row.chat_id,
+        "ticketId": row.ticket_id,
         "createdAt": row.created_at.isoformat() if row.created_at else None,
     }
 

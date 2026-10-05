@@ -1,7 +1,8 @@
 """用量与 trace 查询接口。
 
 埋点写进 trace_spans 之后，这里只做聚合与树形还原——两个真正想回答的问题：
-「钱花在哪个环节」和「这次回答慢在哪一步」。
+「钱花在哪个环节」和「这张工单慢在哪一步」。归属单位是工单：``trace_spans.ticket_id``
+由编排层在开 trace 时写入，所以一次跨天、被审批打断多次的处置能串回同一条线。
 
 成本按币种分组返回而不是加成一个数：价目表允许不同模型用不同货币，
 把 CNY 和 USD 相加是错的。
@@ -18,11 +19,10 @@ from sqlalchemy.orm import Session
 from auth import get_current_user
 from config import settings
 from database import get_db
-from models import AgentRun, TraceSpan, User
+from models import TraceSpan, User
 from services.clock import naive_now
 from services.pricing import price_table
 from services import production_monitor
-from services.semantic_cache import semantic_cache
 
 router = APIRouter(prefix="/metrics", tags=["用量与追踪"])
 
@@ -170,8 +170,6 @@ async def get_usage(
         "byName": _grouped(db, current_user.id, since, TraceSpan.name),
         "byModel": _grouped(db, current_user.id, since, TraceSpan.model),
         "byKind": _grouped(db, current_user.id, since, TraceSpan.kind),
-        # 缓存统计存在进程内，重启归零，也不受 days 窗口约束——面板上要说清楚
-        "cache": semantic_cache.stats(),
     }
 
 
@@ -198,209 +196,21 @@ async def get_health(
     }
 
 
-@router.get("/agents")
-async def get_agent_metrics(
-    days: int = Query(default=0, ge=0, le=90),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """委派、审批、子代理的线上指标。
-
-    这个接口存在的理由只有一个：**回答"委派到底值不值"**。多代理已经能跑，但
-    "它比单代理好"到目前为止只是一个说法——没有任何数字支持它。委派的代价是
-    确定的（每次一个完整的嵌套循环，成本与延迟都上去），收益是不确定的，
-    而这个不确定性在任何单次回答里都看不出来。
-
-    三个设计决定：
-
-    **只按主代理 run 分桶（``parent_run_id IS NULL``）。** 子代理的成本要算进
-    发起它的那次回答里，而不是单列一行——问题是"这次回答花了多少"，
-    不是"researcher 花了多少"。子代理的钱通过 trace_id 自然滚进父 run。
-
-    **委派 / 未委派的对比按 ``delegations > 0`` 切，而不是按开关模式切。**
-    augment 模式下模型自己决定要不要派人，于是同一份配置里两种都有——
-    这正是能看出委派有没有用的地方。按模式切只能比"两次不同配置的运行"，
-    那里面混着别的变量。
-
-    **成本从 ``trace_spans`` 聚合，不在 ``agent_runs`` 里再存一份。** 两份数字
-    迟早不一致，而 trace 那边已经处理了按币种分组、provider/estimated 区分。
-    代价是要 join，且埋点关掉时这一段为空——那时前端显示"未知"而不是 0。
-    """
-    window = days or settings.METRICS_DEFAULT_DAYS
-    since = _window_start(window)
-
-    base = (
-        db.query(AgentRun)
-        .filter(
-            AgentRun.user_id == current_user.id,
-            AgentRun.started_at >= since,
-            AgentRun.parent_run_id.is_(None),
-        )
-        .subquery()
-    )
-
-    totals_row = db.query(
-        func.count(base.c.id).label("runs"),
-        func.sum(case((base.c.delegations > 0, 1), else_=0)).label("delegated"),
-        func.coalesce(func.sum(base.c.delegations), 0).label("delegations"),
-        func.coalesce(func.sum(base.c.interrupts), 0).label("interrupts"),
-        func.sum(case((base.c.interrupts > 0, 1), else_=0)).label("interrupted_runs"),
-        func.sum(case((base.c.status == "failed", 1), else_=0)).label("failed"),
-        func.sum(case((base.c.status == "waiting_approval", 1), else_=0)).label(
-            "waiting"
-        ),
-        func.avg(base.c.rounds).label("avg_rounds"),
-    ).one()
-    totals = totals_row._mapping
-    runs = int(totals["runs"] or 0)
-
-    # ---- 子代理：按角色分布与失败率 ----
-    # 失败率按角色分开看:researcher 常失败和 critic 常失败是两种完全不同的病,
-    # 前者多半是任务描述写得不够自包含,后者多半是它没拿到可审的材料。
-    role_rows = (
-        db.query(
-            AgentRun.agent_role,
-            func.count(AgentRun.id).label("runs"),
-            func.sum(case((AgentRun.status == "failed", 1), else_=0)).label("failed"),
-            func.avg(AgentRun.rounds).label("avg_rounds"),
-        )
-        .filter(
-            AgentRun.user_id == current_user.id,
-            AgentRun.started_at >= since,
-            AgentRun.parent_run_id.isnot(None),
-        )
-        .group_by(AgentRun.agent_role)
-        .order_by(func.count(AgentRun.id).desc())
-        .all()
-    )
-
-    return {
-        "rangeDays": window,
-        # 快照关着的时候这张表根本不写行。返回 false 让前端说"未开启"，
-        # 而不是画一个全零的面板——那两件事看起来一样，含义完全不同。
-        "enabled": bool(settings.AGENT_CHECKPOINT_ENABLED),
-        "delegationMode": settings.AGENT_DELEGATION_MODE,
-        "approvalMode": settings.AGENT_APPROVAL_MODE,
-        "totals": {
-            "runs": runs,
-            "delegatedRuns": int(totals["delegated"] or 0),
-            "delegations": int(totals["delegations"] or 0),
-            # 分母是主代理 run 数。没有 run 时给 None——0% 会被读成
-            # "从来不委派"，而真相是"这个窗口里什么都没跑"
-            "delegationRate": (
-                round(int(totals["delegated"] or 0) / runs, 4) if runs else None
-            ),
-            "interrupts": int(totals["interrupts"] or 0),
-            "interruptedRuns": int(totals["interrupted_runs"] or 0),
-            "failedRuns": int(totals["failed"] or 0),
-            "waitingApproval": int(totals["waiting"] or 0),
-            "avgRounds": _as_float(totals["avg_rounds"]),
-        },
-        "byRole": [
-            {
-                "role": row.agent_role,
-                "runs": int(row.runs),
-                "failed": int(row.failed or 0),
-                "failureRate": (
-                    round(int(row.failed or 0) / int(row.runs), 4) if row.runs else None
-                ),
-                "avgRounds": _as_float(row.avg_rounds),
-            }
-            for row in role_rows
-        ],
-        "comparison": _delegation_comparison(db, current_user.id, since),
-    }
-
-
-def _delegation_comparison(
-    db: Session, user_id: str, since: datetime
-) -> list[dict[str, Any]]:
-    """委派 vs 未委派的轮次、成本、延迟对比。
-
-    这是整个面板真正要看的那张表。判断委派值不值只能靠它——单看"委派率 27%"
-    什么都说明不了，得知道那 27% 多花了几倍的钱、慢了几倍。
-
-    成本按 ``(是否委派, 币种)`` 分组:不同模型可能用不同货币,把 CNY 和 USD
-    相加是错的（与 ``/usage`` 同一套约定）。
-    """
-    rows = (
-        db.query(
-            case((AgentRun.delegations > 0, 1), else_=0).label("delegated"),
-            TraceSpan.currency,
-            func.count(func.distinct(AgentRun.id)).label("runs"),
-            func.avg(AgentRun.rounds).label("avg_rounds"),
-            func.sum(TraceSpan.cost).label("cost"),
-            func.coalesce(func.sum(TraceSpan.prompt_tokens), 0).label("prompt_tokens"),
-            func.coalesce(func.sum(TraceSpan.completion_tokens), 0).label(
-                "completion_tokens"
-            ),
-        )
-        # inner join：埋点关掉时 trace_id 为空，这一段自然为空列表，
-        # 前端据此显示"需要开启埋点"而不是一堆 0
-        .join(TraceSpan, TraceSpan.trace_id == AgentRun.trace_id)
-        .filter(
-            AgentRun.user_id == user_id,
-            AgentRun.started_at >= since,
-            AgentRun.parent_run_id.is_(None),
-        )
-        .group_by(case((AgentRun.delegations > 0, 1), else_=0), TraceSpan.currency)
-        .all()
-    )
-
-    # 延迟单列一次查询：它要的是**每个 run 的总耗时**（根 span 的 duration），
-    # 而上面那个 join 是逐 span 的行——在同一个查询里 avg(duration_ms) 算出来的
-    # 是"平均每个 span 多久"，不是"平均每次回答多久"。这两个数差一个数量级，
-    # 而它们看起来都像是延迟。
-    latency_rows = (
-        db.query(
-            case((AgentRun.delegations > 0, 1), else_=0).label("delegated"),
-            func.avg(TraceSpan.duration_ms).label("avg_ms"),
-        )
-        .join(TraceSpan, TraceSpan.trace_id == AgentRun.trace_id)
-        .filter(
-            AgentRun.user_id == user_id,
-            AgentRun.started_at >= since,
-            AgentRun.parent_run_id.is_(None),
-            TraceSpan.name == "chat.turn",
-            TraceSpan.parent_id.is_(None),
-        )
-        .group_by(case((AgentRun.delegations > 0, 1), else_=0))
-        .all()
-    )
-    latency = {int(row.delegated): _as_float(row.avg_ms) for row in latency_rows}
-
-    return [
-        {
-            "delegated": bool(row.delegated),
-            "currency": row.currency,
-            "runs": int(row.runs),
-            "avgRounds": _as_float(row.avg_rounds),
-            "cost": _as_float(row.cost),
-            "avgCost": (
-                round(float(row.cost) / int(row.runs), 6)
-                if row.cost is not None and row.runs
-                else None
-            ),
-            "promptTokens": int(row.prompt_tokens or 0),
-            "completionTokens": int(row.completion_tokens or 0),
-            "avgTurnMs": latency.get(int(row.delegated)),
-        }
-        for row in rows
-    ]
-
-
 @router.get("/traces")
 async def list_traces(
-    chat_id: str | None = None,
+    ticket_id: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """最近若干次回答的概览，每条对应一棵 trace。"""
+    """最近若干次编排运行的概览，每条对应一棵 trace。
+
+    一次运行不等于一张工单：挂起等人批之后恢复会再开一条 trace，所以同一张工单
+    通常有多条。工单台看的是业务轨迹（``/tickets/{id}/events``），这里看的是埋点。
+    """
     query = db.query(
         TraceSpan.trace_id,
-        TraceSpan.chat_id,
-        TraceSpan.message_id,
+        TraceSpan.ticket_id,
         func.min(TraceSpan.started_at).label("started_at"),
         func.count(TraceSpan.id).label("spans"),
         func.coalesce(func.sum(TraceSpan.prompt_tokens), 0).label("prompt_tokens"),
@@ -416,11 +226,11 @@ async def list_traces(
             case((TraceSpan.parent_id.is_(None), TraceSpan.duration_ms), else_=0)
         ).label("duration_ms"),
     ).filter(TraceSpan.user_id == current_user.id)
-    if chat_id:
-        query = query.filter(TraceSpan.chat_id == chat_id)
+    if ticket_id:
+        query = query.filter(TraceSpan.ticket_id == ticket_id)
 
     rows = (
-        query.group_by(TraceSpan.trace_id, TraceSpan.chat_id, TraceSpan.message_id)
+        query.group_by(TraceSpan.trace_id, TraceSpan.ticket_id)
         .order_by(func.min(TraceSpan.started_at).desc())
         .limit(limit)
         .all()
@@ -428,8 +238,7 @@ async def list_traces(
     return [
         {
             "traceId": row.trace_id,
-            "chatId": row.chat_id,
-            "messageId": row.message_id,
+            "ticketId": row.ticket_id,
             "startedAt": row.started_at.isoformat() if row.started_at else None,
             "durationMs": int(row.duration_ms or 0),
             "spans": int(row.spans),

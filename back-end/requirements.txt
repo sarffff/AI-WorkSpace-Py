@@ -16,7 +16,7 @@ python-jose[cryptography]>=3.3.0
 bcrypt>=4.0.0
 python-multipart>=0.0.12
 openai>=1.55.0
-# web_search 直接用它发请求（openai 也依赖它，这里显式声明避免间接依赖被断开）
+# 出站抓取（政策文档 from-url）直接用它发请求（openai 也依赖它，这里显式声明避免间接依赖被断开）
 httpx>=0.27.0
 email-validator>=2.2.0
 PyPDF2>=3.0.0
@@ -48,8 +48,23 @@ faiss-cpu>=1.7.4
 # 那两条都不会报错——搬到 Qdrant 换来的是持久态与多 worker 共享
 qdrant-client>=1.12.0
 slowapi>=0.1.9
+# 工单编排：显式状态机 + 检查点 + 人在回路（见 services/ticket/graph.py）。
+#
+# 工单要的是**跨进程的长生命周期**——一张停在"等人批退款"上的单可能要挂几天，
+# 中间进程重启过，重启之后还得知道它停在哪一步、已经花掉多少。检查点这件事有一个
+# 成熟的落盘实现可依赖，就不该再自研一套快照层。循环内部的执行仍复用
+# services/tool_runtime.py（白名单、参数校验、重复拦截、熔断）。
+langgraph>=1.2.0
+# 检查点存到 sqlite：桌面部署里没有一个 Postgres 可连，而挂起的状态必须活得
+# 比进程长。异步那一半（AsyncSqliteSaver）依赖 aiosqlite，路由是 async 的，
+# SqliteSaver 的 async 方法直接 NotImplementedError，所以两个都要写进来。
+langgraph-checkpoint-sqlite>=3.1.0
+aiosqlite>=0.20.0
+# MCP 协议层：把工单业务工具经 server 暴露（见 services/ticket/mcp_server.py）。
+# 文档第 3 层写的就是这个边界——接真 ERP/CRM 时换掉的是工具背后的实现，而不是
+# Agent 与业务系统之间的协议。v2 里 FastMCP 改名成 MCPServer，所以下限写 2.3。
+mcp>=2.3.0
 
 # 测试依赖
 pytest>=7.4.0
 pytest-asyncio>=0.21.0
-langsmith>=0.1.0

@@ -1,0 +1,310 @@
+"""回复出口：入队、租约认领、幂等重试。
+
+配合 ``models.TicketOutbox``——为什么需要这张表、为什么 ``suppressed`` 必须有人明确
+选择，见那个模型的文档串。形态照搬 ``services/document_queue``（认领时自增
+attempts、租约过期被别人捡走、失败按 attempts 退避），因为要解决的问题一模一样：
+一件必须发生、又不能塞进请求里发生的事。
+
+**没有出口通道时 ``deliver`` 什么都不做，也不改任何状态。** 那几行留在 pending 里
+就是"欠客户一个回复"的可见证据；把它们悄悄标成 sent 是这一层最坏的一种撒谎——
+工单看起来全绿，而客户一句都没收到。
+"""
+from __future__ import annotations
+
+import logging
+import uuid
+from dataclasses import dataclass
+from typing import Any, Callable
+
+from sqlalchemy.orm import Session
+
+from config import settings
+from models import Ticket, TicketOutbox
+from services.clock import naive_now
+from services.ticket.trace import append_event
+
+logger = logging.getLogger("ticket.outbox")
+
+KIND_REPLY = "reply"
+KIND_CSAT_INVITE = "csat_invite"
+KINDS = (KIND_REPLY, KIND_CSAT_INVITE)
+
+# 还没发出去的状态。dedupe 只看这两个：已经 sent 的那一条不能挡住
+# "重开之后再回一句"，那是一句新的话
+_IN_FLIGHT = ("pending", "sending")
+
+# sender 的签名：(channel, recipient, body) -> None，抛异常即失败
+Sender = Callable[[str, str | None, str], None]
+
+
+@dataclass
+class Claimed:
+    id: str
+    ticket_id: str
+    channel: str
+    recipient: str | None
+    body: str
+    attempts: int
+
+
+def enqueue(
+    db: Session,
+    ticket: Ticket,
+    *,
+    kind: str,
+    body: str,
+    recipient: str | None = None,
+) -> str | None:
+    """把一条要发给客户的话排进队列。返回行 id；被去重或写失败时返回 None。
+
+    入队失败**必须留下痕迹**：这一条丢了就等于客户永远收不到回话，而工单状态
+    看起来完全正常。所以除了日志，还在轨迹里写一条——回放时能看到"办完了但没发出去"，
+    这是这个缺陷唯一能被发现的时刻。
+    """
+    if kind not in KINDS:
+        raise ValueError(f"未知的出口类型：{kind!r}，可选：{list(KINDS)}")
+    if not body.strip():
+        return None
+    try:
+        existing = (
+            db.query(TicketOutbox.id)
+            .filter(
+                TicketOutbox.ticket_id == ticket.id,
+                TicketOutbox.kind == kind,
+                TicketOutbox.status.in_(_IN_FLIGHT),
+            )
+            .first()
+        )
+        if existing is not None:
+            return None
+        now = naive_now()
+        row = TicketOutbox(
+            id=str(uuid.uuid4()),
+            workspace_id=ticket.workspace_id,
+            ticket_id=ticket.id,
+            kind=kind,
+            channel=ticket.channel,
+            recipient=recipient,
+            body=body[:8000],
+            status="pending",
+            attempts=0,
+            max_attempts=max(1, settings.TICKET_OUTBOX_MAX_ATTEMPTS),
+            available_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(row)
+        db.commit()
+        return row.id
+    except Exception:
+        db.rollback()
+        logger.exception("failed to enqueue %s for ticket %s", kind, ticket.id)
+        try:
+            append_event(
+                db,
+                ticket,
+                node="confirm",
+                kind="error",
+                status="blocked",
+                message=f"要给客户发的那条 {kind} 没能排进发送队列，这句话目前没有人发得出",
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("failed to trace the enqueue failure")
+        return None
+
+
+def reap_expired_leases(db: Session, limit: int = 100) -> int:
+    """发送中途进程死掉留下的 sending 行推回 pending。
+
+    挂在读路径上，和 ``document_queue`` 同一形状：本仓库没有调度器。
+    """
+    now = naive_now()
+    try:
+        rows = (
+            db.query(TicketOutbox)
+            .filter(
+                TicketOutbox.status == "sending",
+                TicketOutbox.lease_expires_at.is_not(None),
+                TicketOutbox.lease_expires_at <= now,
+            )
+            .limit(max(1, min(limit, 500)))
+            .all()
+        )
+        for row in rows:
+            row.status = "pending"
+            row.lease_owner = None
+            row.lease_expires_at = None
+            row.error = "发送租约过期（进程在发送中途没了）"
+            row.updated_at = now
+        if rows:
+            db.commit()
+        return len(rows)
+    except Exception:
+        db.rollback()
+        logger.exception("reap_expired_leases failed")
+        return 0
+
+
+def claim_next(db: Session, worker_id: str) -> Claimed | None:
+    """原子认领最老的一条待发送。认领即占租约并自增 attempts。"""
+    now = naive_now()
+    query = (
+        db.query(TicketOutbox)
+        .filter(TicketOutbox.status == "pending", TicketOutbox.available_at <= now)
+        .order_by(TicketOutbox.available_at.asc())
+    )
+    try:
+        row = query.with_for_update(skip_locked=True).first()
+    except Exception:
+        # 方言不支持 FOR UPDATE（SQLite）——退回普通取
+        row = query.first()
+    if row is None:
+        return None
+    row.status = "sending"
+    row.lease_owner = worker_id[:64]
+    row.lease_expires_at = now + timedelta_seconds(settings.TICKET_OUTBOX_LEASE_SECONDS)
+    row.attempts += 1
+    row.updated_at = now
+    db.commit()
+    return Claimed(
+        id=row.id,
+        ticket_id=row.ticket_id,
+        channel=row.channel,
+        recipient=row.recipient,
+        body=row.body,
+        attempts=row.attempts,
+    )
+
+
+def timedelta_seconds(seconds: float):
+    from datetime import timedelta
+
+    return timedelta(seconds=seconds)
+
+
+def mark_sent(db: Session, row_id: str) -> None:
+    now = naive_now()
+    row = db.get(TicketOutbox, row_id)
+    if row is None:
+        return
+    row.status = "sent"
+    row.sent_at = now
+    row.updated_at = now
+    row.lease_owner = None
+    row.lease_expires_at = None
+    row.error = None
+    db.commit()
+
+
+def fail_with_retry(db: Session, row_id: str, error: str = "") -> bool:
+    """失败。没到尝试上限就退避重排（返回 True），到了就落 failed（返回 False）。
+
+    退避把 ``available_at`` 推到 ``now + 基数 × attempts``：一条一直发不出去的邮件
+    不应该每被 drain 一次就再打服务商一次。
+    """
+    now = naive_now()
+    row = db.get(TicketOutbox, row_id)
+    if row is None:
+        return False
+    row.updated_at = now
+    row.lease_owner = None
+    row.lease_expires_at = None
+    row.error = error[:200] or "发送失败"
+    if row.attempts >= row.max_attempts:
+        row.status = "failed"
+        db.commit()
+        return False
+    row.status = "pending"
+    row.available_at = now + timedelta_seconds(
+        settings.TICKET_OUTBOX_BACKOFF_SECONDS * row.attempts
+    )
+    db.commit()
+    return True
+
+
+def suppress(db: Session, row_id: str, *, actor_id: str, reason: str) -> bool:
+    """显式不发。**要理由，而且要留痕。**
+
+    被抑制的消息不会再自己发出去，所以这个状态只能由一个对此负责的人给出：
+    "客户拒收营销信息"是真的，"刚才发送报错了先标一下"不是——后者属于
+    ``fail_with_retry``，它会自己再试，也不会假装这件事已经解决。
+    """
+    if not reason.strip():
+        raise ValueError("抑制一条待发消息必须写明理由")
+    row = db.get(TicketOutbox, row_id)
+    if row is None:
+        return False
+    row.status = "suppressed"
+    row.error = f"由 {actor_id} 抑制：{reason.strip()[:180]}"
+    row.updated_at = naive_now()
+    row.lease_owner = None
+    row.lease_expires_at = None
+    db.commit()
+    return True
+
+
+def deliver(
+    db: Session, *, sender: Sender | None, worker: str = "ticket-outbox", limit: int = 10
+) -> dict[str, Any]:
+    """把队列里的东西发出去。返回一份发生了几次什么的汇总。
+
+    ``sender is None`` 时直接返回、**一行状态都不改**：没有出口通道不是"发送失败"，
+    更不是"发送成功"。把 pending 悄悄刷成 sent 会让这张表从此不能再用来回答
+    "客户收到回话了吗"，而它正是为这个问题存在的。
+    """
+    if sender is None:
+        pending = count_pending(db)
+        return {
+            "sent": 0,
+            "failed": 0,
+            "pending": pending,
+            "delivered": False,
+            "reason": "没有接入任何发送通道（邮件/企微/短信），待发内容仍留在队列里",
+        }
+    reap_expired_leases(db)
+    sent = failed = 0
+    for _ in range(max(1, min(limit, 100))):
+        claimed = claim_next(db, worker)
+        if claimed is None:
+            break
+        try:
+            sender(claimed.channel, claimed.recipient, claimed.body)
+        except Exception as exc:
+            retried = fail_with_retry(db, claimed.id, f"{type(exc).__name__}: {exc}")
+            if not retried:
+                failed += 1
+            continue
+        mark_sent(db, claimed.id)
+        sent += 1
+    return {
+        "sent": sent,
+        "failed": failed,
+        "pending": count_pending(db),
+        "delivered": True,
+        "reason": "",
+    }
+
+
+def count_pending(db: Session, workspace_id: str | None = None) -> int:
+    query = db.query(TicketOutbox.id).filter(TicketOutbox.status == "pending")
+    if workspace_id:
+        query = query.filter(TicketOutbox.workspace_id == workspace_id)
+    return query.count()
+
+
+def list_recent(
+    db: Session, workspace_id: str, *, status: str | None = None, limit: int = 50
+) -> list[TicketOutbox]:
+    query = db.query(TicketOutbox).filter(TicketOutbox.workspace_id == workspace_id)
+    if status:
+        query = query.filter(TicketOutbox.status == status)
+    return (
+        query.order_by(TicketOutbox.created_at.desc())
+        .limit(max(1, min(limit, 200)))
+        .all()
+    )
+
+
+CSAT_INVITE_BODY = "这张工单已经处理完了。方便的话给我们打个分（1-5 分），您的评价会直接影响我们决定下一步收紧哪条规则。"
