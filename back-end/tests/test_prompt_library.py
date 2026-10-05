@@ -5,7 +5,7 @@
 加载/渲染阶段，而不是让一段自洽但错误的提示词进到模型那边。
 
 键名一律取现在真实存在的 spec：``ticket_agent``（无占位符、无开关，最适合当解析器
-的空白靶）、``ticket_understand``（有 required 占位符）、``agent_researcher``
+的空白靶）、``ticket_understand``（有 required 占位符）、``ticket_sub_inquiry``
 （有 setting 且有 v1/v2 两版，是唯一能测"版本切换"路径的）。
 """
 from __future__ import annotations
@@ -69,7 +69,7 @@ def test_subagent_prompts_are_switchable():
     没有 setting 时 resolve_version 只剩 default_version 一个出口——新写一版
     进去没有任何代码路径能到达它。
     """
-    for key in ("agent_researcher", "agent_analyst", "agent_critic"):
+    for key in ("ticket_sub_inquiry", "ticket_sub_policy", "ticket_sub_reassurance"):
         spec = prompt_library.SPECS[key]
         assert spec.setting, f"{key} 不可切版本"
         assert hasattr(settings, spec.setting), f"{spec.setting} 没有对应的配置项"
@@ -79,16 +79,16 @@ def test_each_role_has_its_own_setting():
     """共享一个开关就没法单独 A/B 某个角色,动一个会让另两个的结果一起失效。"""
     settings_used = [
         prompt_library.SPECS[key].setting
-        for key in ("agent_researcher", "agent_analyst", "agent_critic")
+        for key in ("ticket_sub_inquiry", "ticket_sub_policy", "ticket_sub_reassurance")
     ]
     assert len(set(settings_used)) == 3, settings_used
 
 
 def test_role_prompt_follows_its_setting(monkeypatch):
-    """改配置要真的换到另一版——这是 role_prompt() 唯一的切换入口。"""
+    """改配置要真的换到另一版——这是 ``role_prompt()`` 唯一的切换入口。"""
     from services import agent_roles, subagent
 
-    role = agent_roles.ROLES["critic"]
+    role = agent_roles.ROLES["policy"]
     spec = prompt_library.SPECS[role.prompt_key]
 
     # 指向一个不存在的版本：报错说明 setting 真的被读了（而不是静默用默认版）
@@ -102,15 +102,15 @@ def test_role_prompt_follows_its_setting(monkeypatch):
 
 def test_version_resolution_order(monkeypatch):
     """显式传参 > settings > 契约默认值。"""
-    spec = prompt_library.SPECS["agent_researcher"]
+    spec = prompt_library.SPECS["ticket_sub_inquiry"]
     monkeypatch.setattr(settings, spec.setting, "v1", raising=False)
-    assert prompt_library.resolve_version("agent_researcher") == "v1"
-    assert prompt_library.resolve_version("agent_researcher", spec.default_version) == (
+    assert prompt_library.resolve_version("ticket_sub_inquiry") == "v1"
+    assert prompt_library.resolve_version("ticket_sub_inquiry", spec.default_version) == (
         spec.default_version
     )
 
     monkeypatch.setattr(settings, spec.setting, "", raising=False)
-    assert prompt_library.resolve_version("agent_researcher") == spec.default_version
+    assert prompt_library.resolve_version("ticket_sub_inquiry") == spec.default_version
 
 
 def test_shipped_config_leaves_every_version_setting_empty():
@@ -149,8 +149,8 @@ def test_default_version_is_reachable_without_any_env(monkeypatch):
 
 
 def test_ref_is_key_at_version():
-    template = prompt_library.get("agent_researcher")
-    assert template.ref == f"agent_researcher@{template.version}"
+    template = prompt_library.get("ticket_sub_inquiry")
+    assert template.ref == f"ticket_sub_inquiry@{template.version}"
 
 
 def test_catalog_marks_exactly_one_active_version_per_key():
@@ -158,32 +158,6 @@ def test_catalog_marks_exactly_one_active_version_per_key():
         active = [v for v in entry["versions"] if v["isActive"]]
         assert len(active) == 1, entry["key"]
         assert active[0]["version"] == entry["activeVersion"]
-
-
-def test_unknown_expects_value_is_rejected():
-    """拼错的 expects 静默忽略，等于启动校验以为这一版没有前置条件。"""
-    with pytest.raises(PromptError):
-        prompt_library._parse(
-            "---\nstatus: candidate\nexpects: delegatoin\n---\n正文",
-            "ticket_agent",
-            "vtest",
-        )
-
-
-def test_expects_defaults_to_empty_and_parses_list():
-    plain = prompt_library._parse(
-        "---\nstatus: active\n---\n正文", "ticket_agent", "vtest"
-    )
-    assert plain.expects == ()
-
-    multi = prompt_library._parse(
-        "---\nstatus: candidate\nexpects: delegation, supervisor\n---\n正文",
-        "ticket_agent",
-        "vtest",
-    )
-    assert multi.expects == ("delegation", "supervisor")
-    assert multi.expects_all("delegation", "supervisor")
-    assert not multi.expects_all("workspace-tools")
 
 
 # ========== 解析器本身的边界 ==========

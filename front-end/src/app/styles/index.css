@@ -6,6 +6,8 @@
 
 @layer base {
   :root {
+    color-scheme: light;
+
     --color-bg-primary: #fbf9f5;
     --color-bg-secondary: #f3f0e6;
     --color-text-primary: #1f1e1d;
@@ -34,6 +36,30 @@
     --c-accent-faint: rgba(218, 119, 86, 0.1);
     --c-accent-line: rgba(218, 119, 86, 0.28);
 
+    /* ---- 工单域状态色 ----
+       这套颜色不是装饰：它对应后端的 status / riskLevel / permission 三组枚举，
+       坐席扫一眼队列就该能分辨"这张单在等谁"。所以每一档都配一个 faint 底，
+       用于行内标签，避免只在文字上区分。 */
+    --c-idle: #8b8779; /* 新建 / 未开始 */
+    --c-idle-faint: rgba(139, 135, 121, 0.12);
+    --c-active: #3a6b8c; /* Agent 正在办 */
+    --c-active-faint: rgba(58, 107, 140, 0.12);
+    --c-hold: #b7791f; /* 等人批 / 等复核：最需要被看见的一档 */
+    --c-hold-faint: rgba(183, 121, 31, 0.14);
+    --c-done: #3f7d54; /* 已解决 / 已关闭 */
+    --c-done-faint: rgba(63, 125, 84, 0.13);
+    --c-bad: #b3402f; /* 转人工 / 失败 / 越界 */
+    --c-bad-faint: rgba(179, 64, 47, 0.13);
+
+    /* 权限三档：读 / 改 / 资金。资金档用朱红——它和"转人工"同色是有意的,
+       看到红色竖条就该知道"这一步要有人点头"。 */
+    --tier-read: #3a6b8c;
+    --tier-mutate: #b7791f;
+    --tier-fund: #b3402f;
+
+    /* 侧栏强调条（队列行的左沿） */
+    --c-rail: #ded8ca;
+
     /* 高光/阴影/纹理 */
     --hl-code-bg: #f6f2ea;
     --hl-code-ink: #4a4437;
@@ -56,6 +82,8 @@
   }
 
   .dark {
+    color-scheme: dark;
+
     --color-bg-primary: #141413;
     --color-bg-secondary: #1a1917;
     --color-text-primary: #edece8;
@@ -76,6 +104,25 @@
     --c-accent-deep: #da7756;
     --c-accent-faint: rgba(224, 138, 106, 0.12);
     --c-accent-line: rgba(224, 138, 106, 0.32);
+
+    /* 深色下状态色整体提亮一档：浅色那套在 #141413 上对比不足，
+       而"等人批"这类信号色丢了对比就等于丢了这个功能。 */
+    --c-idle: #8f8b80;
+    --c-idle-faint: rgba(143, 139, 128, 0.16);
+    --c-active: #74a8c9;
+    --c-active-faint: rgba(116, 168, 201, 0.16);
+    --c-hold: #dfae5b;
+    --c-hold-faint: rgba(223, 174, 91, 0.16);
+    --c-done: #86bd95;
+    --c-done-faint: rgba(134, 189, 149, 0.15);
+    --c-bad: #e58a78;
+    --c-bad-faint: rgba(229, 138, 120, 0.16);
+
+    --tier-read: #74a8c9;
+    --tier-mutate: #dfae5b;
+    --tier-fund: #e58a78;
+
+    --c-rail: #2e2c28;
 
     --hl-code-bg: #201e1a;
     --hl-code-ink: #e8e4d8;
@@ -442,6 +489,367 @@
     border: 2.5px solid var(--c-accent);
     box-shadow: 0 2px 6px rgba(66, 55, 40, 0.25);
   }
+
+  /* ================= 工单台 =================
+     这一层的每一条都为"扫一眼就知道这张单在等谁"服务：等宽数字、账本横线、
+     左沿档位条、以及一枚盖在处置上的印章。 */
+
+  /* 金额 / 工单号 / 时间戳一律等宽 + 表格数字：跳动的位数会让核对变成逐字阅读 */
+  .num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+
+  /* 账本横线：队列与轨迹行的底沿，比卡片堆叠更像一个台面 */
+  .ledger-row {
+    position: relative;
+    display: grid;
+    align-items: center;
+    border-bottom: 1px solid var(--c-line);
+    transition: background 0.16s ease, border-color 0.16s ease;
+  }
+
+  .ledger-row:hover {
+    background: color-mix(in srgb, var(--c-mantle) 62%, transparent);
+  }
+
+  .ledger-row[data-selected="true"] {
+    background: var(--c-accent-faint);
+  }
+
+  .ledger-row[data-selected="true"]::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: -1px;
+    width: 2px;
+    background: var(--c-accent);
+  }
+
+  /* 左沿档位条：读 / 改 / 资金。颜色比文字先到眼睛里，这是它唯一的工作方式 */
+  .tier-bar {
+    position: relative;
+    padding-left: 12px;
+  }
+
+  .tier-bar::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 4px;
+    bottom: 4px;
+    width: 3px;
+    border-radius: 2px;
+    background: var(--c-rail);
+  }
+
+  .tier-bar[data-tier="read"]::before {
+    background: var(--tier-read);
+  }
+
+  .tier-bar[data-tier="mutate"]::before {
+    background: var(--tier-mutate);
+  }
+
+  .tier-bar[data-tier="fund"]::before {
+    background: var(--tier-fund);
+    box-shadow: 0 0 0 2px var(--c-bad-faint);
+  }
+
+  /* 状态胶囊：tone 对应后端 status/risk 的分组，不是自由配色 */
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    border: 1px solid var(--c-line);
+    background: var(--c-mantle);
+    color: var(--c-ink-soft);
+    white-space: nowrap;
+  }
+
+  .status-pill[data-tone="idle"] {
+    color: var(--c-idle);
+    background: var(--c-idle-faint);
+    border-color: color-mix(in srgb, var(--c-idle) 30%, transparent);
+  }
+
+  .status-pill[data-tone="active"] {
+    color: var(--c-active);
+    background: var(--c-active-faint);
+    border-color: color-mix(in srgb, var(--c-active) 32%, transparent);
+  }
+
+  .status-pill[data-tone="hold"] {
+    color: var(--c-hold);
+    background: var(--c-hold-faint);
+    border-color: color-mix(in srgb, var(--c-hold) 38%, transparent);
+  }
+
+  .status-pill[data-tone="done"] {
+    color: var(--c-done);
+    background: var(--c-done-faint);
+    border-color: color-mix(in srgb, var(--c-done) 34%, transparent);
+  }
+
+  .status-pill[data-tone="bad"] {
+    color: var(--c-bad);
+    background: var(--c-bad-faint);
+    border-color: color-mix(in srgb, var(--c-bad) 40%, transparent);
+  }
+
+  /* 脉冲点：只给"正在等人"用。台面上一闪一闪的东西必须真的值得看 */
+  .status-pill .beacon {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: currentColor;
+    animation: beacon-blink 2.1s ease-in-out infinite;
+  }
+
+  /* 印章：批准/拒绝是一次处置的凭证，不是一条 toast。
+     双环 + 轻微旋转 + 油墨不匀，是让它在满屏灰字里被记住的那一下。 */
+  .stamp {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 12px;
+    border-radius: 8px;
+    border: 1.5px solid currentColor;
+    box-shadow: inset 0 0 0 2px color-mix(in srgb, currentColor 22%, transparent);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.16em;
+    transform: rotate(-2.4deg);
+    opacity: 0.92;
+  }
+
+  .stamp[data-verdict="approved"] {
+    color: var(--c-done);
+  }
+
+  .stamp[data-verdict="rejected"] {
+    color: var(--c-bad);
+  }
+
+  /* 值班条：全局暂停 / 今日退款 / SLA 超期——台面顶上的那块小黑板 */
+  .shift-board {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+    gap: 1px;
+    border: 1px solid var(--c-line);
+    border-radius: 14px;
+    background: var(--c-line);
+    overflow: hidden;
+  }
+
+  .shift-cell {
+    flex: 1 1 9rem;
+    min-width: 8.5rem;
+    padding: 10px 14px;
+    background: var(--c-surface);
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .shift-cell[data-alarm="true"] {
+    background: var(--c-bad-faint);
+  }
+
+  .shift-cell .shift-key {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--c-ink-faint);
+  }
+
+  .shift-cell .shift-value {
+    font-family: var(--font-display);
+    font-variation-settings: "opsz" 24;
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--c-ink);
+    line-height: 1.15;
+  }
+
+  /* 额度计：当日退款 / 单工单成本这类"还剩多少"的量 */
+  .gauge {
+    position: relative;
+    height: 5px;
+    border-radius: 999px;
+    background: var(--c-overlay);
+    overflow: hidden;
+  }
+
+  .gauge > i {
+    position: absolute;
+    inset: 0 auto 0 0;
+    border-radius: 999px;
+    background: var(--c-hold);
+    transform-origin: left center;
+    animation: bar-grow 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .gauge[data-critical="true"] > i {
+    background: var(--c-bad);
+  }
+
+  .gauge[data-empty="true"] > i {
+    background: var(--c-done);
+  }
+
+  /* 轨迹回放：左侧序号槽 + 节点徽标，读起来像一张工序单而不是一段日志 */
+  .trace-gutter {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-variant-numeric: tabular-nums;
+    color: var(--c-ink-faint);
+    text-align: right;
+  }
+
+  .trace-node {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    padding: 1px 7px;
+    border-radius: 5px;
+    border: 1px solid var(--c-line);
+    background: var(--c-mantle);
+    color: var(--c-ink-soft);
+    white-space: nowrap;
+  }
+
+  /* 未定价 / 未采到的量：显示"未知"而不是 0，样式也要说"这里没有数" */
+  .unknown-value {
+    color: var(--c-ink-faint);
+    font-style: italic;
+    letter-spacing: 0.02em;
+  }
+
+  /* ---------- 表单控件 ----------
+     工单台上真正被频繁填写的是"理由"和"参数"，所以输入态要比一般后台更清楚：
+     聚焦时有一条 2px 的强调环，而不是只把边框换个几乎看不出的色。 */
+  .input-field {
+    width: 100%;
+    padding: 8px 11px;
+    border-radius: 10px;
+    border: 1px solid var(--c-line-strong);
+    background: var(--c-surface);
+    color: var(--c-ink);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.5;
+    transition: border-color 0.16s ease, box-shadow 0.16s ease;
+  }
+
+  .input-field::placeholder {
+    color: var(--c-ink-faint);
+  }
+
+  .input-field:focus {
+    outline: none;
+    border-color: var(--c-accent);
+    box-shadow: 0 0 0 3px var(--c-accent-faint);
+  }
+
+  .input-field:disabled {
+    background: var(--c-mantle);
+    color: var(--c-ink-faint);
+    cursor: not-allowed;
+  }
+
+  textarea.input-field {
+    resize: vertical;
+    min-height: 68px;
+  }
+
+  /* 参数编辑框：改的是金额与地址，读的是等宽字才数得清 */
+  .input-mono {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .btn-quiet {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 7px 13px;
+    border-radius: 10px;
+    border: 1px solid var(--c-line-strong);
+    background: var(--c-surface);
+    color: var(--c-ink-soft);
+    font-size: 12px;
+    font-weight: 600;
+    transition: border-color 0.16s ease, color 0.16s ease, background 0.16s ease;
+  }
+
+  .btn-quiet:hover:not(:disabled) {
+    border-color: var(--c-accent-line);
+    color: var(--c-ink);
+    background: var(--c-accent-faint);
+  }
+
+  /* 拒绝、暂停、抑制——这三个动作的按钮用状态色而不是强调色：
+     它们表达的是"这件事停在这儿了"，不是"点我" */
+  .btn-alarm {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 7px 13px;
+    border-radius: 10px;
+    border: 1px solid color-mix(in srgb, var(--c-bad) 45%, transparent);
+    background: var(--c-bad-faint);
+    color: var(--c-bad);
+    font-size: 12px;
+    font-weight: 700;
+    transition: background 0.16s ease, transform 0.16s ease;
+  }
+
+  .btn-alarm:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--c-bad) 20%, transparent);
+  }
+
+  .btn-quiet:disabled,
+  .btn-alarm:disabled,
+  .btn-accent:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .kbd {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    border: 1px solid var(--c-line-strong);
+    background: var(--c-mantle);
+    color: var(--c-ink-soft);
+  }
+
+  /* 焦点可见性：键盘坐席是真实存在的用户 */
+  .queue-row:focus-visible,
+  .ledger-row:focus-visible,
+  .shift-cell:focus-visible,
+  a:focus-visible,
+  button:focus-visible {
+    outline: 2px solid var(--c-accent);
+    outline-offset: 2px;
+    border-radius: 8px;
+  }
 }
 
 @layer utilities {
@@ -556,6 +964,19 @@
   to {
     transform: scaleX(1);
     opacity: 1;
+  }
+}
+
+/* 等人批的呼吸点。整个台面只有这一处持续动，所以它一定指向"该有人来做了" */
+@keyframes beacon-blink {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
   }
 }
 

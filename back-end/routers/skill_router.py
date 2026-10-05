@@ -34,12 +34,12 @@ class SkillUpsertRequest(BaseModel):
     enabled: bool = True
     # 下结论之前必须先拿到的东西，逗号分隔（中英文逗号都收）。
     #
-    # 它不是提示词，是给 structured.ReviewVerdict 提供必填槽位：审核型 SOP 填了它，
-    # 结论里就有对应数量的核对项，缺一项就只能是 needs_human——由代码强制。
-    # 写作指导类的 SOP 留空即可。
+    # 这一行是**登记**，不是**闸门**：它进 admin 界面的清单，不进模型上下文
+    # （load_skill 只交正文）。想让"缺材料就别下结论"真的生效，得把它接到执行
+    # 路径上，目前还没有。写作指导类的 SOP 留空即可。
     #
     # 500 与 models.WorkspaceSkill.required_inputs 的列宽一致：在这里挡住比在
-    # 数据库层截断好，后者会把最后一项悄悄截掉半个字，而那一项就永远 found=false。
+    # 数据库层截断好，后者会把最后一项悄悄截掉半个字，而截剩下的那半项没人认得。
     required_inputs: str = Field(default="", max_length=500)
 
 

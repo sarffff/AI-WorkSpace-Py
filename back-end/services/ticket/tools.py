@@ -171,9 +171,35 @@ APPROVAL_TOOLS = frozenset(name for name, tier in TIER_BY_TOOL.items() if tier =
 _TIER_FLOOR = {READ: 0, MUTATE: 1, FUND: 2}
 _RISK_FLOOR = {"low": 0, "mid": 1, "high": 2}
 
+# 编排层往工具面上追加的**非业务**工具：SOP 加载、政策检索、委派。
+# 它们不进 ``TIER_BY_TOOL``，因为那张表同时是 ``build()`` 装配业务工具的清单来源
+# （按档位筛、逐个配 handler），而这三个的 handler 在编排层手里。
+# 但"这次调用要不要人批"必须有一个答案，所以在这里给它们一个档位：一律 READ——
+# 它们不碰业务库：load_skill 只读 SOP 正文，search_policy 只读知识库，
+# delegate 的执行面由角色自己限定（角色工具面里没有写操作，见 agent_roles）。
+AUXILIARY_READ_TOOLS = frozenset(
+    {"load_skill", "read_skill_file", "search_policy", "delegate"}
+)
+
+
+def tier_of(tool_name: str) -> str:
+    """这个工具有多大权力。业务工具查表，编排层追加的按 ``AUXILIARY_READ_TOOLS`` 判，
+    其余**一律按 FUND 处理**。
+
+    fail-closed 的理由：这张表是治理唯一的输入，而"模型能调的东西"会随编排层长大
+    （今天加了 skill，明天可能接 CRM）。漏登记时如果默认 READ，那个新工具就直接
+    拿到"不过人审就能执行"的待遇；而 READ 的语义是"只查不改"，一个没登记过的工具
+    恰恰最可能是在改东西。按 FUND 走的表现是"每次都挂起来等人批"——多一次摩擦，
+    不丢安全性，而且漏登记会在工单台上立刻显眼。
+    """
+    tier = TIER_BY_TOOL.get(tool_name)
+    if tier is not None:
+        return tier
+    return READ if tool_name in AUXILIARY_READ_TOOLS else FUND
+
 
 def requires_approval(tool_name: str) -> bool:
-    return tool_name in APPROVAL_TOOLS
+    return tier_of(tool_name) == FUND
 
 
 def _humanize(exc: ValidationError) -> str:

@@ -45,14 +45,11 @@ def allowed_hosts() -> set[str]:
         settings.LLM_BASE_URL,
         settings.EMBEDDING_BASE_URL,
         settings.RERANK_BASE_URL,
-        settings.WEB_SEARCH_BASE_URL,
         settings.QDRANT_URL,
     ):
         host = _host_of(raw)
         if host:
             hosts.add(host)
-    # web_search 未覆盖 base_url 时用的两个默认端点（见 web_search._DEFAULT_ENDPOINTS）
-    hosts.update(("api.tavily.com", "google.serper.dev"))
     for item in (settings.EGRESS_ALLOWLIST or "").split(","):
         item = item.strip().lower()
         if item:

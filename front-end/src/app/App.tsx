@@ -6,27 +6,32 @@ import { ProtectedRoute } from "@/shared/lib/ProtectedRoute";
 import { Layout } from "./Layout";
 import { LoginPage } from "@/pages/auth/ui/LoginPage";
 import { RegisterPage } from "@/pages/auth/ui/RegisterPage";
-import { ChatPage } from "@/pages/chat/ui/ChatPage";
-import { KnowledgePage } from "@/pages/knowledge/ui/KnowledgePage";
-import { PromptsPage } from "@/pages/prompts/ui/PromptsPage";
-import { ReviewsPage } from "@/pages/reviews/ui/ReviewsPage";
-import { SkillsPage } from "@/pages/skills/ui/SkillsPage";
-import { DashboardPage } from "@/pages/dashboard/ui/DashboardPage";
-import { TracesPage } from "@/pages/traces/ui/TracesPage";
+import { TicketQueuePage } from "@/pages/queue/ui/TicketQueuePage";
+import { TicketDetailPage } from "@/pages/queue/ui/TicketDetailPage";
+import { ApprovalsPage } from "@/pages/approvals/ui/ApprovalsPage";
+import { GovernancePage } from "@/pages/governance/ui/GovernancePage";
 import { MetricsPage } from "@/pages/metrics/ui/MetricsPage";
-import { SettingsPage } from "@/pages/settings/ui/SettingsPage";
+import { KnowledgePage } from "@/pages/knowledge/ui/KnowledgePage";
+import { SkillsPage } from "@/pages/skills/ui/SkillsPage";
+import { NotificationsPage } from "@/pages/notifications/ui/NotificationsPage";
+import { AuditPage } from "@/pages/audit/ui/AuditPage";
+import { WorkspacePage } from "@/pages/workspace/ui/WorkspacePage";
 
+/**
+ * 路由表就是工单台的模块清单。
+ *
+ * 首页指向队列而不是"总览"：一个处置系统的第一屏应该是"现在有什么事没办完"，
+ * 而不是几张统计卡——统计在指标看板里，看它的时候事情已经办完了。
+ */
 export function App() {
   return (
     <ThemeProvider>
       <HashRouter>
         <AuthProvider>
           <Routes>
-            {/* 公开路由 */}
             <Route path="/login" element={<LoginPage />} />
             <Route path="/register" element={<RegisterPage />} />
 
-            {/* 受保护的路由 */}
             <Route
               path="/"
               element={
@@ -35,19 +40,19 @@ export function App() {
                 </ProtectedRoute>
               }
             >
-              <Route index element={<Navigate to="/dashboard" replace />} />
-              <Route path="dashboard" element={<DashboardPage />} />
-              <Route path="chat" element={<ChatPage />} />
-              <Route path="traces" element={<TracesPage />} />
+              <Route index element={<Navigate to="/queue" replace />} />
+              <Route path="queue" element={<TicketQueuePage />} />
+              <Route path="tickets/:ticketId" element={<TicketDetailPage />} />
+              <Route path="approvals" element={<ApprovalsPage />} />
+              <Route path="governance" element={<GovernancePage />} />
               <Route path="metrics" element={<MetricsPage />} />
               <Route path="knowledge" element={<KnowledgePage />} />
               <Route path="skills" element={<SkillsPage />} />
-              <Route path="prompts" element={<PromptsPage />} />
-              <Route path="reviews" element={<ReviewsPage />} />
-              <Route path="settings" element={<SettingsPage />} />
+              <Route path="notifications" element={<NotificationsPage />} />
+              <Route path="audit" element={<AuditPage />} />
+              <Route path="workspace" element={<WorkspacePage />} />
             </Route>
 
-            {/* 404 - 重定向到首页 */}
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </AuthProvider>

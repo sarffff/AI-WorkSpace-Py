@@ -63,9 +63,9 @@ _PINNED_FLAGS = {
     # 提示词版本。空串 = 走代码里的默认版本；.env 里设成某个具体版本之后，
     # 断言提示词内容的测试会挂在与改动无关的地方。提示词版本和其它配置是耦合的，
     # 一旦本地为了试新版切了版本，这类断言就全部漂移。
-    "PROMPT_AGENT_RESEARCHER_VERSION": "",
-    "PROMPT_AGENT_ANALYST_VERSION": "",
-    "PROMPT_AGENT_CRITIC_VERSION": "",
+    "PROMPT_TICKET_SUB_INQUIRY_VERSION": "",
+    "PROMPT_TICKET_SUB_POLICY_VERSION": "",
+    "PROMPT_TICKET_SUB_REASSURANCE_VERSION": "",
     "PROMPT_EVAL_ANSWER_VERSION": "",
     # 护栏按"开启但不拦截"测，拦截行为由 test_guardrails 自己 monkeypatch 阈值
     "GUARDRAIL_ENABLED": True,

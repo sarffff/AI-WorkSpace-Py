@@ -3,7 +3,6 @@ import { RetrievalDebugger } from "@/features/knowledge-debug/ui/RetrievalDebugg
 import { apiClient } from "@/shared/api/client";
 import type {
     DocumentVisibility,
-    FileTypesCapability,
     KnowledgeDocument,
     WorkspaceInfo,
 } from "@/shared/types/api.types";
@@ -66,13 +65,15 @@ export const KnowledgePage: React.FC = () => {
         "all" | "shared" | "mine" | "member" | "inherited"
     >("all");
     /**
-     * 知识库收哪些格式，由后端给（`services/file_types.py`）。
+     * 收哪些格式**不在前端列**。这份清单的唯一来源是后端 `services/file_types.py`，
+     * 曾经通过 `/settings` 的 `capabilities.fileTypes` 发出来；那个端点随对话工作台
+     * 一起删了，所以现在文件选择器不做过滤——选到不支持的格式时由后端 400 并列出
+     * 允许的那些。
      *
-     * 这个页面此前写死的那份 accept 有两处错：含 `.html`——后端白名单里没有，
-     * 于是选得到、传上去 400；缺 csv/log/sh/java/go/rs/c/cpp——后端明明支持，
-     * 用户在文件选择器里却选不到。两处都是"两份清单必须一致但不一致时零报错"。
+     * 这里刻意**不留一份写死的 accept**：这个仓库有过六处互相矛盾的扩展名副本，
+     * 症状正是"选择器里选得到、传上去 400"和"后端明明支持、选择器里选不到"。
+     * 要恢复过滤器，正确做法是在某个活着的接口上把 `file_types.payload()` 发出来。
      */
-    const [fileTypes, setFileTypes] = useState<FileTypesCapability | null>(null);
 
     /**
      * 权限判据用后端算好的 isAdmin，不自己比 role：
@@ -98,13 +99,7 @@ export const KnowledgePage: React.FC = () => {
             .catch((e) => {
                 toast.error(toastMessageFrom(e, "加载工作区信息失败"));
             });
-        // 支持的格式随后端配置固定，挂载时取一次就够。取不到不提示：
-        // 拖拽上传这条路不依赖它（后端 400 会带回允许列表），
-        // 只有文件选择器的过滤器会退化成"不过滤"。
-        apiClient
-            .getSettings()
-            .then((settings) => setFileTypes(settings.capabilities?.fileTypes ?? null))
-            .catch(() => setFileTypes(null));
+        // 支持的格式不在这里取：见上面 fileTypes 那段说明
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
@@ -287,9 +282,7 @@ export const KnowledgePage: React.FC = () => {
         <div className="page-shell app-atmosphere transition-colors duration-200">
             <div className="relative z-10 space-y-6 max-w-6xl">
                 <PageHeader
-                    eyebrow="检索"
-                    title="知识库与 RAG"
-                    description="文档进库、切块、混合检索。调试页不经过对话，直接看 dense / sparse 命中了什么。"
+                    description="政策、FAQ、退换规则进库、切块、混合检索。下面的调试框直接看 dense / sparse 各命中了什么。"
                     actions={
                         <div className="flex items-center gap-2">
                             {/* admin 才有的选择：共享 or 个人。
@@ -339,7 +332,6 @@ export const KnowledgePage: React.FC = () => {
                     ref={fileInputRef}
                     type="file"
                     className="hidden"
-                    accept={fileTypes?.knowledgeAccept}
                     onChange={handleFileChange}
                 />
 

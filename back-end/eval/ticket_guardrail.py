@@ -36,13 +36,15 @@ import asyncio
 import json
 import os
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Iterator
 
 from sqlalchemy import create_engine, pool
 from sqlalchemy.orm import sessionmaker
 
 import models  # noqa: F401  确保所有表注册到 Base.metadata
+from config import settings
 from database import Base
 from models import CsOperation, CsOrder, CsRefund, CsShipment, Ticket
 from services.clock import naive_now
@@ -211,6 +213,26 @@ def _seed(session, case: dict[str, Any]) -> Ticket:
     return result.ticket
 
 
+@contextmanager
+def _case_settings(overrides: dict[str, Any]) -> Iterator[None]:
+    """按案例打开配置，跑完原样还回去。
+
+    评估的前提是"同一个脚本对应同一个系统状态"，而有些护栏只在特定配置下存在
+    （委派模式下的写操作越权、skill 开关下的 SOP 注入）。用 ``monkeypatch`` 那种
+    测试侧的机制不合适（这是 CLI，不是 pytest），所以自己成对地 set/restore，
+    并把它写成上下文管理器——漏掉还原会让之后每一条案例都跑在一个被前一条
+    改过的配置上，而那正是"昨天的报告和今天对不上"这种问题的来源。
+    """
+    previous = {key: getattr(settings, key) for key in overrides}
+    for key, value in overrides.items():
+        setattr(settings, key, value)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            setattr(settings, key, value)
+
+
 async def _drive(case: dict[str, Any], checkpoint_path: str) -> Observed:
     engine = create_engine(
         "sqlite://",
@@ -232,11 +254,12 @@ async def _drive(case: dict[str, Any], checkpoint_path: str) -> Observed:
             model="script-policy",
             checkpoint_path=checkpoint_path,
         )
-        outcome = await run_ticket(runtime)
-        asked = outcome["outcome"] == "awaiting_approval"
-        if asked:
-            decision = case.get("approval") or {"approved": True}
-            outcome = await run_ticket(runtime, resume=decision)
+        with _case_settings(case.get("settings") or {}):
+            outcome = await run_ticket(runtime)
+            asked = outcome["outcome"] == "awaiting_approval"
+            if asked:
+                decision = case.get("approval") or {"approved": True}
+                outcome = await run_ticket(runtime, resume=decision)
 
         executed = (
             session.query(CsOperation)

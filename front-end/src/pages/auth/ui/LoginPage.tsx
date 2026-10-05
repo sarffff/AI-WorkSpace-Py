@@ -3,21 +3,21 @@ import { useNavigate } from 'react-router-dom'
 import { useDispatch } from 'react-redux'
 import { apiClient } from '@/shared/api/client'
 import { setUser, setToken } from '@/entities/auth/model/authSlice'
-import { useTheme } from '@/shared/lib/ThemeContext'
+import { NEXT_MODE, THEME_LABELS, useTheme } from '@/shared/lib/ThemeContext'
 import { BrandMark } from '@/shared/ui/BrandMark'
-import { Mail, Lock, Github, Chrome, AlertCircle, Eye, EyeOff, Sun, Moon } from 'lucide-react'
+import { Mail, Lock, Github, Chrome, AlertCircle, Eye, EyeOff, Sun, Moon, Monitor } from 'lucide-react'
 
 const STORIES = [
-  { label: '混合检索', body: 'dense + sparse，RRF 融合后再引用。' },
-  { label: '工具轨迹', body: '每一步落库，刷新之后还能核对。' },
-  { label: '语义缓存', body: '按提示词版本分桶，试一版不会脏另一版。' },
-  { label: '安全护栏', body: '检索资料里的注入指令会被中和，不是静默吞掉。' },
+  { label: '人在回路', body: '资金类操作停下来等人批；批准后执行的就是当时看到的那份参数。' },
+  { label: '完整轨迹', body: '每一步判断、调用与结果都落库，事后能回答当时查到哪儿。' },
+  { label: '限额与熔断', body: '当日退款额度、单工单成本与工具次数；到线就交人，不是退少一点。' },
+  { label: '注入中和', body: '客户原文与政策片段进上下文前先中和协议标记，命中会留痕。' },
 ]
 
 export const LoginPage: React.FC = () => {
   const navigate = useNavigate()
   const dispatch = useDispatch()
-  const { theme, toggleTheme } = useTheme()
+  const { mode, theme, cycleMode } = useTheme()
 
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -35,7 +35,7 @@ export const LoginPage: React.FC = () => {
       dispatch(setToken(response.access_token))
       dispatch(setUser(response.user))
       localStorage.setItem('user', JSON.stringify(response.user))
-      navigate('/chat')
+      navigate('/queue')
     } catch (err) {
       const detail = (err as { response?: { data?: { detail?: string } } }).response?.data?.detail
       setError(detail || '登录失败,请检查邮箱和密码')
@@ -52,28 +52,36 @@ export const LoginPage: React.FC = () => {
     <div className="min-h-screen app-atmosphere flex transition-colors duration-200">
       <div className="absolute top-6 right-6 z-20">
         <button
-          onClick={toggleTheme}
-          className="p-2.5 rounded-full bg-[#f3f0e6] hover:bg-[#eae6db] dark:bg-[#1e1d1b] dark:hover:bg-[#262522] border border-[#e3dfd5] dark:border-[#2e2d2a] text-[#1f1e1d] dark:text-[#edece8] transition-all shadow-md"
+          onClick={cycleMode}
+          className="group relative p-2.5 rounded-full bg-mantle hover:bg-overlay border border-line text-ink transition-all shadow-card"
+          aria-label={`主题：${THEME_LABELS[mode]}（点击切换到${THEME_LABELS[NEXT_MODE[mode]]}）`}
+          title="登录前也可以先把明暗定下来"
         >
-          {theme === "dark" ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4 text-slate-700" />}
+          {mode === "system" ? (
+            <Monitor className="w-4 h-4" />
+          ) : theme === "dark" ? (
+            <Sun className="w-4 h-4 text-state-hold" />
+          ) : (
+            <Moon className="w-4 h-4" />
+          )}
         </button>
       </div>
 
-      <aside className="hidden lg:flex w-[44%] relative flex-col justify-between p-12 border-r border-[#e6e2d8] dark:border-[#282724]">
+      <aside className="hidden lg:flex w-[44%] relative flex-col justify-between p-12 border-r border-line">
         <div className="absolute inset-0 pointer-events-none overflow-hidden">
           <div className="absolute inset-0 lab-grid" />
         </div>
         <div className="relative z-10">
           <div className="flex items-center gap-3 mb-10">
             <BrandMark size={40} />
-            <span className="font-display text-lg font-semibold">有据工作台</span>
+            <span className="font-display text-lg font-semibold">客服工单台</span>
           </div>
-          <p className="label-eyebrow mb-3">工作台</p>
-          <h1 className="font-display text-[40px] leading-[1.15] font-semibold text-[#1f1e1d] dark:text-[#edece8] text-balance">
-            看见模型<br />怎么想
+          <p className="label-eyebrow mb-3">TICKET DESK</p>
+          <h1 className="font-display text-[40px] leading-[1.15] font-semibold text-ink text-balance">
+            把工单办完<br />而不是答完
           </h1>
-          <p className="mt-4 text-sm text-[#6e6b63] dark:text-[#a19f96] max-w-sm leading-relaxed">
-            不是又一个聊天框。检索、工具、缓存、护栏和轨迹摊在台面上，方便核对每一次回答是怎么来的。
+          <p className="mt-4 text-sm text-ink-soft max-w-sm leading-relaxed">
+            查订单、改地址、发起退款、关单——风险高的那几步必须有人点头，而每一步做过什么都留得下来。
           </p>
         </div>
         <ul className="relative z-10 space-y-4 mt-12">

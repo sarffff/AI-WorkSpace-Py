@@ -1,124 +1,81 @@
-import React, { useEffect } from "react";
-import { useSelector, useDispatch } from "react-redux";
+import React, { useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
-import { RootState } from "@/app/providers/store";
-import {
-  setSelectedModel,
-  setServerStatus,
-} from "@/entities/chat/model/chatSlice";
+import { PauseOctagon } from "lucide-react";
 import { apiClient } from "@/shared/api/client";
-import { NotificationBell } from "@/features/notifications/ui/NotificationBell";
-import { ChevronDown, ShieldCheck, Sparkles } from "lucide-react";
 
+/**
+ * 模块标题。`eyebrow` 是给快速扫视用的英文短语（轨道图标 + 英文小字
+ * 比纯中文更快定位），正文一律中文。
+ */
 const TITLES: Record<string, { title: string; eyebrow: string }> = {
-  dashboard: { title: "工作台", eyebrow: "Overview" },
-  chat: { title: "对话 · 审核", eyebrow: "Studio" },
-  reviews: { title: "审核台账", eyebrow: "Ledger" },
-  traces: { title: "运行轨迹", eyebrow: "Replay" },
-  knowledge: { title: "知识库", eyebrow: "Retrieval" },
-  skills: { title: "作业指导", eyebrow: "SOPs" },
-  prompts: { title: "提示词工作台", eyebrow: "Lab" },
-  metrics: { title: "运营指标", eyebrow: "Metrics" },
-  settings: { title: "设置", eyebrow: "System" },
+  queue: { title: "工单队列", eyebrow: "TICKET QUEUE" },
+  tickets: { title: "工单详情", eyebrow: "TICKET" },
+  approvals: { title: "审批收件箱", eyebrow: "AWAITING YOU" },
+  governance: { title: "治理台", eyebrow: "GUARDRAILS" },
+  metrics: { title: "指标看板", eyebrow: "METRICS" },
+  knowledge: { title: "知识库", eyebrow: "KNOWLEDGE" },
+  skills: { title: "作业指导", eyebrow: "SOP LIBRARY" },
+  notifications: { title: "通知", eyebrow: "INBOX" },
+  audit: { title: "审计", eyebrow: "AUDIT TRAIL" },
+  workspace: { title: "工作区", eyebrow: "WORKSPACE" },
 };
 
 export const Header: React.FC = () => {
-  const dispatch = useDispatch();
   const location = useLocation();
-  const { selectedModel, serverStatus, sessions } = useSelector(
-    (state: RootState) => state.chat,
-  );
-  const [appVersion] = React.useState<string>("0.1.0");
-  const [models, setModels] = React.useState<string[]>([selectedModel]);
+  const module = location.pathname.split("/")[1] || "queue";
+  const meta = TITLES[module] ?? TITLES.queue;
 
-  const routeKey = location.pathname.split("/")[1] || "dashboard";
-  const page = TITLES[routeKey] || TITLES.dashboard;
+  /**
+   * 全局暂停状态在每个页面都要看得见。
+   *
+   * 它是唯一一个"看不见就会出事"的状态：暂停之后 Agent 不再执行任何写操作，
+   * 坐席如果没注意到横幅，会对"为什么这单一直没动"做出错误的判断，
+   * 然后去做本该由系统做的那一步。所以它进顶栏，而不只进治理台。
+   */
+  const [paused, setPaused] = useState<{ paused: boolean; reason: string | null }>({
+    paused: false,
+    reason: null,
+  });
 
   useEffect(() => {
-    apiClient.ping().then((online) => {
-      dispatch(setServerStatus(online ? "online" : "offline"));
-    });
+    let alive = true;
     apiClient
-      .getSettings()
-      .then((settings) => {
-        const supported = settings.availableModels.map((model) => model.id);
-        setModels(supported);
-        if (!supported.includes(selectedModel)) {
-          dispatch(setSelectedModel(settings.preferences.defaultModel));
-        }
-      })
-      .catch(() => {});
-  }, [dispatch, selectedModel]);
-
-  const dotClass =
-    serverStatus === "online"
-      ? "bg-emerald-500"
-      : serverStatus === "offline"
-        ? "bg-rose-500"
-        : "bg-amber-500";
-
-  const statusLabel =
-    serverStatus === "online"
-      ? `在线 · ${sessions.length} 会话`
-      : serverStatus === "offline"
-        ? "服务离线"
-        : "正在检查服务...";
+      .governorState()
+      .then((state) =>
+        alive && setPaused({ paused: state.paused, reason: state.pauseReason })
+      )
+      // 拿不到就当没暂停：这一条是提示，不是权限判据（真正的拦在后端执行那一步）
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [location.pathname]);
 
   return (
-    <header className="h-14 border-b border-[#e6e2d8] dark:border-[#282724] bg-[#fbf9f5]/70 dark:bg-[#141413]/70 backdrop-blur-md px-4 sm:px-6 flex items-center justify-between select-none transition-colors duration-200 relative z-10">
-      <div className="flex items-center gap-3 min-w-0">
-        <div>
-          <div className="label-eyebrow leading-none mb-0.5">{page.eyebrow}</div>
-          <h2 className="font-display text-[17px] font-semibold text-[#1f1e1d] dark:text-[#edece8] leading-tight">
-            {page.title}
-          </h2>
-        </div>
-        <span
-          className="chip chip-accent"
-          style={{ fontFamily: "var(--font-mono)" }}
+    <header className="h-14 shrink-0 flex items-center justify-between gap-4 px-6 border-b border-line bg-crust relative z-10">
+      <div className="min-w-0">
+        <div className="label-eyebrow">{meta.eyebrow}</div>
+        <h1 className="font-display text-[17px] font-semibold text-ink leading-tight truncate">
+          {meta.title}
+        </h1>
+      </div>
+
+      {paused.paused && (
+        <div
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-[12px] font-semibold text-state-bad"
+          style={{
+            background: "var(--c-bad-faint)",
+            border: "1px solid color-mix(in srgb, var(--c-bad) 40%, transparent)",
+          }}
+          title={paused.reason ?? "未注明原因"}
+          role="status"
         >
-          v{appVersion}
-        </span>
-      </div>
-
-        <div className="flex items-center gap-1.5 sm:gap-2.5">
-        <div className="relative group">
-          <Sparkles className="w-3.5 h-3.5 text-[#da7756] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-          <select
-            value={selectedModel}
-            onChange={(e) => dispatch(setSelectedModel(e.target.value))}
-            className="appearance-none bg-[#f3f0e6] hover:bg-[#eae6db] dark:bg-[#1e1d1b] dark:hover:bg-[#262522] text-[#1f1e1d] dark:text-[#edece8] text-xs font-medium rounded-full pl-8 pr-8 py-1.5 border border-[#e3dfd5] dark:border-[#2e2d2a] hover:border-[#da7756]/40 focus:outline-none focus:ring-1 focus:ring-[#da7756] cursor-pointer transition-all shadow-sm"
-          >
-            {models.map((m) => (
-              <option
-                key={m}
-                value={m}
-                className="bg-[#fbf9f5] dark:bg-[#181816] text-[#1f1e1d] dark:text-[#edece8]"
-              >
-                {m}
-              </option>
-            ))}
-          </select>
-          <ChevronDown className="w-3.5 h-3.5 text-[#6e6b63] dark:text-[#a19f96] absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-        </div>
-
-        <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-full bg-[#f3f0e6]/60 dark:bg-[#1e1d1b]/60 border border-[#e3dfd5] dark:border-[#2e2d2a] text-[11px] text-[#6e6b63] dark:text-[#a19f96]">
-          <span className="relative flex w-2 h-2">
-            {serverStatus === "online" && (
-              <span
-                className={`animate-ping absolute inline-flex h-full w-full rounded-full ${dotClass} opacity-50`}
-              />
-            )}
-            <span
-              className={`relative inline-flex rounded-full h-2 w-2 ${dotClass}`}
-            />
+          <PauseOctagon className="w-4 h-4 shrink-0" />
+          <span className="truncate max-w-[42ch]">
+            全线暂停中{paused.reason ? ` · ${paused.reason}` : ""}
           </span>
-          <ShieldCheck className="w-3.5 h-3.5" />
-          <span className="hidden sm:inline">{statusLabel}</span>
         </div>
-
-        <NotificationBell />
-      </div>
+      )}
     </header>
   );
 };

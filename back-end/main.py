@@ -31,6 +31,7 @@ from routers import (
 from services import prompt_library
 from services import security_preflight
 from services import skill_library
+from services import subagent
 from services import ingest_clean
 from services import retriever
 from services import vector_store
@@ -399,19 +400,24 @@ async def startup():
             else "off（模型看不到任何作业指导）"
         )
     )
-    # 这几项都会改变循环行为，而它们的效果在界面上看不见：缓存命中只体现在账单上，
-    # 重复拦截只体现在少跑一次工具。启动时打出来，排查"为什么这次和上次不一样"
-    # 时不用去翻 .env。
-    print(
-        "Prompt cache: stable prefix "
-        + ("on" if settings.PROMPT_CACHE_STABLE_PREFIX else "off（对照组）")
-    )
+    # 这几项都会改变循环行为，而它们的效果在界面上看不见：重复拦截只体现在少跑一次
+    # 工具，委派只体现在多了一整个子代理循环。启动时打出来，排查"为什么这次和上次
+    # 不一样"时不用去翻 .env。
     print(
         "Repeat guard: "
         + (
             f"同一 (工具, 参数) 上限 {settings.AGENT_REPEAT_LIMIT} 次"
             if settings.AGENT_REPEAT_LIMIT > 0
             else "off（不检测重复调用）"
+        )
+    )
+    print(
+        "Delegation: "
+        + subagent.describe_mode()
+        + (
+            f"，每张工单 ≤{settings.AGENT_MAX_DELEGATIONS} 次"
+            if subagent.enabled()
+            else ""
         )
     )
     print(f"Structured output retries: {settings.STRUCTURED_OUTPUT_RETRIES}")

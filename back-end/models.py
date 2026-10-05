@@ -243,16 +243,16 @@ class WorkspaceSkill(Base):
     instructions: Mapped[str] = mapped_column(Text, nullable=False)
     # 关掉而不是删掉：改坏一条 SOP 之后想先停用看看，比删了重录便宜
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    # 正文或描述变化时 +1（在 service 层判定）。审核结论要引用它，否则 admin 改一次
-    # SOP，之前所有结论的依据就都指向一份已经不存在的文本——三个月后有人问"当时
-    # 为什么通过"，答不出来。enabled 开关和改错别字不让它跳，否则这个号很快大到
-    # 没人看，"版本变了"这个信号也就没用了。
+    # 正文或描述变化时 +1（在 service 层判定），enabled 开关和改错别字不让它跳。
+    # 它是给人看的计数器：这张表只存最新一份正文，所以"改过几次"答得出，
+    # "当时那版写的是什么"答不出——逐版追溯要另加历史行，别把这个号当成那个东西。
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     # 下结论之前必须先拿到的东西，逗号分隔。解析走 skill_library.parse_required_inputs
     # （和内置 skill 的 frontmatter 共用一套，各写一遍迟早在"逗号后空格算不算"上分叉）。
     #
-    # 它不是给模型看的提示，是给 structured.ReviewVerdict 提供必填槽位：结构里有
-    # 那个位置，空着就是空着。于是"漏了一项"从判断题变成填空题。
+    # 目前它只是登记给 admin 看的清单：load_skill 交给模型的是正文，不含这一行，
+    # 所以"缺材料就别下结论"仍然是正文里的**措辞**，不是代码里的约束。
+    # 曾有的强制消费方（结构化审核结论的必填槽位）随报销审核栈一起删掉了。
     required_inputs: Mapped[str] = mapped_column(
         String(500), default="", nullable=False
     )
